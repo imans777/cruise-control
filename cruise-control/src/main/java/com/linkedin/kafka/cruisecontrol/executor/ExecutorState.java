@@ -27,6 +27,10 @@ public final class ExecutorState {
   @JsonResponseField
   private static final String STATE = "state";
   @JsonResponseField(required = false)
+  private static final String EXECUTION_TIME_WINDOW = "executionTimeWindow";
+  @JsonResponseField(required = false)
+  private static final String EXECUTION_PAUSED_REASON = "executionPausedReason";
+  @JsonResponseField(required = false)
   private static final String RECENTLY_DEMOTED_BROKERS = "recentlyDemotedBrokers";
   @JsonResponseField(required = false)
   private static final String RECENTLY_REMOVED_BROKERS = "recentlyRemovedBrokers";
@@ -156,6 +160,8 @@ public final class ExecutorState {
   private final boolean _isTriggeredByUserRequest;
   private final Set<Integer> _recentlyDemotedBrokers;
   private final Set<Integer> _recentlyRemovedBrokers;
+  private final ExecutionTimeWindow _executionTimeWindow;
+  private final String _executionPausedReason;
 
   private ExecutorState(State state,
                         ExecutionTasksSummary executionTasksSummary,
@@ -165,6 +171,20 @@ public final class ExecutorState {
                         Set<Integer> recentlyDemotedBrokers,
                         Set<Integer> recentlyRemovedBrokers,
                         boolean isTriggeredByUserRequest) {
+    this(state, executionTasksSummary, executionConcurrencySummary, uuid, reason, recentlyDemotedBrokers, recentlyRemovedBrokers,
+         isTriggeredByUserRequest, null, null);
+  }
+
+  private ExecutorState(State state,
+                        ExecutionTasksSummary executionTasksSummary,
+                        ExecutionConcurrencySummary executionConcurrencySummary,
+                        String uuid,
+                        String reason,
+                        Set<Integer> recentlyDemotedBrokers,
+                        Set<Integer> recentlyRemovedBrokers,
+                        boolean isTriggeredByUserRequest,
+                        ExecutionTimeWindow executionTimeWindow,
+                        String executionPausedReason) {
     _state = state;
     _executionTasksSummary = executionTasksSummary;
     _executionConcurrencySummary = executionConcurrencySummary;
@@ -173,6 +193,8 @@ public final class ExecutorState {
     _recentlyDemotedBrokers = recentlyDemotedBrokers;
     _recentlyRemovedBrokers = recentlyRemovedBrokers;
     _isTriggeredByUserRequest = isTriggeredByUserRequest;
+    _executionTimeWindow = executionTimeWindow;
+    _executionPausedReason = executionPausedReason;
   }
 
   /**
@@ -280,6 +302,33 @@ public final class ExecutorState {
                                                   Set<Integer> recentlyDemotedBrokers,
                                                   Set<Integer> recentlyRemovedBrokers,
                                                   boolean isTriggeredByUserRequest) {
+    return operationInProgress(state, executionTasksSummary, executionConcurrencySummary, uuid, reason, recentlyDemotedBrokers,
+                               recentlyRemovedBrokers, isTriggeredByUserRequest, null, null);
+  }
+
+  /**
+   * @param state State of executor.
+   * @param executionTasksSummary Summary of the execution tasks.
+   * @param executionConcurrencySummary Summary of the execution concurrency.
+   * @param uuid UUID of the current execution.
+   * @param reason Reason of the current execution.
+   * @param recentlyDemotedBrokers Recently demoted broker IDs.
+   * @param recentlyRemovedBrokers Recently removed broker IDs.
+   * @param isTriggeredByUserRequest Whether the execution is triggered by a user request.
+   * @param executionTimeWindow The daily time window within which new movements are allowed to start, or {@code null} if none.
+   * @param executionPausedReason The reason why the execution is not starting new movements, or {@code null} if it is not paused.
+   * @return Executor state when execution is in progress.
+   */
+  public static ExecutorState operationInProgress(State state,
+                                                  ExecutionTasksSummary executionTasksSummary,
+                                                  ExecutionConcurrencySummary executionConcurrencySummary,
+                                                  String uuid,
+                                                  String reason,
+                                                  Set<Integer> recentlyDemotedBrokers,
+                                                  Set<Integer> recentlyRemovedBrokers,
+                                                  boolean isTriggeredByUserRequest,
+                                                  ExecutionTimeWindow executionTimeWindow,
+                                                  String executionPausedReason) {
     if (!IN_PROGRESS_STATES.contains(state)) {
       throw new IllegalArgumentException(String.format("%s is not an operation-in-progress executor state %s.", state, IN_PROGRESS_STATES));
     }
@@ -290,7 +339,9 @@ public final class ExecutorState {
                              reason,
                              recentlyDemotedBrokers,
                              recentlyRemovedBrokers,
-                             isTriggeredByUserRequest);
+                             isTriggeredByUserRequest,
+                             executionTimeWindow,
+                             executionPausedReason);
   }
 
   /**
@@ -348,6 +399,34 @@ public final class ExecutorState {
     return _executionTasksSummary;
   }
 
+  /**
+   * @return The daily time window within which new movements are allowed to start, or {@code null} if none.
+   */
+  public ExecutionTimeWindow executionTimeWindow() {
+    return _executionTimeWindow;
+  }
+
+  /**
+   * @return The reason why the execution is not starting new movements, or {@code null} if it is not paused.
+   */
+  public String executionPausedReason() {
+    return _executionPausedReason;
+  }
+
+  private void populateExecutionTimeWindowInJsonStructure(Map<String, Object> execState) {
+    if (_executionTimeWindow != null) {
+      execState.put(EXECUTION_TIME_WINDOW, _executionTimeWindow.getJsonStructure());
+    }
+    if (_executionPausedReason != null) {
+      execState.put(EXECUTION_PAUSED_REASON, _executionPausedReason);
+    }
+  }
+
+  private String executionTimeWindowPlaintext() {
+    return (_executionTimeWindow == null ? "" : String.format(", %s: %s", EXECUTION_TIME_WINDOW, _executionTimeWindow))
+           + (_executionPausedReason == null ? "" : String.format(", %s: %s", EXECUTION_PAUSED_REASON, _executionPausedReason));
+  }
+
   private List<Object> getTaskDetails(ExecutionTask.TaskType type, ExecutionTaskState state) {
     List<Object> taskList = new ArrayList<>();
     for (ExecutionTask task : _executionTasksSummary.filteredTasksByState().get(type).get(state)) {
@@ -393,6 +472,7 @@ public final class ExecutorState {
       case LEADER_MOVEMENT_TASK_IN_PROGRESS:
         populateUuidFieldInJsonStructure(execState, _uuid);
         execState.put(TRIGGERED_TASK_REASON, _reason);
+        populateExecutionTimeWindowInJsonStructure(execState);
         execState.put(MAXIMUM_BROKER_LEADER_MOVEMENT_CONCURRENCY, _executionConcurrencySummary.getMaxExecutionConcurrency(
             ConcurrencyType.LEADERSHIP_BROKER));
         execState.put(MINIMUM_BROKER_LEADER_MOVEMENT_CONCURRENCY,
@@ -411,6 +491,7 @@ public final class ExecutorState {
         interBrokerPartitionMovementStats = _executionTasksSummary.taskStat().get(INTER_BROKER_REPLICA_ACTION);
         populateUuidFieldInJsonStructure(execState, _uuid);
         execState.put(TRIGGERED_TASK_REASON, _reason);
+        populateExecutionTimeWindowInJsonStructure(execState);
         execState.put(MAXIMUM_CONCURRENT_INTER_BROKER_PARTITION_MOVEMENTS_PER_BROKER,
                       _executionConcurrencySummary.getMaxExecutionConcurrency(ConcurrencyType.INTER_BROKER_REPLICA));
         execState.put(MINIMUM_CONCURRENT_INTER_BROKER_PARTITION_MOVEMENTS_PER_BROKER,
@@ -437,6 +518,7 @@ public final class ExecutorState {
         intraBrokerPartitionMovementStats = _executionTasksSummary.taskStat().get(INTRA_BROKER_REPLICA_ACTION);
         populateUuidFieldInJsonStructure(execState, _uuid);
         execState.put(TRIGGERED_TASK_REASON, _reason);
+        populateExecutionTimeWindowInJsonStructure(execState);
         execState.put(MAXIMUM_CONCURRENT_INTRA_BROKER_PARTITION_MOVEMENTS_PER_BROKER,
                       _executionConcurrencySummary.getMaxExecutionConcurrency(ConcurrencyType.INTRA_BROKER_REPLICA));
         execState.put(MINIMUM_CONCURRENT_INTRA_BROKER_PARTITION_MOVEMENTS_PER_BROKER,
@@ -464,6 +546,7 @@ public final class ExecutorState {
         intraBrokerPartitionMovementStats = _executionTasksSummary.taskStat().get(INTRA_BROKER_REPLICA_ACTION);
         populateUuidFieldInJsonStructure(execState, _uuid);
         execState.put(TRIGGERED_TASK_REASON, _reason);
+        populateExecutionTimeWindowInJsonStructure(execState);
         execState.put(MAXIMUM_CONCURRENT_INTER_BROKER_PARTITION_MOVEMENTS_PER_BROKER,
                       _executionConcurrencySummary.getMaxExecutionConcurrency(ConcurrencyType.INTER_BROKER_REPLICA));
         execState.put(MAXIMUM_CONCURRENT_INTRA_BROKER_PARTITION_MOVEMENTS_PER_BROKER,
@@ -527,7 +610,7 @@ public final class ExecutorState {
                              _executionConcurrencySummary.getAvgExecutionConcurrency(ConcurrencyType.LEADERSHIP_BROKER),
                              _executionConcurrencySummary.getClusterLeadershipMovementConcurrency(),
                              _isTriggeredByUserRequest ? TRIGGERED_USER_TASK_ID : TRIGGERED_SELF_HEALING_TASK_ID,
-                             _uuid, TRIGGERED_TASK_REASON, _reason, recentlyDemotedBrokers, recentlyRemovedBrokers);
+                             _uuid, TRIGGERED_TASK_REASON, _reason, recentlyDemotedBrokers, recentlyRemovedBrokers + executionTimeWindowPlaintext());
       case INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS:
 
         interBrokerPartitionMovementStats = _executionTasksSummary.taskStat().get(INTER_BROKER_REPLICA_ACTION);
@@ -554,7 +637,7 @@ public final class ExecutorState {
                              _executionConcurrencySummary.getMinExecutionConcurrency(ConcurrencyType.INTER_BROKER_REPLICA),
                              _executionConcurrencySummary.getAvgExecutionConcurrency(ConcurrencyType.INTER_BROKER_REPLICA),
                              _isTriggeredByUserRequest ? TRIGGERED_USER_TASK_ID : TRIGGERED_SELF_HEALING_TASK_ID, _uuid,
-                             TRIGGERED_TASK_REASON, _reason, recentlyDemotedBrokers, recentlyRemovedBrokers);
+                             TRIGGERED_TASK_REASON, _reason, recentlyDemotedBrokers, recentlyRemovedBrokers + executionTimeWindowPlaintext());
       case INTRA_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS:
         intraBrokerPartitionMovementStats = _executionTasksSummary.taskStat().get(INTRA_BROKER_REPLICA_ACTION);
         long finishedIntraBrokerDataMovementInMB = _executionTasksSummary.finishedIntraBrokerDataMovementInMB();
@@ -580,7 +663,7 @@ public final class ExecutorState {
                              _executionConcurrencySummary.getMinExecutionConcurrency(ConcurrencyType.INTRA_BROKER_REPLICA),
                              _executionConcurrencySummary.getAvgExecutionConcurrency(ConcurrencyType.INTRA_BROKER_REPLICA),
                              _isTriggeredByUserRequest ? TRIGGERED_USER_TASK_ID : TRIGGERED_SELF_HEALING_TASK_ID, _uuid,
-                             TRIGGERED_TASK_REASON, _reason, recentlyDemotedBrokers, recentlyRemovedBrokers);
+                             TRIGGERED_TASK_REASON, _reason, recentlyDemotedBrokers, recentlyRemovedBrokers + executionTimeWindowPlaintext());
       case STOPPING_EXECUTION:
         interBrokerPartitionMovementStats = _executionTasksSummary.taskStat().get(INTER_BROKER_REPLICA_ACTION);
         intraBrokerPartitionMovementStats = _executionTasksSummary.taskStat().get(INTRA_BROKER_REPLICA_ACTION);
@@ -607,7 +690,7 @@ public final class ExecutorState {
                              _executionConcurrencySummary.getMaxExecutionConcurrency(ConcurrencyType.LEADERSHIP_BROKER),
                              _executionConcurrencySummary.getClusterLeadershipMovementConcurrency(),
                              _isTriggeredByUserRequest ? TRIGGERED_USER_TASK_ID : TRIGGERED_SELF_HEALING_TASK_ID, _uuid,
-                             TRIGGERED_TASK_REASON, _reason, recentlyDemotedBrokers, recentlyRemovedBrokers);
+                             TRIGGERED_TASK_REASON, _reason, recentlyDemotedBrokers, recentlyRemovedBrokers + executionTimeWindowPlaintext());
       default:
         throw new IllegalStateException("This should never happen");
     }
