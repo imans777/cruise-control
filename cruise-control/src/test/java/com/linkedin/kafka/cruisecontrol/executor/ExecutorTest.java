@@ -37,6 +37,8 @@ import com.linkedin.kafka.cruisecontrol.monitor.sampling.NoopSampler;
 import com.linkedin.kafka.cruisecontrol.monitor.task.LoadMonitorTaskRunner;
 import com.linkedin.kafka.cruisecontrol.servlet.UserTaskManager;
 import java.time.Duration;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -51,6 +53,7 @@ import java.util.Set;
 import java.util.HashSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.CommonClientConfigs;
@@ -98,6 +101,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
   private static final Random RANDOM = new Random(0xDEADBEEF);
   private static final int MOCK_BROKER_ID_TO_DROP = 1;
   private static final long MOCK_CURRENT_TIME = 1596842708000L;
+  private static final ZoneId UTC = ZoneId.of("UTC");
 
   private CCContainerizedKraftCluster _cluster;
   private Admin _adminClient;
@@ -607,6 +611,137 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
                   "Proposal execution did not finish within the time limit",
                   EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
     EasyMock.verify(mockMetadataClient, mockLoadMonitor, mockAnomalyDetectorManager, mockUserTaskInfo, mockUserTaskManager);
+  }
+
+  @Test
+  public void testExecutionWaitsForExecutionTimeWindowToOpen() throws InterruptedException, OngoingExecutionException,
+                                                                    ExecutionException, TimeoutException {
+    List<ExecutionProposal> proposalsToExecute = new ArrayList<>();
+    List<ExecutionProposal> proposalsToCheck = new ArrayList<>();
+    populateProposals(proposalsToExecute, proposalsToCheck, 0);
+
+    // The execution is requested at 03:00, but new movements are allowed to start only within [07:00, 14:00).
+    ExecutionTimeWindow executionTimeWindow = new ExecutionTimeWindow(7, 14, UTC);
+    MockTime time = new MockTime(0L, timeMsInUtc(28, 3), 0L);
+    Executor executor = executorForExecutionTimeWindowTest(time);
+
+    executor.setGeneratingProposalsForExecution(RANDOM_UUID, ExecutorTest.class::getSimpleName, true);
+    executor.executeProposals(proposalsToCheck, Collections.emptySet(), null, getMockLoadMonitorForExecutionTimeWindowTest(),
+                              null, null, null, null, null, null, null, null, true, RANDOM_UUID, false, false, executionTimeWindow);
+
+    // The execution should wait for the window to open without starting any movement.
+    waitUntilTrue(() -> executor.state().state() == ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS
+                        && executor.state().executionPausedReason() != null,
+                  "Execution did not report waiting for the execution time window within the time limit",
+                  EXECUTION_DEADLINE_MS, EXECUTION_SHORT_CHECK_MS);
+    ExecutorState executorState = executor.state();
+    assertEquals(executionTimeWindow, executorState.executionTimeWindow());
+    assertTrue(executorState.executionPausedReason().contains(executionTimeWindow.toString()));
+    assertTrue(executorState.getJsonStructure(false).containsKey("executionPausedReason"));
+    assertTrue(executorState.getJsonStructure(false).containsKey("executionTimeWindow"));
+    // Wait for a few execution progress check intervals and ensure that no movement has started.
+    Thread.sleep(TimeUnit.SECONDS.toMillis(2));
+    assertTrue(executor.hasOngoingExecution());
+    assertTrue(executor.inExecutionTasks().isEmpty());
+    assertTrue(ExecutionUtils.partitionsBeingReassigned((AdminClient) _adminClient).isEmpty());
+    assertEquals(0, executor.state().numFinishedMovements(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION));
+
+    // Once the window opens, the execution resumes and finishes.
+    time.setCurrentTimeMs(timeMsInUtc(28, 7));
+    waitUntilTrue(() -> (!executor.hasOngoingExecution() && executor.state().state() == ExecutorState.State.NO_TASK_IN_PROGRESS),
+                  "Proposal execution did not finish within the time limit",
+                  EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
+    assertNull(executor.state().executionPausedReason());
+    verifyReplicasMoved(proposalsToCheck);
+  }
+
+  @Test
+  public void testInProgressMovementIsNotStoppedWhenExecutionTimeWindowCloses() throws InterruptedException,
+                                                                                    OngoingExecutionException {
+    List<ExecutionProposal> proposalsToExecute = new ArrayList<>();
+    List<ExecutionProposal> proposalsToCheck = new ArrayList<>();
+    // Move enough data with a replication throttle to keep the inter-broker replica movement in progress for a while.
+    populateProposals(proposalsToExecute, proposalsToCheck, PRODUCE_SIZE_IN_BYTES);
+
+    // The execution starts at 13:00 within the window [07:00, 14:00).
+    ExecutionTimeWindow executionTimeWindow = new ExecutionTimeWindow(7, 14, UTC);
+    MockTime time = new MockTime(0L, timeMsInUtc(28, 13), 0L);
+    Executor executor = executorForExecutionTimeWindowTest(time);
+
+    executor.setGeneratingProposalsForExecution(RANDOM_UUID, ExecutorTest.class::getSimpleName, true);
+    executor.executeProposals(proposalsToCheck, Collections.emptySet(), null, getMockLoadMonitorForExecutionTimeWindowTest(),
+                              null, null, null, null, null, null, null, PRODUCE_SIZE_IN_BYTES / 2, true, RANDOM_UUID, false, false,
+                              executionTimeWindow);
+    waitUntilTrue(() -> executor.state().state() == ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS
+                        && !executor.inExecutionTasks().isEmpty(),
+                  "Inter-broker replica movement did not start within the time limit",
+                  EXECUTION_DEADLINE_MS, EXECUTION_SHORT_CHECK_MS);
+    verifyOngoingPartitionReassignments(Collections.singleton(TP0));
+
+    // The window closes while the replica movement is in progress.
+    time.setCurrentTimeMs(timeMsInUtc(28, 14));
+
+    // The in-progress movement must not be stopped or rolled back -- it is allowed to finish. However, the execution must not
+    // proceed with the remaining (i.e. leadership) movements until the window opens again.
+    waitUntilTrue(() -> executor.state().state() == ExecutorState.State.LEADER_MOVEMENT_TASK_IN_PROGRESS
+                        && executor.state().executionPausedReason() != null,
+                  "Execution did not report waiting for the execution time window within the time limit",
+                  EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
+    Map<ExecutionTaskState, Integer> interBrokerTaskStats =
+        executor.state().executionTasksSummary().taskStat().get(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
+    assertEquals(0, interBrokerTaskStats.get(ExecutionTaskState.DEAD).intValue());
+    assertEquals(0, interBrokerTaskStats.get(ExecutionTaskState.ABORTED).intValue());
+    assertEquals(0, interBrokerTaskStats.get(ExecutionTaskState.PENDING).intValue());
+    assertTrue(interBrokerTaskStats.get(ExecutionTaskState.COMPLETED) > 0);
+    assertTrue(executor.hasOngoingExecution());
+    assertTrue(executor.state().executionTasksSummary().taskStat().get(ExecutionTask.TaskType.LEADER_ACTION)
+                       .get(ExecutionTaskState.PENDING) > 0);
+
+    // Once the window opens again on the next day, the execution resumes and finishes.
+    time.setCurrentTimeMs(timeMsInUtc(29, 7));
+    waitUntilTrue(() -> (!executor.hasOngoingExecution() && executor.state().state() == ExecutorState.State.NO_TASK_IN_PROGRESS),
+                  "Proposal execution did not finish within the time limit",
+                  EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
+    verifyReplicasMoved(proposalsToCheck);
+  }
+
+  private static long timeMsInUtc(int dayOfMonth, int hour) {
+    return ZonedDateTime.of(2026, 9, dayOfMonth, hour, 0, 0, 0, UTC).toInstant().toEpochMilli();
+  }
+
+  private Executor executorForExecutionTimeWindowTest(Time time) {
+    KafkaCruiseControlConfig configs = new KafkaCruiseControlConfig(getExecutorProperties());
+    UserTaskManager.UserTaskInfo mockUserTaskInfo = getMockUserTaskInfo();
+    UserTaskManager mockUserTaskManager = getMockUserTaskManager(RANDOM_UUID, mockUserTaskInfo, Collections.singletonList(false));
+    AnomalyDetectorManager mockAnomalyDetectorManager = getMockAnomalyDetector(RANDOM_UUID, false);
+    EasyMock.replay(mockUserTaskInfo, mockUserTaskManager, mockAnomalyDetectorManager);
+    Executor executor = new Executor(configs, time, new MetricRegistry(), (AdminClient) _adminClient,
+                                     new MetadataAdminClient(_adminClient), null, mockAnomalyDetectorManager);
+    executor.setUserTaskManager(mockUserTaskManager);
+    return executor;
+  }
+
+  private static LoadMonitor getMockLoadMonitorForExecutionTimeWindowTest() {
+    LoadMonitor mockLoadMonitor = getMockLoadMonitor();
+    EasyMock.replay(mockLoadMonitor);
+    return mockLoadMonitor;
+  }
+
+  private void verifyReplicasMoved(Collection<ExecutionProposal> proposalsToCheck) {
+    for (ExecutionProposal proposal : proposalsToCheck) {
+      TopicPartition tp = new TopicPartition(proposal.topic(), proposal.partitionId());
+      Set<Integer> expectedBrokerIds = proposal.newReplicas().stream().map(ReplicaPlacementInfo::brokerId).collect(Collectors.toSet());
+      _cluster.waitForTopicMetadata(
+        List.of(tp.topic()),
+        Duration.ofSeconds(15),
+        Duration.ofSeconds(60),
+        topicDescription -> {
+          TopicPartitionInfo partitionInfo = topicDescription.partitions().get(tp.partition());
+          Set<Integer> actualBrokerIds = partitionInfo.replicas().stream().map(Node::id).collect(Collectors.toSet());
+          Node leader = partitionInfo.leader();
+          return actualBrokerIds.equals(expectedBrokerIds) && leader != null && leader.id() == proposal.newLeader().brokerId();
+        });
+    }
   }
 
   /**

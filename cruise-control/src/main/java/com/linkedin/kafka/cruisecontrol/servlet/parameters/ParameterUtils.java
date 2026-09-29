@@ -17,6 +17,7 @@ import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.detector.notifier.KafkaAnomalyType;
 import com.linkedin.kafka.cruisecontrol.executor.ConcurrencyType;
+import com.linkedin.kafka.cruisecontrol.executor.ExecutionTimeWindow;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint;
 import com.linkedin.kafka.cruisecontrol.servlet.UserRequestException;
@@ -131,6 +132,8 @@ public final class ParameterUtils {
   public static final String FAST_MODE_PARAM = "fast_mode";
   public static final String STOP_EXTERNAL_AGENT_PARAM = "stop_external_agent";
   public static final String DEVELOPER_MODE_PARAM = "developer_mode";
+  public static final String EXECUTION_WINDOW_START_HOUR_PARAM = "execution_window_start_hour";
+  public static final String EXECUTION_WINDOW_END_HOUR_PARAM = "execution_window_end_hour";
   private static final int MAX_REASON_LENGTH = 50;
   private static final String DELIMITER_BETWEEN_BROKER_ID_AND_LOGDIR = "-";
   public static final long DEFAULT_START_TIME_FOR_CLUSTER_MODEL = -1L;
@@ -864,6 +867,53 @@ public final class ParameterUtils {
    */
   static Long executionProgressCheckIntervalMs(CruiseControlRequestContext requestContext) {
     return getLongParam(requestContext, EXECUTION_PROGRESS_CHECK_INTERVAL_MS_PARAM, null);
+  }
+
+  /**
+   * Get the daily time window within which the execution is allowed to start new movements. Default: {@code null} (no window).
+   * Both {@link #EXECUTION_WINDOW_START_HOUR_PARAM} and {@link #EXECUTION_WINDOW_END_HOUR_PARAM} must be either set together
+   * or omitted together. The hours are interpreted in the time zone configured via
+   * {@link ExecutorConfig#EXECUTION_WINDOW_TIMEZONE_CONFIG}.
+   *
+   * @param requestContext The Http request.
+   * @param config The configurations of Cruise Control.
+   * @return The execution time window, or {@code null} if no window is requested.
+   */
+  static ExecutionTimeWindow executionTimeWindow(CruiseControlRequestContext requestContext, KafkaCruiseControlConfig config) {
+    Integer startHour = executionWindowHour(requestContext, EXECUTION_WINDOW_START_HOUR_PARAM);
+    Integer endHour = executionWindowHour(requestContext, EXECUTION_WINDOW_END_HOUR_PARAM);
+    if (startHour == null && endHour == null) {
+      return null;
+    }
+    if (startHour == null || endHour == null) {
+      throw new UserRequestException(String.format("%s and %s must be specified together.", EXECUTION_WINDOW_START_HOUR_PARAM,
+                                                   EXECUTION_WINDOW_END_HOUR_PARAM));
+    }
+    if (startHour.equals(endHour)) {
+      throw new UserRequestException(String.format("%s and %s cannot be the same (requested: %d).", EXECUTION_WINDOW_START_HOUR_PARAM,
+                                                   EXECUTION_WINDOW_END_HOUR_PARAM, startHour));
+    }
+    return new ExecutionTimeWindow(startHour, endHour,
+                                   ExecutorConfig.executionWindowZoneId(config.getString(ExecutorConfig.EXECUTION_WINDOW_TIMEZONE_CONFIG)));
+  }
+
+  private static Integer executionWindowHour(CruiseControlRequestContext requestContext, String parameter) {
+    String parameterString = caseSensitiveParameterName(requestContext.getParameterMap(), parameter);
+    if (parameterString == null) {
+      return null;
+    }
+    String value = requestContext.getParameter(parameterString);
+    int hour;
+    try {
+      hour = Integer.parseInt(value.trim());
+    } catch (NumberFormatException e) {
+      throw new UserRequestException(String.format("%s must be an integer hour of the day (requested: %s).", parameter, value));
+    }
+    if (hour < ExecutionTimeWindow.MIN_HOUR || hour > ExecutionTimeWindow.MAX_HOUR) {
+      throw new UserRequestException(String.format("%s must be in [%d, %d] (requested: %d).", parameter, ExecutionTimeWindow.MIN_HOUR,
+                                                   ExecutionTimeWindow.MAX_HOUR, hour));
+    }
+    return hour;
   }
 
   /**

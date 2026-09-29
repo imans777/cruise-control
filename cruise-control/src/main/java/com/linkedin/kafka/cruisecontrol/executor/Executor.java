@@ -127,6 +127,10 @@ public class Executor {
   private final AtomicInteger _numExecutionStartedInNonKafkaAssignerMode;
   private volatile boolean _isKafkaAssignerMode;
   private volatile boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+  // The daily time window within which the ongoing execution is allowed to start new movements (null if no window).
+  private volatile ExecutionTimeWindow _executionTimeWindow;
+  // The reason why the ongoing execution is not starting new movements (null if it is not paused).
+  private volatile String _executionPausedReason;
   // TODO: Execution history is currently kept in memory, but ideally we should move it to a persistent store.
   private final long _demotionHistoryRetentionTimeMs;
   private final long _removalHistoryRetentionTimeMs;
@@ -192,6 +196,8 @@ public class Executor {
     _partitionMovementMbPerSec = new AtomicDouble(0);
     _isKafkaAssignerMode = false;
     _skipInterBrokerReplicaConcurrencyAdjustment = false;
+    _executionTimeWindow = null;
+    _executionPausedReason = null;
     ExecutionUtils.init(config);
     _config = config;
 
@@ -827,9 +833,70 @@ public class Executor {
                                             String uuid,
                                             boolean isKafkaAssignerMode,
                                             boolean skipInterBrokerReplicaConcurrencyAdjustment) throws OngoingExecutionException {
+    executeProposals(proposals, unthrottledBrokers, removedBrokers, loadMonitor, requestedInterBrokerPartitionMovementConcurrency,
+                     requestedMaxClusterPartitionMovements, requestedIntraBrokerPartitionMovementConcurrency,
+                     requestedClusterLeadershipMovementConcurrency, requestedBrokerLeadershipMovementConcurrency,
+                     requestedExecutionProgressCheckIntervalMs, replicaMovementStrategy, replicationThrottle, isTriggeredByUserRequest, uuid,
+                     isKafkaAssignerMode, skipInterBrokerReplicaConcurrencyAdjustment, null);
+  }
+
+  /**
+   * Initialize proposal execution and start execution, starting new movements only within the given execution time window.
+   *
+   * <ul>
+   *   <li>The execution time window only gates the start of new movements. Movements that are already in progress when the
+   *   window closes are allowed to finish -- they are never stopped or rolled back due to the window.</li>
+   *   <li>While the window is closed, the executor state reports the reason why no new movements are started.</li>
+   * </ul>
+   *
+   * @param proposals Proposals to be executed.
+   * @param unthrottledBrokers Brokers that are not throttled in terms of the number of in/out replica movements.
+   * @param removedBrokers Removed brokers, null if no brokers has been removed.
+   * @param loadMonitor Load monitor.
+   * @param requestedInterBrokerPartitionMovementConcurrency The maximum number of concurrent inter-broker partition movements
+   *                                                         per broker(if null, use num.concurrent.partition.movements.per.broker).
+   * @param requestedMaxClusterPartitionMovements The upper bound of concurrent inter broker partition movements in cluster
+   *                                              (if null, use max.num.cluster.partition.movements).
+   * @param requestedIntraBrokerPartitionMovementConcurrency The maximum number of concurrent intra-broker partition movements
+   *                                                         (if null, use num.concurrent.intra.broker.partition.movements).
+   * @param requestedClusterLeadershipMovementConcurrency The maximum number of concurrent leader movements in a cluster
+   *                                               (if null, use num.concurrent.leader.movements).
+   * @param requestedBrokerLeadershipMovementConcurrency The maximum number of concurrent leader movements involved in a broker
+   *                                               (if null, use num.concurrent.leader.movements.per.broker).
+   * @param requestedExecutionProgressCheckIntervalMs The interval between checking and updating the progress of an initiated
+   *                                                  execution (if null, use execution.progress.check.interval.ms).
+   * @param replicaMovementStrategy The strategy used to determine the execution order of generated replica movement tasks.
+   * @param replicationThrottle The replication throttle (bytes/second) to apply to both leaders and followers
+   *                            when executing a proposal (if null, no throttling is applied).
+   * @param isTriggeredByUserRequest Whether the execution is triggered by a user request.
+   * @param uuid UUID of the execution.
+   * @param isKafkaAssignerMode {@code true} if kafka assigner mode, {@code false} otherwise.
+   * @param skipInterBrokerReplicaConcurrencyAdjustment {@code true} to skip auto adjusting concurrency of inter-broker
+   * replica movements even if the concurrency adjuster is enabled, {@code false} otherwise.
+   * @param executionTimeWindow The daily time window within which new movements are allowed to start (if null, no window).
+   */
+  public synchronized void executeProposals(Collection<ExecutionProposal> proposals,
+                                            Set<Integer> unthrottledBrokers,
+                                            Set<Integer> removedBrokers,
+                                            LoadMonitor loadMonitor,
+                                            Integer requestedInterBrokerPartitionMovementConcurrency,
+                                            Integer requestedMaxClusterPartitionMovements,
+                                            Integer requestedIntraBrokerPartitionMovementConcurrency,
+                                            Integer requestedClusterLeadershipMovementConcurrency,
+                                            Integer requestedBrokerLeadershipMovementConcurrency,
+                                            Long requestedExecutionProgressCheckIntervalMs,
+                                            ReplicaMovementStrategy replicaMovementStrategy,
+                                            Long replicationThrottle,
+                                            boolean isTriggeredByUserRequest,
+                                            String uuid,
+                                            boolean isKafkaAssignerMode,
+                                            boolean skipInterBrokerReplicaConcurrencyAdjustment,
+                                            ExecutionTimeWindow executionTimeWindow) throws OngoingExecutionException {
     setExecutionMode(isKafkaAssignerMode);
     sanityCheckExecuteProposals(loadMonitor, uuid);
     _skipInterBrokerReplicaConcurrencyAdjustment = skipInterBrokerReplicaConcurrencyAdjustment;
+    _executionTimeWindow = executionTimeWindow;
+    _executionPausedReason = null;
     try {
       initProposalExecution(proposals, unthrottledBrokers, requestedInterBrokerPartitionMovementConcurrency, requestedMaxClusterPartitionMovements,
                             requestedIntraBrokerPartitionMovementConcurrency, requestedClusterLeadershipMovementConcurrency,
@@ -924,6 +991,8 @@ public class Executor {
     setExecutionMode(false);
     sanityCheckExecuteProposals(loadMonitor, uuid);
     _skipInterBrokerReplicaConcurrencyAdjustment = true;
+    _executionTimeWindow = null;
+    _executionPausedReason = null;
     try {
       initProposalExecution(proposals, demotedBrokers, concurrentSwaps, null, 0,
                             requestedClusterLeadershipMovementConcurrency, requestedBrokerLeadershipMovementConcurrency,
@@ -1088,6 +1157,8 @@ public class Executor {
     _executionTaskManager.clear();
     _uuid = null;
     _reasonSupplier = null;
+    _executionTimeWindow = null;
+    _executionPausedReason = null;
     _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());
   }
 
@@ -1457,7 +1528,9 @@ public class Executor {
                                                              _reasonSupplier.get(),
                                                              _recentlyDemotedBrokers,
                                                              _recentlyRemovedBrokers,
-                                                             _isTriggeredByUserRequest);
+                                                             _isTriggeredByUserRequest,
+                                                             _executionTimeWindow,
+                                                             _executionPausedReason);
           interBrokerMoveReplicas();
           updateOngoingExecutionState();
         }
@@ -1473,7 +1546,9 @@ public class Executor {
                                                              _reasonSupplier.get(),
                                                              _recentlyDemotedBrokers,
                                                              _recentlyRemovedBrokers,
-                                                             _isTriggeredByUserRequest);
+                                                             _isTriggeredByUserRequest,
+                                                             _executionTimeWindow,
+                                                             _executionPausedReason);
           intraBrokerMoveReplicas();
           updateOngoingExecutionState();
         }
@@ -1489,7 +1564,9 @@ public class Executor {
                                                              _reasonSupplier.get(),
                                                              _recentlyDemotedBrokers,
                                                              _recentlyRemovedBrokers,
-                                                             _isTriggeredByUserRequest);
+                                                             _isTriggeredByUserRequest,
+                                                             _executionTimeWindow,
+                                                             _executionPausedReason);
           moveLeaderships();
           updateOngoingExecutionState();
         }
@@ -1539,6 +1616,8 @@ public class Executor {
       _executionTaskManager.clear();
       _uuid = null;
       _reasonSupplier = null;
+      _executionTimeWindow = null;
+      _executionPausedReason = null;
       _executorState = ExecutorState.noTaskInProgress(_recentlyDemotedBrokers, _recentlyRemovedBrokers);
       _hasOngoingExecution = false;
       _noOngoingExecutionSemaphore.release();
@@ -1562,7 +1641,9 @@ public class Executor {
                                                                _reasonSupplier.get(),
                                                                _recentlyDemotedBrokers,
                                                                _recentlyRemovedBrokers,
-                                                               _isTriggeredByUserRequest);
+                                                               _isTriggeredByUserRequest,
+                                                               _executionTimeWindow,
+                                                               _executionPausedReason);
             break;
           case INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS:
             _executorState = ExecutorState.operationInProgress(INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS,
@@ -1574,7 +1655,9 @@ public class Executor {
                                                                _reasonSupplier.get(),
                                                                _recentlyDemotedBrokers,
                                                                _recentlyRemovedBrokers,
-                                                               _isTriggeredByUserRequest);
+                                                               _isTriggeredByUserRequest,
+                                                               _executionTimeWindow,
+                                                               _executionPausedReason);
             break;
           case INTRA_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS:
             _executorState = ExecutorState.operationInProgress(INTRA_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS,
@@ -1586,7 +1669,9 @@ public class Executor {
                                                                _reasonSupplier.get(),
                                                                _recentlyDemotedBrokers,
                                                                _recentlyRemovedBrokers,
-                                                               _isTriggeredByUserRequest);
+                                                               _isTriggeredByUserRequest,
+                                                               _executionTimeWindow,
+                                                               _executionPausedReason);
             break;
           default:
             throw new IllegalStateException("Unexpected ongoing execution state " + _executorState.state());
@@ -1601,7 +1686,9 @@ public class Executor {
                                                            _reasonSupplier.get(),
                                                            _recentlyDemotedBrokers,
                                                            _recentlyRemovedBrokers,
-                                                           _isTriggeredByUserRequest);
+                                                           _isTriggeredByUserRequest,
+                                                           _executionTimeWindow,
+                                                           _executionPausedReason);
       }
     }
 
@@ -1617,8 +1704,15 @@ public class Executor {
       int partitionsToMove = numTotalPartitionMovements;
       // Exhaust all the pending partition movements.
       while ((partitionsToMove > 0 || !inExecutionTasks().isEmpty()) && _stopSignal.get() == NO_STOP_EXECUTION) {
+        // The execution time window (if any) only gates starting new tasks -- in-progress tasks are always allowed to finish.
+        boolean canStartNewTasks = canStartNewTasksInExecutionTimeWindow();
+        if (!canStartNewTasks && inExecutionTasks().isEmpty()) {
+          waitForExecutionTimeWindowToOpen();
+          continue;
+        }
         // Get tasks to execute.
-        List<ExecutionTask> tasksToExecute = _executionTaskManager.getInterBrokerReplicaMovementTasks();
+        List<ExecutionTask> tasksToExecute = canStartNewTasks ? _executionTaskManager.getInterBrokerReplicaMovementTasks()
+                                                              : Collections.emptyList();
         LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
 
         AlterPartitionReassignmentsResult result = null;
@@ -1686,8 +1780,15 @@ public class Executor {
       int partitionsToMove = numTotalPartitionMovements;
       // Exhaust all the pending partition movements.
       while ((partitionsToMove > 0 || !inExecutionTasks().isEmpty()) && _stopSignal.get() == NO_STOP_EXECUTION) {
+        // The execution time window (if any) only gates starting new tasks -- in-progress tasks are always allowed to finish.
+        boolean canStartNewTasks = canStartNewTasksInExecutionTimeWindow();
+        if (!canStartNewTasks && inExecutionTasks().isEmpty()) {
+          waitForExecutionTimeWindowToOpen();
+          continue;
+        }
         // Get tasks to execute.
-        List<ExecutionTask> tasksToExecute = _executionTaskManager.getIntraBrokerReplicaMovementTasks();
+        List<ExecutionTask> tasksToExecute = canStartNewTasks ? _executionTaskManager.getIntraBrokerReplicaMovementTasks()
+                                                              : Collections.emptyList();
         LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
 
         if (!tasksToExecute.isEmpty()) {
@@ -1745,6 +1846,11 @@ public class Executor {
       LOG.info("User task {}: Starting {} leadership movements.", _uuid, numTotalLeadershipMovements);
       int numFinishedLeadershipMovements = 0;
       while (_executionTaskManager.numRemainingLeadershipMovements() != 0 && _stopSignal.get() == NO_STOP_EXECUTION) {
+        // Each batch of leadership movements completes before the next one starts; hence, only wait between batches.
+        if (!canStartNewTasksInExecutionTimeWindow()) {
+          waitForExecutionTimeWindowToOpen();
+          continue;
+        }
         updateOngoingExecutionState();
         numFinishedLeadershipMovements += moveLeadershipInBatch();
         LOG.info("User task {}: {}/{} ({}%) leadership movements completed.", _uuid, numFinishedLeadershipMovements,
@@ -1764,6 +1870,51 @@ public class Executor {
                  leadershipMovementTasksByState.get(ExecutionTaskState.ABORTED),
                  leadershipMovementTasksByState.get(ExecutionTaskState.DEAD),
                  leadershipMovementTasksByState.get(ExecutionTaskState.COMPLETED));
+      }
+    }
+
+    /**
+     * Check whether new movement tasks can be started with respect to the execution time window (if any). If the window is
+     * closed, the reason for not starting new tasks is recorded to be reported in the executor state. Note that the window
+     * only gates starting new tasks: tasks that are already in progress are never stopped or rolled back due to the window.
+     *
+     * @return {@code true} if there is no execution time window or the window is open, {@code false} otherwise.
+     */
+    private boolean canStartNewTasksInExecutionTimeWindow() {
+      ExecutionTimeWindow executionTimeWindow = _executionTimeWindow;
+      if (executionTimeWindow == null) {
+        return true;
+      }
+      long nowMs = _time.milliseconds();
+      if (executionTimeWindow.isOpen(nowMs)) {
+        if (_executionPausedReason != null) {
+          LOG.info("User task {}: Execution time window {} is open. Resuming the execution.", _uuid, executionTimeWindow);
+          _executionPausedReason = null;
+          updateOngoingExecutionState();
+        }
+        return true;
+      }
+      String pausedReason = String.format("Waiting for the execution time window %s to open at %s before starting new movements."
+                                          + " Movements that are already in progress are allowed to finish.",
+                                          executionTimeWindow, executionTimeWindow.nextOpenTime(nowMs));
+      if (!pausedReason.equals(_executionPausedReason)) {
+        LOG.info("User task {}: {}", _uuid, pausedReason);
+        _executionPausedReason = pausedReason;
+      }
+      updateOngoingExecutionState();
+      return false;
+    }
+
+    /**
+     * Wait until the execution time window opens or the execution is stopped.
+     */
+    private void waitForExecutionTimeWindowToOpen() {
+      while (_stopSignal.get() == NO_STOP_EXECUTION && !canStartNewTasksInExecutionTimeWindow()) {
+        try {
+          Thread.sleep(executionProgressCheckIntervalMs());
+        } catch (InterruptedException e) {
+          // let it go
+        }
       }
     }
 
