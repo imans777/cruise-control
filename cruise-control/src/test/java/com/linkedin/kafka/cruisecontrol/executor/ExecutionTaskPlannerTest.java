@@ -15,6 +15,8 @@ import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeLargeReplica
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeMinIsrWithOfflineReplicasStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeOneAboveMinIsrWithOfflineReplicasStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeSmallReplicaMovementStrategy;
+import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
+import com.linkedin.kafka.cruisecontrol.executor.strategy.RoundRobinBrokerReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import java.lang.reflect.Constructor;
@@ -42,6 +44,8 @@ import org.junit.Test;
 import static org.apache.kafka.common.KafkaFuture.completedFuture;
 import static org.easymock.EasyMock.anyObject;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC1;
 import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC2;
 import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC3;
@@ -413,6 +417,80 @@ public class ExecutionTaskPlannerTest {
   }
 
   @Test
+  public void testRoundRobinBrokerStrategyRotatesBrokers() {
+    // Broker 0 is the leader of both p0 and p1, which have smaller execution ids than p2.
+    ExecutionProposal p0 = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 10, _r0, List.of(_r0, _r1), List.of(_r0, _r2));
+    ExecutionProposal p1 = new ExecutionProposal(new TopicPartition(TOPIC1, 1), 10, _r0, List.of(_r0, _r1), List.of(_r0, _r2));
+    ExecutionProposal p2 = new ExecutionProposal(new TopicPartition(TOPIC1, 2), 10, _r3, List.of(_r3, _r4), List.of(_r3, _r5));
+    List<ExecutionProposal> proposals = List.of(p0, p1, p2);
+    StrategyOptions strategyOptions = strategyOptionsFor(proposals);
+
+    // The base strategy keeps picking broker 0 as long as it has the task with the highest priority.
+    ExecutionTaskPlanner basePlanner =
+        new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
+    basePlanner.addExecutionProposals(proposals, strategyOptions, null);
+    assertEquals(List.of(p0, p1, p2), getInterBrokerReplicaMovementsOneByOne(basePlanner, proposals.size()));
+
+    // The round-robin broker strategy picks broker 0 again only after the other brokers had their turn.
+    Properties roundRobinProps = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    roundRobinProps.setProperty(ExecutorConfig.DEFAULT_REPLICA_MOVEMENT_STRATEGIES_CONFIG,
+                                RoundRobinBrokerReplicaMovementStrategy.class.getName());
+    ExecutionTaskPlanner roundRobinPlanner = new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(roundRobinProps));
+    roundRobinPlanner.addExecutionProposals(proposals, strategyOptions, null);
+    assertEquals(List.of(p0, p2, p1), getInterBrokerReplicaMovementsOneByOne(roundRobinPlanner, proposals.size()));
+  }
+
+  @Test
+  public void testRoundRobinBrokerStrategyConsidersAllReplicasInvolved() {
+    // Broker 1 is a follower of p0 (whose replica is being removed) and the leader of p1.
+    ExecutionProposal p0 = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 10, _r0, List.of(_r0, _r1), List.of(_r0, _r2));
+    ExecutionProposal p1 = new ExecutionProposal(new TopicPartition(TOPIC1, 1), 10, _r1, List.of(_r1, _r3), List.of(_r1, _r4));
+    ExecutionProposal p2 = new ExecutionProposal(new TopicPartition(TOPIC1, 2), 10, _r5, List.of(_r5, new ReplicaPlacementInfo(6)),
+                                                 List.of(_r5, new ReplicaPlacementInfo(7)));
+    List<ExecutionProposal> proposals = List.of(p0, p1, p2);
+    StrategyOptions strategyOptions = strategyOptionsFor(proposals);
+    int maxInterBrokerPartitionMovements = 2;
+
+    // The base strategy only considers the leader and destination brokers as involved, so p0 and p1 are picked together.
+    ExecutionTaskPlanner basePlanner =
+        new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
+    basePlanner.addExecutionProposals(proposals, strategyOptions, null);
+    List<ExecutionTask> tasks = basePlanner.getInterBrokerReplicaMovementTasks(readyBrokers(), Collections.emptySet(),
+                                                                               maxInterBrokerPartitionMovements);
+    assertEquals(List.of(p0, p1), proposalsOf(tasks));
+
+    // The round-robin broker strategy considers broker 1 as involved in p0, so p2 is picked together with p0.
+    ExecutionTaskPlanner roundRobinPlanner =
+        new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
+    roundRobinPlanner.addExecutionProposals(proposals, strategyOptions, new RoundRobinBrokerReplicaMovementStrategy());
+    tasks = roundRobinPlanner.getInterBrokerReplicaMovementTasks(readyBrokers(), Collections.emptySet(), maxInterBrokerPartitionMovements);
+    assertEquals(List.of(p0, p2), proposalsOf(tasks));
+  }
+
+  @Test
+  public void testDynamicConfigRoundRobinBrokerStrategy() {
+    ExecutionProposal p0 = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 10, _r0, List.of(_r0, _r1), List.of(_r0, _r2));
+    ExecutionProposal p1 = new ExecutionProposal(new TopicPartition(TOPIC1, 1), 10, _r0, List.of(_r0, _r1), List.of(_r0, _r2));
+    ExecutionProposal p2 = new ExecutionProposal(new TopicPartition(TOPIC1, 2), 10, _r3, List.of(_r3, _r4), List.of(_r3, _r5));
+    List<ExecutionProposal> proposals = List.of(p0, p1, p2);
+    StrategyOptions strategyOptions = strategyOptionsFor(proposals);
+    ExecutionTaskPlanner planner =
+        new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
+
+    // Round-robin broker strategy chained after another strategy.
+    ReplicaMovementStrategy chainedStrategy = new PrioritizeLargeReplicaMovementStrategy().chain(new RoundRobinBrokerReplicaMovementStrategy());
+    assertTrue(RoundRobinBrokerReplicaMovementStrategy.isEnabledIn(chainedStrategy.chainBaseReplicaMovementStrategyIfAbsent()));
+    planner.addExecutionProposals(proposals, strategyOptions, chainedStrategy);
+    assertEquals(List.of(p0, p2, p1), getInterBrokerReplicaMovementsOneByOne(planner, proposals.size()));
+    planner.clear();
+
+    // Falls back to the default strategy for the next execution.
+    assertFalse(RoundRobinBrokerReplicaMovementStrategy.isEnabledIn(new PrioritizeLargeReplicaMovementStrategy()));
+    planner.addExecutionProposals(proposals, strategyOptions, null);
+    assertEquals(List.of(p0, p1, p2), getInterBrokerReplicaMovementsOneByOne(planner, proposals.size()));
+  }
+
+  @Test
   public void testGetIntraBrokerPartitionMovementTasks() {
     ReplicaPlacementInfo r0d0 = new ReplicaPlacementInfo(0, "d0");
     ReplicaPlacementInfo r0d1 = new ReplicaPlacementInfo(0, "d1");
@@ -500,6 +578,50 @@ public class ExecutionTaskPlannerTest {
     planner.clear();
     assertEquals(0, planner.remainingLeadershipMovements().size());
     assertEquals(0, planner.remainingInterBrokerReplicaMovements().size());
+  }
+
+  /**
+   * Get the inter-broker replica movements from the given planner one at a time (i.e. max one partition movement per call).
+   *
+   * @param planner The execution task planner to get the inter-broker replica movements from.
+   * @param numMovements The number of inter-broker replica movements to get.
+   * @return The proposals of the inter-broker replica movements in the order they are picked by the planner.
+   */
+  private List<ExecutionProposal> getInterBrokerReplicaMovementsOneByOne(ExecutionTaskPlanner planner, int numMovements) {
+    List<ExecutionProposal> movements = new ArrayList<>();
+    Map<Integer, Integer> readyBrokers = readyBrokers();
+    for (int i = 0; i < numMovements; i++) {
+      List<ExecutionTask> tasks = planner.getInterBrokerReplicaMovementTasks(readyBrokers, Collections.emptySet(), 1);
+      assertEquals(1, tasks.size());
+      movements.add(tasks.get(0).proposal());
+    }
+    assertEquals(0, planner.remainingInterBrokerReplicaMovements().size());
+    return movements;
+  }
+
+  private static Map<Integer, Integer> readyBrokers() {
+    Map<Integer, Integer> readyBrokers = new HashMap<>();
+    for (int brokerId = 0; brokerId < 8; brokerId++) {
+      readyBrokers.put(brokerId, MAX_BROKER_CONCURRENCY);
+    }
+    return readyBrokers;
+  }
+
+  private static List<ExecutionProposal> proposalsOf(List<ExecutionTask> tasks) {
+    List<ExecutionProposal> proposals = new ArrayList<>(tasks.size());
+    tasks.forEach(task -> proposals.add(task.proposal()));
+    return proposals;
+  }
+
+  private StrategyOptions strategyOptionsFor(List<ExecutionProposal> proposals) {
+    Set<PartitionInfo> partitions = new HashSet<>();
+    proposals.forEach(proposal -> partitions.add(generatePartitionInfo(proposal, false)));
+    List<Node> nodes = new ArrayList<>();
+    for (int brokerId = 0; brokerId < 8; brokerId++) {
+      nodes.add(new Node(brokerId, "null", -1));
+    }
+    Cluster cluster = new Cluster(null, nodes, partitions, Collections.emptySet(), Collections.emptySet());
+    return new StrategyOptions.Builder(cluster).build();
   }
 
   private Node[] generateExpectedReplicas(ExecutionProposal proposal) {
