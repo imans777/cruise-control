@@ -4,6 +4,7 @@
 
 package com.linkedin.kafka.cruisecontrol.executor;
 
+import com.linkedin.cruisecontrol.monitor.sampling.aggregator.MetricValues;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.ValuesAndExtrapolations;
 import com.linkedin.kafka.cruisecontrol.common.TopicMinIsrCache.MinIsrWithTime;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
@@ -98,6 +99,13 @@ public final class ExecutionUtils {
   private static int minNumBrokersViolateMetricLimitToDecreaseClusterConcurrency;
   private static long listPartitionReassignmentsTimeoutMs;
   private static int listPartitionReassignmentsMaxAttempts;
+  static final double BYTES_IN_KB = 1024.0;
+  // Bounds and adjustment parameters of the replication throttle (bytes/sec) used by the concurrency adjuster.
+  private static long minReplicationThrottle;
+  private static long maxReplicationThrottle;
+  private static long additiveIncreaseReplicationThrottle;
+  private static int multiplicativeDecreaseReplicationThrottle;
+  private static double replicationThrottleTargetNetworkUtilization;
 
   private ExecutionUtils() { }
 
@@ -145,6 +153,82 @@ public final class ExecutionUtils {
     listPartitionReassignmentsMaxAttempts = config.getInt(ExecutorConfig.LIST_PARTITION_REASSIGNMENTS_MAX_ATTEMPTS_CONFIG);
     minNumBrokersViolateMetricLimitToDecreaseClusterConcurrency =
         Math.max(1, config.getInt(ExecutorConfig.MIN_NUM_BROKERS_VIOLATE_METRIC_LIMIT_TO_DECREASE_CLUSTER_CONCURRENCY_CONFIG));
+    minReplicationThrottle = config.getLong(ExecutorConfig.CONCURRENCY_ADJUSTER_MIN_REPLICATION_THROTTLE_CONFIG);
+    maxReplicationThrottle = config.getLong(ExecutorConfig.CONCURRENCY_ADJUSTER_MAX_REPLICATION_THROTTLE_CONFIG);
+    additiveIncreaseReplicationThrottle = config.getLong(ExecutorConfig.CONCURRENCY_ADJUSTER_ADDITIVE_INCREASE_REPLICATION_THROTTLE_CONFIG);
+    multiplicativeDecreaseReplicationThrottle =
+        config.getInt(ExecutorConfig.CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE_CONFIG);
+    replicationThrottleTargetNetworkUtilization =
+        config.getDouble(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_CONFIG);
+  }
+
+  /**
+   * Get the latest value of the given broker metric.
+   *
+   * @param currentMetrics Current metrics of a broker.
+   * @param metricDef The broker metric to retrieve.
+   * @return The latest value of the given broker metric, or {@code null} if the metric is not available.
+   */
+  @Nullable
+  static Double latestBrokerMetricValue(ValuesAndExtrapolations currentMetrics, KafkaMetricDef metricDef) {
+    MetricValues metricValues = currentMetrics.metricValues().valuesFor(KafkaMetricDef.brokerMetricDef().metricInfo(metricDef.name()).id());
+    return metricValues == null ? null : (double) metricValues.latest();
+  }
+
+  /**
+   * Recommend the replication throttle of a broker in one traffic direction (i.e. inbound for the follower throttle and outbound
+   * for the leader throttle) based on the network headroom of the broker in that direction.
+   *
+   * <p>The target throttle is the throttle that would bring the network utilization of the broker to the target utilization
+   * ({@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_CONFIG}), assuming that the throttled
+   * replica movements use up to the current throttle. Throttled replica movements are part of the replication traffic and cannot
+   * exceed the current throttle, hence the traffic not attributed to them is estimated as
+   * {@code leader traffic + replication traffic - min(current throttle, replication traffic)}.</p>
+   *
+   * <ul>
+   *   <li>If the target is below the current throttle, the throttle is decreased to the target at once (bounded by the minimum
+   *   throttle).</li>
+   *   <li>If the target is above the current throttle, the throttle is increased by at most the additive increase (bounded by the
+   *   maximum throttle), and only if the replication traffic is at least the current throttle -- i.e. only if the throttle may be
+   *   limiting the replica movements. Otherwise, increasing the throttle would not speed up the movements, and the network
+   *   headroom may have been overestimated.</li>
+   * </ul>
+   *
+   * @param currentThrottle The current throttle (bytes/sec) of the broker in the relevant direction.
+   * @param networkCapacityKBps The network capacity (KB/sec) of the broker in the relevant direction.
+   * @param leaderBytesRateKBps The leader (i.e. client) traffic (KB/sec) of the broker in the relevant direction.
+   * @param replicationBytesRateKBps The replication traffic (KB/sec) of the broker in the relevant direction.
+   * @return The recommended throttle (bytes/sec) of the broker in the relevant direction.
+   */
+  static long recommendedReplicationThrottle(long currentThrottle,
+                                             double networkCapacityKBps,
+                                             double leaderBytesRateKBps,
+                                             double replicationBytesRateKBps) {
+    double currentThrottleKBps = currentThrottle / BYTES_IN_KB;
+    double otherTrafficKBps = leaderBytesRateKBps + replicationBytesRateKBps - Math.min(currentThrottleKBps, replicationBytesRateKBps);
+    double targetThrottleKBps = replicationThrottleTargetNetworkUtilization * networkCapacityKBps - otherTrafficKBps;
+    long targetThrottle = (long) Math.max(0.0, targetThrottleKBps * BYTES_IN_KB);
+
+    if (targetThrottle < currentThrottle) {
+      // Decrease at once (MIN: minReplicationThrottle).
+      return Math.min(currentThrottle, Math.max(minReplicationThrottle, targetThrottle));
+    }
+    if (targetThrottle > currentThrottle && replicationBytesRateKBps >= currentThrottleKBps) {
+      // Additive-increase (MAX: maxReplicationThrottle).
+      long increasedThrottle = Math.min(targetThrottle, currentThrottle + additiveIncreaseReplicationThrottle);
+      return Math.max(currentThrottle, Math.min(maxReplicationThrottle, increasedThrottle));
+    }
+    return currentThrottle;
+  }
+
+  /**
+   * Multiplicative-decrease the given replication throttle (MIN: minimum replication throttle of concurrency adjuster).
+   *
+   * @param currentThrottle The current throttle (bytes/sec).
+   * @return The decreased throttle (bytes/sec).
+   */
+  static long decreasedReplicationThrottle(long currentThrottle) {
+    return Math.min(currentThrottle, Math.max(minReplicationThrottle, currentThrottle / multiplicativeDecreaseReplicationThrottle));
   }
 
   public static String toMetricName(Short metricId) {
