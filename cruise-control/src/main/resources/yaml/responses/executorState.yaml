@@ -30,6 +30,10 @@ ExecutorState:
       items:
         type: integer
         format: int32
+    executionTimeWindow:
+      $ref: '#/ExecutionTimeWindow'
+    executionPausedReason:
+      type: string
     # leadership information
     numTotalLeadershipMovements:
       type: integer
@@ -222,3 +226,19 @@ ExecutionTask:
     brokerId:
       type: integer
       format: int32
+
+ExecutionTimeWindow:
+  type: object
+  required:
+    - startHour
+    - endHour
+    - timeZone
+  properties:
+    startHour:
+      type: integer
+      format: int32
+    endHour:
+      type: integer
+      format: int32
+    timeZone:
+      type: string

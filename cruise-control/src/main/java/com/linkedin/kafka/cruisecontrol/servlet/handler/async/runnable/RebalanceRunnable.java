@@ -8,6 +8,7 @@ import com.linkedin.kafka.cruisecontrol.KafkaCruiseControl;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizerResult;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.exception.KafkaCruiseControlException;
+import com.linkedin.kafka.cruisecontrol.executor.ExecutionTimeWindow;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.RebalanceParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.response.OptimizationResult;
@@ -30,6 +31,7 @@ import static com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable.Ru
 public class RebalanceRunnable extends GoalBasedOperationRunnable {
   public static final boolean SELF_HEALING_IGNORE_PROPOSAL_CACHE = false;
   public static final boolean SELF_HEALING_IS_REBALANCE_DISK_MODE = false;
+  public static final ExecutionTimeWindow SELF_HEALING_EXECUTION_TIME_WINDOW = null;
   protected final Integer _concurrentInterBrokerPartitionMovements;
   protected final Integer _maxInterBrokerPartitionMovements;
   protected final Integer _concurrentIntraBrokerPartitionMovements;
@@ -41,6 +43,7 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
   protected final boolean _ignoreProposalCache;
   protected final Set<Integer> _destinationBrokerIds;
   protected final boolean _isRebalanceDiskMode;
+  protected final ExecutionTimeWindow _executionTimeWindow;
   protected static final boolean SKIP_AUTO_REFRESHING_CONCURRENCY = false;
 
   /**
@@ -67,6 +70,7 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
     _ignoreProposalCache = SELF_HEALING_IGNORE_PROPOSAL_CACHE;
     _destinationBrokerIds = SELF_HEALING_DESTINATION_BROKER_IDS;
     _isRebalanceDiskMode = SELF_HEALING_IS_REBALANCE_DISK_MODE;
+    _executionTimeWindow = SELF_HEALING_EXECUTION_TIME_WINDOW;
   }
 
   public RebalanceRunnable(KafkaCruiseControl kafkaCruiseControl,
@@ -86,6 +90,7 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
     _ignoreProposalCache = parameters.ignoreProposalCache();
     _destinationBrokerIds = parameters.destinationBrokerIds();
     _isRebalanceDiskMode = parameters.isRebalanceDiskMode();
+    _executionTimeWindow = parameters.executionTimeWindow();
   }
 
   @Override
@@ -124,7 +129,7 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
           _concurrentInterBrokerPartitionMovements, _maxInterBrokerPartitionMovements,
           _concurrentIntraBrokerPartitionMovements, _clusterLeaderMovementConcurrency, _brokerLeaderMovementConcurrency,
           _executionProgressCheckIntervalMs, _replicaMovementStrategy,
-          _replicationThrottle, _isTriggeredByUserRequest, _uuid, SKIP_AUTO_REFRESHING_CONCURRENCY);
+          _replicationThrottle, _isTriggeredByUserRequest, _uuid, SKIP_AUTO_REFRESHING_CONCURRENCY, _executionTimeWindow);
     }
     return result;
   }

@@ -318,7 +318,8 @@ public class AnomalyDetectorManagerTest {
                                               EasyMock.eq(null),
                                               EasyMock.eq(false),
                                               EasyMock.anyString(),
-                                              EasyMock.eq(false));
+                                              EasyMock.eq(false),
+                                              EasyMock.isNull());
 
       EasyMock.expect(mockAnomalyNotifier.onGoalViolation(EasyMock.isA(GoalViolations.class))).andReturn(AnomalyNotificationResult.fix());
     } else if (anomalyType == KafkaAnomalyType.DISK_FAILURE) {

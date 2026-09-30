@@ -353,6 +353,8 @@ Supported parameters are:
 | reason                                        | string    | reason for the request                                                                                                                | "No reason provided"  | yes       | 
 | doAs                                          | string    | propagated user by the trusted proxy service                                                                                          | null                  | yes       | 
 | fast_mode                                     | boolean   | true to compute proposals in fast mode, false otherwise                                                                               | true                  | yes       |
+| execution_window_start_hour                   | integer   | hour of the day (0-23, inclusive) from which the execution is allowed to start new movements; requires `execution_window_end_hour`     | null                  | yes       |
+| execution_window_end_hour                     | integer   | hour of the day (0-23, exclusive) at which the execution stops starting new movements; requires `execution_window_start_hour`          | null                  | yes       |
 
 Similar to the [GET interface for getting proposals](https://github.com/linkedin/cruise-control/wiki/REST-APIs/_edit#get-optimization-proposals), the rebalance can also be based on available valid windows or available valid partitions.
 
@@ -362,6 +364,15 @@ When rebalancing a cluster, all the brokers in the cluster(except recently remov
 
 * By throttling number of replica concurrently moving into a broker. It is gated by the request parameter `concurrent_partition_movements_per_broker` or config value `num.concurrent.partition.movements.per.broker` (if request parameter is not set), `concurrent_intra_partition_movements` or config value `num.concurrent.intra.broker.partition.movements`. Similarly, the number of concurrent partition leadership changes is gated by request parameter `concurrent_leader_movements` or config value `num.concurrent.leader.movements`.
 * By throttling the bandwidth used to move replicas into a broker. It is gated by the request parameter `replication_throttle` or config value `default.replication.throttle` (if request parameter is not set).
+
+The rebalance execution can also be restricted to a daily time window (e.g. off-peak hours) using `execution_window_start_hour` and `execution_window_end_hour` (with `dryrun=false`). For example, `execution_window_start_hour=7&execution_window_end_hour=14` lets the execution start new movements only between 07:00 and 14:00:
+
+* The proposals are computed and the execution starts as soon as the request is received. However, new replica or leadership movements are started only while the current time is within the window. Outside the window, the execution waits until the window opens again -- i.e. the rebalance proceeds between 07:00 and 14:00 every day until it is completed.
+* The window only gates starting new movements. Movements that are already in progress when the window closes are allowed to finish; they are never stopped or rolled back due to the window.
+* A start hour greater than the end hour defines a window that spans midnight (e.g. `22` to `6`).
+* The hours are interpreted in the time zone configured by `execution.window.timezone` (default: the time zone of the JVM running Cruise Control).
+* While the execution is waiting for the window to open, the executor state (see `GET /kafkacruisecontrol/state?substates=executor`) reports the window in `executionTimeWindow` and the reason why no new movements are started in `executionPausedReason`.
+* As with any ongoing execution, the execution can be stopped at any time via `POST /kafkacruisecontrol/stop_proposal_execution`, and partition metric sampling remains paused until the execution finishes.
 
 ### Add a list of new brokers to Kafka Cluster
 The following POST request adds the given brokers to the Kafka cluster
