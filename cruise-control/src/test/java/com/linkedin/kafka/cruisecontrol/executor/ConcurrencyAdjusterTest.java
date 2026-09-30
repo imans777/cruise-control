@@ -309,8 +309,13 @@ public class ConcurrencyAdjusterTest {
   }
 
   /**
-   * Get the recommended replication throttle (in MB/sec) for the given current throttle (in MB/sec), network capacity (in MB/sec),
-   * leader traffic (in MB/sec), and replication traffic (in MB/sec).
+   * Get the recommended replication throttle for the given inputs, all in MB/sec.
+   *
+   * @param currentThrottleMB Current throttle (MB/sec).
+   * @param capacityMB Network capacity (MB/sec).
+   * @param leaderMB Leader traffic (MB/sec).
+   * @param replicationMB Replication traffic (MB/sec).
+   * @return The recommended replication throttle (MB/sec).
    */
   private static double recommendedReplicationThrottleInMB(double currentThrottleMB, double capacityMB, double leaderMB,
                                                            double replicationMB) {
