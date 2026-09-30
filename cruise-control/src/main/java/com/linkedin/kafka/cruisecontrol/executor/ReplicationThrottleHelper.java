@@ -115,16 +115,30 @@ class ReplicationThrottleHelper {
           .map(ExecutionTask::proposal)
           .collect(Collectors.toList());
 
-      // These are the brokers which have completed a task with
-      // inter-broker replica movement
-      Set<Integer> participatingBrokers = getParticipatingBrokers(completedProposals);
-
       List<ExecutionProposal> inProgressProposals =
         inProgressTasks
           .stream()
           .filter(this::taskIsInProgress)
           .map(ExecutionTask::proposal)
           .collect(Collectors.toList());
+
+      clearThrottlesForProposals(completedProposals, inProgressProposals);
+    }
+  }
+
+  /**
+   * Clear throttles for the given finished inter-broker replica movement proposals, while retaining the throttled rate on
+   * brokers that participate in the given in-progress proposals.
+   *
+   * @param finishedProposals Inter-broker replica movement proposals that are no longer being executed.
+   * @param inProgressProposals Inter-broker replica movement proposals that are still being executed.
+   */
+  void clearThrottlesForProposals(List<ExecutionProposal> finishedProposals, List<ExecutionProposal> inProgressProposals)
+  throws ExecutionException, InterruptedException, TimeoutException {
+    if (throttlingEnabled()) {
+      // These are the brokers which have completed a task with
+      // inter-broker replica movement
+      Set<Integer> participatingBrokers = getParticipatingBrokers(finishedProposals);
 
       // These are the brokers which currently have in-progress
       // inter-broker replica movement
@@ -140,7 +154,7 @@ class ReplicationThrottleHelper {
         removeThrottledRateFromBroker(broker);
       }
 
-      Map<String, Set<String>> throttledReplicas = getThrottledReplicasByTopic(completedProposals);
+      Map<String, Set<String>> throttledReplicas = getThrottledReplicasByTopic(finishedProposals);
       for (Map.Entry<String, Set<String>> entry : throttledReplicas.entrySet()) {
         removeThrottledReplicasFromTopic(entry.getKey(), entry.getValue());
       }

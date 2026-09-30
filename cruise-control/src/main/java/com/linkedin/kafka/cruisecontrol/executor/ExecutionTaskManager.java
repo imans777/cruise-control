@@ -9,6 +9,7 @@ import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ExecutionConcurrencyManager;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -17,6 +18,7 @@ import java.util.Map;
 import java.util.Set;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.TopicPartitionReplica;
 import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -191,6 +193,23 @@ public class ExecutionTaskManager {
   }
 
   /**
+   * Adopt the given inter-broker and intra-broker replica movements that are already being executed by Kafka (e.g. submitted
+   * before a Cruise Control restart): The corresponding pending tasks are marked as in progress without being submitted
+   * again, so that the execution only monitors them until completion.
+   *
+   * @param interBrokerPartitions Partitions with an ongoing inter-broker replica movement to adopt.
+   * @param intraBrokerReplicas Replicas with an ongoing intra-broker replica movement to adopt.
+   * @return The adopted tasks.
+   */
+  public synchronized List<ExecutionTask> adoptInProgressTasks(Set<TopicPartition> interBrokerPartitions,
+                                                               Set<TopicPartitionReplica> intraBrokerReplicas) {
+    List<ExecutionTask> adoptedTasks = new ArrayList<>(_executionTaskPlanner.removeInterBrokerReplicaMovementTasks(interBrokerPartitions));
+    adoptedTasks.addAll(_executionTaskPlanner.removeIntraBrokerReplicaMovementTasks(intraBrokerReplicas));
+    markTasksInProgress(adoptedTasks);
+    return adoptedTasks;
+  }
+
+  /**
    * Mark the successful completion of a given task. In-progress execution will yield successful completion.
    * Aborting execution will yield Aborted completion.
    * @param task Execution task to mark.
@@ -361,6 +380,20 @@ public class ExecutionTaskManager {
     _inProgressPartitionsForInterBrokerMovement.clear();
     _executionTaskPlanner.clear();
     _executionTaskTracker.clear();
+  }
+
+  /**
+   * @return A number that changes whenever a task is added or changes its state.
+   */
+  public synchronized long taskStateVersion() {
+    return _executionTaskTracker.taskStateVersion();
+  }
+
+  /**
+   * @return All tasks of the current execution regardless of their type and state.
+   */
+  public synchronized List<ExecutionTask> allTasks() {
+    return _executionTaskTracker.allTasks();
   }
 
   /**

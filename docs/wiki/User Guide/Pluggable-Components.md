@@ -85,6 +85,23 @@ Sometimes this could result in prolonged execution time due to some long tail ta
 
 The strategies can be chained to use and can be dynamically set using `replica_movement_strategies` in corresponding request(e.g. [rebalance request](https://github.com/linkedin/cruise-control/wiki/REST-APIs#trigger-a-workload-balance)).
 
+## Execution State Store
+The Execution State Store persists the state of the ongoing execution -- i.e. the parameters it was started with, its proposals, and the
+latest state of each execution task. The state is updated continuously while the execution makes progress: when it starts, right before
+a batch of tasks is submitted to Kafka (so that every task that Kafka may be executing is recorded as in progress), and whenever a task
+finishes. The state is deleted once the execution finishes (i.e. completes, is stopped, or fails), and retained if Cruise Control is shut
+down or crashes during the execution.
+
+Upon startup, Cruise Control reconciles the persisted state (if any) with the current state of the cluster -- e.g. a task that was in
+progress is checked for whether Kafka is still executing it, has completed it, or has not started it. Then, it either resumes the
+remaining tasks of the interrupted execution (see `resume.interrupted.execution.on.startup`) -- monitoring the tasks that Kafka is still
+executing rather than submitting them again -- or waits for the in-flight tasks to finish and removes the replication throttles left
+behind by the interrupted execution.
+
+The default implementation of Execution State Store (see `FileExecutionStateStore`) keeps the state as a JSON document in a local file
+(see `executor.state.file.path`). Custom implementations (e.g. backed by ZooKeeper or a Kafka topic) can be plugged in via
+`executor.state.store.class`; `NoopExecutionStateStore` disables persisting the execution state.
+
 ## Maintenance Event Reader
 When a system/tool in Kafka Ecosystem has knowledge about an upcoming planned maintenance, such as a switch change, an upcoming VM freeze, 
 or reboot of VMs on cloud deployments, the desired preventative mitigation strategy (i.e. `maintenance event`) can be conveyed to 
