@@ -476,7 +476,7 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     throttleHelper.setThrottles(List.of(proposal));
     // The interrupted execution submitted the reassignment before the restart.
     _adminClient.alterPartitionReassignments(Map.of(TP0, Optional.of(new NewPartitionReassignment(List.of(0, 2))))).all().get();
-    assertTrue(ExecutionUtils.partitionsBeingReassigned(_adminClient).contains(TP0));
+    assertTrue(_adminClient.listPartitionReassignments().reassignments().get().containsKey(TP0));
     _store.save(interruptedExecutionState(throttle, List.of(proposal)));
     int numSavedStatesBeforeResume = _store.savedStates().size();
 
