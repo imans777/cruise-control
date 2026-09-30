@@ -37,6 +37,7 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 
@@ -53,6 +54,13 @@ public class ConcurrencyAdjusterTest {
   private static final int MOCK_MIN_PARTITION_MOVEMENTS_PER_BROKER = 1;
   private static final int MOCK_MIN_LEADERSHIP_MOVEMENTS_CONFIG = 50;
   private static final long MOCK_TIME_MS = 100L;
+  private static final long MB_IN_BYTES = 1024L * 1024L;
+  private static final double MB_IN_KB = 1024.0;
+  private static final long MOCK_MIN_REPLICATION_THROTTLE = MB_IN_BYTES;
+  private static final long MOCK_MAX_REPLICATION_THROTTLE = 100 * MB_IN_BYTES;
+  private static final long MOCK_ADDITIVE_INCREASE_REPLICATION_THROTTLE = 10 * MB_IN_BYTES;
+  private static final int MOCK_MD_REPLICATION_THROTTLE = 2;
+  private static final double MOCK_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION = 0.8;
   private static final String TOPIC1 = "topic1";
   private static final String TOPIC2 = "topic2";
   private static final TopicPartition TP1 = new TopicPartition(TOPIC1, 0);
@@ -300,6 +308,61 @@ public class ConcurrencyAdjusterTest {
     assertFalse(ExecutionUtils.withinConcurrencyAdjusterLimit(0, null, overLimitDetailsByMetricNameMap));
   }
 
+  /**
+   * Get the recommended replication throttle (in MB/sec) for the given current throttle (in MB/sec), network capacity (in MB/sec),
+   * leader traffic (in MB/sec), and replication traffic (in MB/sec).
+   */
+  private static double recommendedReplicationThrottleInMB(double currentThrottleMB, double capacityMB, double leaderMB,
+                                                           double replicationMB) {
+    long recommended = ExecutionUtils.recommendedReplicationThrottle((long) (currentThrottleMB * MB_IN_BYTES), capacityMB * MB_IN_KB,
+                                                                     leaderMB * MB_IN_KB, replicationMB * MB_IN_KB);
+    return (double) recommended / MB_IN_BYTES;
+  }
+
+  @Test
+  public void testRecommendedReplicationThrottle() {
+    double delta = 1.0 / MB_IN_BYTES;
+    // Headroom: 0.8 * 100 - (10 + 25 - 20) = 65 MB/sec > 20 MB/sec. Increase is bounded by the additive increase.
+    assertEquals(30.0, recommendedReplicationThrottleInMB(20.0, 100.0, 10.0, 25.0), delta);
+    // Headroom: 0.8 * 100 - (10 + 65 - 60) = 65 MB/sec > 60 MB/sec. Increase is bounded by the headroom.
+    assertEquals(65.0, recommendedReplicationThrottleInMB(60.0, 100.0, 10.0, 65.0), delta);
+    // Headroom: 0.8 * 1000 - (0 + 95 - 95) = 800 MB/sec > 95 MB/sec. Increase is bounded by the maximum throttle.
+    assertEquals(100.0, recommendedReplicationThrottleInMB(95.0, 1000.0, 0.0, 95.0), delta);
+    // Headroom: 0.8 * 100 - (70 + 35 - 30) = 5 MB/sec < 30 MB/sec. Decrease to the headroom at once.
+    assertEquals(5.0, recommendedReplicationThrottleInMB(30.0, 100.0, 70.0, 35.0), delta);
+    // Headroom: 0.8 * 100 - (90 + 30 - 30) < 0 MB/sec. Decrease is bounded by the minimum throttle.
+    assertEquals(1.0, recommendedReplicationThrottleInMB(30.0, 100.0, 90.0, 30.0), delta);
+    // Headroom: 0.8 * 100 - (10 + 12 - 12) = 70 MB/sec > 20 MB/sec, but the replication traffic (12 MB/sec) is below the throttle
+    // (20 MB/sec) -- i.e. the throttle is not limiting the movements. No increase.
+    assertEquals(20.0, recommendedReplicationThrottleInMB(20.0, 100.0, 10.0, 12.0), delta);
+    // Headroom: 0.8 * 100 - (80 + 20 - 0.5) < 0 MB/sec, but the current throttle (0.5 MB/sec) is already below the minimum
+    // throttle. No change.
+    assertEquals(0.5, recommendedReplicationThrottleInMB(0.5, 100.0, 80.0, 20.0), delta);
+    // Headroom: 0.8 * 1000 - (0 + 200 - 200) = 800 MB/sec, but the current throttle (200 MB/sec) is already above the maximum throttle.
+    // No change.
+    assertEquals(200.0, recommendedReplicationThrottleInMB(200.0, 1000.0, 0.0, 200.0), delta);
+    // Headroom: 0.8 * 100 - (10 + 70 - 70) = 70 MB/sec, which is equal to the current throttle. No change.
+    assertEquals(70.0, recommendedReplicationThrottleInMB(70.0, 100.0, 10.0, 70.0), delta);
+  }
+
+  @Test
+  public void testDecreasedReplicationThrottle() {
+    // Multiplicative decrease.
+    assertEquals(15 * MB_IN_BYTES, ExecutionUtils.decreasedReplicationThrottle(30 * MB_IN_BYTES));
+    // Multiplicative decrease is bounded by the minimum throttle.
+    assertEquals(MOCK_MIN_REPLICATION_THROTTLE, ExecutionUtils.decreasedReplicationThrottle(3 * MB_IN_BYTES / 2));
+    // Current throttle is already below the minimum throttle. No change.
+    assertEquals(MB_IN_BYTES / 2, ExecutionUtils.decreasedReplicationThrottle(MB_IN_BYTES / 2));
+  }
+
+  @Test
+  public void testLatestBrokerMetricValue() {
+    short leaderBytesInId = KafkaMetricDef.brokerMetricDef().metricInfo(KafkaMetricDef.LEADER_BYTES_IN.name()).id();
+    ValuesAndExtrapolations currentMetrics = buildValuesAndExtrapolations(Collections.singletonMap(leaderBytesInId, 123.0));
+    assertEquals(123.0, ExecutionUtils.latestBrokerMetricValue(currentMetrics, KafkaMetricDef.LEADER_BYTES_IN), 0.0);
+    assertNull(ExecutionUtils.latestBrokerMetricValue(currentMetrics, KafkaMetricDef.REPLICATION_BYTES_IN_RATE));
+  }
+
   private static Properties getExecutorProperties() {
     Properties props = new Properties();
     props.setProperty(MonitorConfig.BOOTSTRAP_SERVERS_CONFIG, "bootstrap.servers");
@@ -335,6 +398,14 @@ public class ConcurrencyAdjusterTest {
     props.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_MIN_LEADERSHIP_MOVEMENTS_CONFIG,
                       Integer.toString(MOCK_MIN_LEADERSHIP_MOVEMENTS_CONFIG));
     props.setProperty(ExecutorConfig.MIN_NUM_BROKERS_VIOLATE_METRIC_LIMIT_TO_DECREASE_CLUSTER_CONCURRENCY_CONFIG, "2");
+    props.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_MIN_REPLICATION_THROTTLE_CONFIG, Long.toString(MOCK_MIN_REPLICATION_THROTTLE));
+    props.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_MAX_REPLICATION_THROTTLE_CONFIG, Long.toString(MOCK_MAX_REPLICATION_THROTTLE));
+    props.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_ADDITIVE_INCREASE_REPLICATION_THROTTLE_CONFIG,
+                      Long.toString(MOCK_ADDITIVE_INCREASE_REPLICATION_THROTTLE));
+    props.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE_CONFIG,
+                      Integer.toString(MOCK_MD_REPLICATION_THROTTLE));
+    props.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_CONFIG,
+                      Double.toString(MOCK_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION));
 
     return props;
   }
