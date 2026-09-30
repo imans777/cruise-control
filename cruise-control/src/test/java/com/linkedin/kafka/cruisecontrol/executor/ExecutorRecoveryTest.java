@@ -102,7 +102,14 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
    */
   @After
   public void tearDown() {
-    _executors.forEach(Executor::shutdown);
+    for (Executor executor : _executors) {
+      // Stop the ongoing execution (if any) first, as shutting down the executor waits for the ongoing execution to finish.
+      if (executor.hasOngoingExecution()) {
+        executor.userTriggeredStopExecution(false);
+        waitForExecutionToFinish(executor);
+      }
+      executor.shutdown();
+    }
     if (_adminClient != null) {
       _adminClient.close(Duration.ofSeconds(1));
     }
@@ -324,7 +331,7 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
   }
 
   @Test
-  public void testShutdownRetainsExecutionStateAndRecoveryDetectsCompletion() throws Exception {
+  public void testRecoveryDetectsInProgressTaskCompletedDuringDowntime() throws Exception {
     createTopic(Map.of(0, List.of(0, 1)));
     // A metadata client that never reflects the progress of the execution, so that the task remains in progress.
     Node[] nodes = {new Node(0, "h0", 9092), new Node(1, "h1", 9092), new Node(2, "h2", 9092)};
@@ -352,14 +359,13 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
                   "The task is not persisted as in progress", WAIT_TIME_MS, 100L);
     // Kafka completes the reassignment, but the executor does not see it due to the stale metadata.
     waitUntilTrue(() -> List.of(0, 2).equals(currentReplicas(0)), "Reassignment did not complete", WAIT_TIME_MS, 100L);
-
-    // Shutdown stops the execution but retains the persisted state as of before the shutdown.
-    executor.shutdown();
-    _executors.remove(executor);
-    PersistedExecutionState retainedState = _store.state();
-    assertNotNull(retainedState);
-    assertEquals(ExecutionTaskState.IN_PROGRESS, onlyTask(retainedState).state());
-    assertEquals(ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS, retainedState.executorState());
+    // Simulate a crash: the persisted state is what survives the crash.
+    PersistedExecutionState stateAtCrash = _store.state();
+    assertEquals(ExecutionTaskState.IN_PROGRESS, onlyTask(stateAtCrash).state());
+    assertEquals(ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS, stateAtCrash.executorState());
+    executor.userTriggeredStopExecution(false);
+    waitForExecutionToFinish(executor);
+    _store.save(stateAtCrash);
 
     // Upon restart, the in-progress task is found completed in the cluster -- nothing to resume, and the state is cleaned up.
     RecordingNotifier notifier = new RecordingNotifier();
@@ -369,6 +375,30 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     assertFalse(restartedExecutor.hasOngoingExecution());
     assertTrue(notifier.anyMessageContains("there are no remaining tasks to execute"));
     assertTrue(notifier.anyMessageContains("COMPLETED=1"));
+  }
+
+  @Test
+  public void testUserStopDeletesExecutionState() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    Node[] nodes = {new Node(0, "h0", 9092), new Node(1, "h1", 9092), new Node(2, "h2", 9092)};
+    Cluster staleCluster = new Cluster("cluster", Arrays.asList(nodes),
+                                       Collections.singleton(new PartitionInfo(TOPIC, 0, nodes[0], new Node[]{nodes[0], nodes[1]},
+                                                                               new Node[]{nodes[0], nodes[1]})),
+                                       Collections.emptySet(), Collections.emptySet());
+    MetadataAdminClient staleMetadataClient = EasyMock.mock(MetadataAdminClient.class);
+    EasyMock.expect(staleMetadataClient.cluster()).andReturn(staleCluster).anyTimes();
+    EasyMock.replay(staleMetadataClient);
+    Executor executor = newExecutor(false, staleMetadataClient, new RecordingNotifier(), mockAnomalyDetectorManager(true));
+    executor.setGeneratingProposalsForExecution(UUID, () -> REASON, false);
+    executor.executeProposals(List.of(proposal(TP0, List.of(0, 1), List.of(0, 2))), Collections.emptySet(), null, mockLoadMonitor(),
+                              null, null, null, null, null, null, null, null, false, UUID, false, false);
+    waitUntilTrue(() -> _store.state() != null && onlyTask(_store.state()).state() == ExecutionTaskState.IN_PROGRESS,
+                  "The task is not persisted as in progress", WAIT_TIME_MS, 100L);
+    executor.userTriggeredStopExecution(false);
+    waitForExecutionToFinish(executor);
+    // The stop is persisted before the stopped execution finishes, and the state is deleted once it finishes.
+    assertTrue(_store.savedStates().stream().anyMatch(s -> s.executorState() == ExecutorState.State.STOPPING_EXECUTION));
+    assertNull(_store.state());
   }
 
   @Test
