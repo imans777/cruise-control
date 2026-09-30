@@ -5,6 +5,7 @@
 package com.linkedin.kafka.cruisecontrol.config.constants;
 
 import com.linkedin.kafka.cruisecontrol.executor.ExecutorNoopNotifier;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.FileExecutionStateStore;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.BaseReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PostponeUrpReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeLargeReplicaMovementStrategy;
@@ -497,6 +498,40 @@ public final class ExecutorConfig {
   public static final String AUTO_STOP_EXTERNAL_AGENT_DOC = "When starting a new proposal execution while external agent is reassigning partitions,"
       + " automatically stop the external agent and start the execution."
       + " Set to false to keep the external agent reassignment and skip starting the execution.";
+
+  /**
+   * <code>executor.state.store.class</code>
+   */
+  public static final String EXECUTOR_STATE_STORE_CLASS_CONFIG = "executor.state.store.class";
+  public static final String DEFAULT_EXECUTOR_STATE_STORE_CLASS = FileExecutionStateStore.class.getName();
+  public static final String EXECUTOR_STATE_STORE_CLASS_DOC = "The class implementing com.linkedin.kafka.cruisecontrol.executor."
+      + "persistence.ExecutionStateStore to persist the state of the ongoing execution -- i.e. its parameters, proposals, and the"
+      + " latest state of each execution task. The state is updated whenever the execution makes progress, so that after a"
+      + " Cruise Control restart, the interrupted execution can be recovered: its leftover replication throttles are removed,"
+      + " and (if resume.interrupted.execution.on.startup is enabled) its remaining tasks are resumed. Use"
+      + " com.linkedin.kafka.cruisecontrol.executor.persistence.NoopExecutionStateStore to disable persisting the execution state.";
+
+  /**
+   * <code>executor.state.file.path</code>
+   */
+  public static final String EXECUTOR_STATE_FILE_PATH_CONFIG = "executor.state.file.path";
+  public static final String DEFAULT_EXECUTOR_STATE_FILE_PATH = "fileStore/executionState.json";
+  public static final String EXECUTOR_STATE_FILE_PATH_DOC = "The file path to persist the state of the ongoing execution if the"
+      + " executor.state.store.class is com.linkedin.kafka.cruisecontrol.executor.persistence.FileExecutionStateStore. To recover"
+      + " the execution after a restart, this path must be on storage that survives Cruise Control restarts.";
+
+  /**
+   * <code>resume.interrupted.execution.on.startup</code>
+   */
+  public static final String RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG = "resume.interrupted.execution.on.startup";
+  public static final boolean DEFAULT_RESUME_INTERRUPTED_EXECUTION_ON_STARTUP = false;
+  public static final String RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_DOC = "Upon startup, if the persisted execution state indicates"
+      + " that an execution was interrupted (e.g. due to a crash or a restart of Cruise Control), resume its remaining tasks with the"
+      + " original parameters. Tasks that were in progress when Cruise Control stopped and are still being executed by Kafka are"
+      + " monitored until completion rather than being submitted again; tasks that were completed in the meantime are skipped."
+      + " If disabled (or the execution cannot be resumed), Cruise Control waits for the interrupted in-progress tasks to finish and"
+      + " removes the replication throttles left behind by the interrupted execution.";
+
   private ExecutorConfig() {
   }
 
@@ -797,6 +832,21 @@ public final class ExecutorConfig {
                             ConfigDef.Type.BOOLEAN,
                             DEFAULT_AUTO_STOP_EXTERNAL_AGENT,
                             ConfigDef.Importance.MEDIUM,
-                            AUTO_STOP_EXTERNAL_AGENT_DOC);
+                            AUTO_STOP_EXTERNAL_AGENT_DOC)
+                    .define(EXECUTOR_STATE_STORE_CLASS_CONFIG,
+                            ConfigDef.Type.CLASS,
+                            DEFAULT_EXECUTOR_STATE_STORE_CLASS,
+                            ConfigDef.Importance.LOW,
+                            EXECUTOR_STATE_STORE_CLASS_DOC)
+                    .define(EXECUTOR_STATE_FILE_PATH_CONFIG,
+                            ConfigDef.Type.STRING,
+                            DEFAULT_EXECUTOR_STATE_FILE_PATH,
+                            ConfigDef.Importance.LOW,
+                            EXECUTOR_STATE_FILE_PATH_DOC)
+                    .define(RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG,
+                            ConfigDef.Type.BOOLEAN,
+                            DEFAULT_RESUME_INTERRUPTED_EXECUTION_ON_STARTUP,
+                            ConfigDef.Importance.MEDIUM,
+                            RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_DOC);
   }
 }
