@@ -510,6 +510,34 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
   }
 
   @Test
+  public void testWaitForConfigsRetriesOnTransientReadFailure() throws Exception {
+    AdminClient mockAdminClient = EasyMock.strictMock(AdminClient.class);
+    // The first read fails while the topic still exists, so verification retries instead of passing
+    expectDescribeTopicConfigs(mockAdminClient, TOPIC0, EMPTY_CONFIG, false);
+    expectListTopics(mockAdminClient, Collections.singleton(TOPIC0));
+    expectDescribeTopicConfigs(mockAdminClient, TOPIC0, EMPTY_CONFIG, true);
+    EasyMock.replay(mockAdminClient);
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(mockAdminClient, 100L, 2);
+    ConfigResource cf = new ConfigResource(ConfigResource.Type.TOPIC, TOPIC0);
+    throttleHelper.waitForConfigs(cf, Collections.singletonList(
+        new AlterConfigOp(new ConfigEntry("k", null), AlterConfigOp.OpType.DELETE)));
+    EasyMock.verify(mockAdminClient);
+  }
+
+  @Test
+  public void testWaitForConfigsSkipsDeletedTopic() throws Exception {
+    AdminClient mockAdminClient = EasyMock.strictMock(AdminClient.class);
+    expectDescribeTopicConfigs(mockAdminClient, TOPIC0, EMPTY_CONFIG, false);
+    expectListTopics(mockAdminClient, Collections.emptySet());
+    EasyMock.replay(mockAdminClient);
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(mockAdminClient, 100L, 2);
+    ConfigResource cf = new ConfigResource(ConfigResource.Type.TOPIC, TOPIC0);
+    throttleHelper.waitForConfigs(cf, Collections.singletonList(
+        new AlterConfigOp(new ConfigEntry("k", "v"), AlterConfigOp.OpType.SET)));
+    EasyMock.verify(mockAdminClient);
+  }
+
+  @Test
   public void testConfigsEqual() {
     Map<String, String> expectedConfigs = new HashMap<>();
     List<ConfigEntry> entries = new ArrayList<>();
