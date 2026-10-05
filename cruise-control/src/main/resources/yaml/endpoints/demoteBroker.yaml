@@ -58,6 +58,13 @@ DemoteBrokerEndpoint:
         schema:
           type: boolean
           default: true
+      - name: excluded_topics
+        in: query
+        description: Specify topics whose partitions are skipped by the demotion, i.e. their leadership and replica order stay unchanged.
+        schema:
+          type: string # topics regex
+          default: null
+          example: "__CruiseControl.%2A"
       - name: verbose
         in: query
         description: Return detailed state information.
