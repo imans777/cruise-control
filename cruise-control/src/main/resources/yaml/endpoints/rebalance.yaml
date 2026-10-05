@@ -11,7 +11,7 @@ RebalanceEndpoint:
           default: true
       - name: goals
         in: query
-        description: List of goals used to generate proposal, the default goals will be used if this parameter is not specified.
+        description: List of goals used to generate proposal, the default goals will be used if this parameter is not specified. Intra-broker goals can be listed after all inter-broker goals to also balance the disks of each broker (requires JBOD Kafka deployment).
         schema:
           type: array
           items:

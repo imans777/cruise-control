@@ -6,8 +6,10 @@ package com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable;
 
 import com.linkedin.cruisecontrol.exception.NotEnoughValidWindowsException;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControl;
+import com.linkedin.kafka.cruisecontrol.analyzer.AnalyzerUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizerResult;
+import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.exception.KafkaCruiseControlException;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.ProposalsParameters;
@@ -88,7 +90,7 @@ public class ProposalsRunnable extends GoalBasedOperationRunnable {
     ClusterModel clusterModel = _kafkaCruiseControl.clusterModel(DEFAULT_START_TIME_FOR_CLUSTER_MODEL,
                                                                  _kafkaCruiseControl.timeMs(),
                                                                  _combinedCompletenessRequirements,
-                                                                 _isRebalanceDiskMode,
+                                                                 populateReplicaPlacementInfo(),
                                                                  _allowCapacityEstimation,
                                                                  _operationProgress);
     sanityCheckBrokersHavingOfflineReplicasOnBadDisks(_goals, clusterModel);
@@ -128,6 +130,19 @@ public class ProposalsRunnable extends GoalBasedOperationRunnable {
                                                    _ignoreProposalCache,
                                                    _isTriggeredByGoalViolation,
                                                    _destinationBrokerIds,
-                                                   _isRebalanceDiskMode);
+                                                   populateReplicaPlacementInfo());
+  }
+
+  /**
+   * Optimizing intra-broker goals requires the replica placement over disks -- i.e. in rebalance disk mode, or if any
+   * goal is an intra-broker goal (e.g. intra-broker goals that are prioritized after inter-broker goals to balance both
+   * the brokers and the disks of each broker in a single optimization). The proposal cache is computed without the
+   * replica placement over disks, hence it is ignored in such cases.
+   *
+   * @return {@code true} if the replica placement over disks is needed to optimize the goals, {@code false} otherwise.
+   */
+  private boolean populateReplicaPlacementInfo() {
+    KafkaCruiseControlConfig config = _kafkaCruiseControl.config();
+    return _isRebalanceDiskMode || _goalsByPriority.stream().anyMatch(goal -> AnalyzerUtils.isIntraBrokerGoal(goal, config));
   }
 }
