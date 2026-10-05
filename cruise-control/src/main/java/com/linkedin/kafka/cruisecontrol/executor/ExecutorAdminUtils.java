@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
+import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.LogDirDescription;
 import org.apache.kafka.clients.admin.ReplicaInfo;
@@ -109,6 +110,52 @@ public final class ExecutorAdminUtils {
         LOG.warn("Encounter exception {} when trying to execute task {}, mark task dead.", e.getMessage(), replicaToTask.get(entry.getKey()));
         executionTaskManager.markTaskAborting(replicaToTask.get(entry.getKey()));
         executionTaskManager.markTaskDead(replicaToTask.get(entry.getKey()));
+      }
+    }
+  }
+
+  /**
+   * Request the destination brokers of the given inter-broker replica movement tasks to create the replicas to add in the
+   * logdirs specified in the corresponding proposals (if any) -- e.g. logdirs picked by intra-broker goals. This is expected
+   * to be called before submitting the replica reassignments of the given tasks. Since the replicas do not exist yet,
+   * the destination brokers record their logdirs and respond with {@link ReplicaNotAvailableException}. Then, the
+   * replicas are created in the recorded logdirs upon the corresponding replica reassignments.
+   *
+   * This is a best-effort operation: if the logdir of a replica cannot be recorded, the destination broker picks the logdir
+   * to create the replica in.
+   *
+   * @param tasks Inter-broker replica movement tasks.
+   * @param adminClient The adminClient to send alterReplicaLogDirs request.
+   * @param config The config object that holds all the Cruise Control related configs
+   */
+  static void setLogdirsOfReplicasToAdd(Collection<ExecutionTask> tasks,
+                                        AdminClient adminClient,
+                                        KafkaCruiseControlConfig config) {
+    Map<TopicPartitionReplica, String> logdirByReplica = new HashMap<>();
+    for (ExecutionTask task : tasks) {
+      ExecutionProposal proposal = task.proposal();
+      for (ReplicaPlacementInfo replicaToAdd : proposal.replicasToAdd()) {
+        if (replicaToAdd.logdir() != null) {
+          logdirByReplica.put(new TopicPartitionReplica(proposal.topic(), proposal.partitionId(), replicaToAdd.brokerId()),
+                              replicaToAdd.logdir());
+        }
+      }
+    }
+    if (logdirByReplica.isEmpty()) {
+      return;
+    }
+    for (Map.Entry<TopicPartitionReplica, KafkaFuture<Void>> entry: adminClient.alterReplicaLogDirs(logdirByReplica).values().entrySet()) {
+      try {
+        entry.getValue().get(config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS);
+      } catch (ExecutionException e) {
+        // The replica does not exist yet, hence the destination broker recorded the logdir to create it in.
+        if (!(e.getCause() instanceof ReplicaNotAvailableException)) {
+          LOG.warn("Failed to set the logdir of replica {} to {}, the broker will pick the logdir.", entry.getKey(),
+                   logdirByReplica.get(entry.getKey()), e.getCause());
+        }
+      } catch (InterruptedException | TimeoutException e) {
+        LOG.warn("Failed to set the logdir of replica {} to {}, the broker will pick the logdir.", entry.getKey(),
+                 logdirByReplica.get(entry.getKey()), e);
       }
     }
   }

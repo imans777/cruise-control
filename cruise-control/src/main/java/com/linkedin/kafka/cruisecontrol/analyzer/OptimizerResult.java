@@ -262,13 +262,19 @@ public class OptimizerResult {
     long interBrokerDataToMove = 0L;
     long intraBrokerDataToMove = 0L;
     for (ExecutionProposal p : _proposals) {
-      if (!p.replicasToAdd().isEmpty() || !p.replicasToRemove().isEmpty()) {
+      // A proposal may involve both inter-broker and intra-broker replica movements (e.g. if the optimization involves
+      // both inter-broker and intra-broker goals).
+      boolean hasInterBrokerReplicaMovement = !p.replicasToAdd().isEmpty() || !p.replicasToRemove().isEmpty();
+      boolean hasIntraBrokerReplicaMovement = !p.replicasToMoveBetweenDisksByBroker().isEmpty();
+      if (hasInterBrokerReplicaMovement) {
         numInterBrokerReplicaMovements++;
         interBrokerDataToMove += p.interBrokerDataToMoveInMB();
-      } else if (!p.replicasToMoveBetweenDisksByBroker().isEmpty()) {
+      }
+      if (hasIntraBrokerReplicaMovement) {
         numIntraBrokerReplicaMovements += p.replicasToMoveBetweenDisksByBroker().size();
         intraBrokerDataToMove += p.intraBrokerDataToMoveInMB() * p.replicasToMoveBetweenDisksByBroker().size();
-      } else {
+      }
+      if (!hasInterBrokerReplicaMovement && !hasIntraBrokerReplicaMovement) {
         numLeadershipMovements++;
       }
     }

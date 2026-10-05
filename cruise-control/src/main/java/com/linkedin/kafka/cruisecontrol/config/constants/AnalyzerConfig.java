@@ -325,8 +325,10 @@ public final class AnalyzerConfig {
                                                                           .add(TopicReplicaDistributionGoal.class.getName())
                                                                           .add(LeaderReplicaDistributionGoal.class.getName())
                                                                           .add(LeaderBytesInDistributionGoal.class.getName()).toString();
-  public static final String DEFAULT_GOALS_DOC = "The list of inter-broker goals that will be used by default if no goal list "
-      + "is provided. This list of goals will also be used for proposal pre-computation.";
+  public static final String DEFAULT_GOALS_DOC = "The list of goals that will be used by default if no goal list is provided. "
+      + "This list of goals will also be used for proposal pre-computation. Intra-broker goals can be listed after the inter-broker "
+      + "goals to also balance the disks of each broker, in which case rebalance and proposals requests that use the default goals "
+      + "do not use the pre-computed proposals.";
 
   /**
    * <code>goal.balancedness.priority.weight</code>

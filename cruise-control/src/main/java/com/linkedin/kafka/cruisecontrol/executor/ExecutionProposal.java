@@ -73,15 +73,10 @@ public class ExecutionProposal {
     Set<Integer> oldBrokerList = _oldReplicas.stream().mapToInt(ReplicaPlacementInfo::brokerId).boxed().collect(Collectors.toSet());
     _replicasToAdd = _newReplicas.stream().filter(r -> !oldBrokerList.contains(r.brokerId())).collect(Collectors.toSet());
     _replicasToRemove = _oldReplicas.stream().filter(r -> !newBrokerList.contains(r.brokerId())).collect(Collectors.toSet());
+    // A proposal may involve both inter-broker and intra-broker replica movements, which are executed in that order.
     _replicasToMoveBetweenDisksByBroker = new HashMap<>();
     newReplicas.stream().filter(r -> !_replicasToAdd.contains(r) && !_oldReplicas.contains(r))
                .forEach(r -> _replicasToMoveBetweenDisksByBroker.put(r.brokerId(), r));
-
-    // Verify the proposal will not generate both inter-broker movement and intra-broker replica movement at the same time.
-    if (!_replicasToAdd.isEmpty() && !_replicasToMoveBetweenDisksByBroker.isEmpty()) {
-      throw new IllegalArgumentException("Change from " + _oldReplicas + " to " + _newReplicas + " will generate both "
-                                         + "intra-broker and inter-broker replica movements.");
-    }
   }
 
   private static boolean brokerOrderMatched(Node[] currentOrderedReplicas, List<ReplicaPlacementInfo> replicas) {
@@ -185,7 +180,8 @@ public class ExecutionProposal {
   }
 
   /**
-   * @return The replicas that exist in new replica list but not in old replica list.
+   * @return The replicas that exist in new replica list but not in old replica list. If the logdir of such a replica is
+   * specified, the replica is expected to be created in that logdir of its broker.
    */
   public Set<ReplicaPlacementInfo> replicasToAdd() {
     return Collections.unmodifiableSet(_replicasToAdd);

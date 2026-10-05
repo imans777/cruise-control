@@ -510,9 +510,37 @@ public class Broker implements Serializable, Comparable<Broker> {
       _immigrantReplicas.remove(removedReplica);
       _currentOfflineReplicas.remove(removedReplica);
       _sortedReplicas.values().forEach(sr -> sr.remove(removedReplica));
+      // Remove the replica from its disk (if the replica placement over disks is populated).
+      if (removedReplica.disk() != null) {
+        removedReplica.disk().removeReplica(removedReplica);
+      }
     }
 
     return removedReplica;
+  }
+
+  /**
+   * Get the disk to host the given replica, which is relocated to this broker from another broker.
+   * <ul>
+   *   <li>If this broker is the original broker of the replica, the original disk of the replica is returned -- i.e.
+   *   relocating a replica back to its original broker does not move it to another disk of the broker.</li>
+   *   <li>Otherwise, the alive disk that would have the lowest utilization percentage after hosting the replica is
+   *   returned.</li>
+   * </ul>
+   *
+   * @param replica Replica to be relocated to this broker.
+   * @return The disk to host the given replica, or {@code null} if the broker has no alive disk with positive capacity.
+   */
+  Disk diskForRelocatedReplica(Replica replica) {
+    if (replica.originalBroker() == this && replica.originalDisk() != null) {
+      return replica.originalDisk();
+    }
+    double replicaUtilization = replica.load().expectedUtilizationFor(Resource.DISK);
+    // Disks are sorted by logdir, hence ties are broken in favor of the disk with the lexicographically smaller logdir.
+    return _diskByLogdir.values().stream()
+                        .filter(disk -> disk.isAlive() && disk.capacity() > 0)
+                        .min(Comparator.comparingDouble(disk -> (disk.utilization() + replicaUtilization) / disk.capacity()))
+                        .orElse(null);
   }
 
   /**

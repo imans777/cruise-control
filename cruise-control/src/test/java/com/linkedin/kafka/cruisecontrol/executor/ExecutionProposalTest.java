@@ -13,6 +13,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.junit.Assert;
 import org.junit.Test;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -29,6 +30,7 @@ public class ExecutionProposalTest {
   private final ReplicaPlacementInfo _r0d0 = new ReplicaPlacementInfo(0, "tmp0");
   private final ReplicaPlacementInfo _r0d1 = new ReplicaPlacementInfo(0, "tmp1");
   private final ReplicaPlacementInfo _r1d1 = new ReplicaPlacementInfo(1, "tmp1");
+  private final ReplicaPlacementInfo _r2d1 = new ReplicaPlacementInfo(2, "tmp1");
 
   private static final Node NODE_0 = new Node(0, "host0", 100);
   private static final Node NODE_1 = new Node(1, "host1", 200);
@@ -60,9 +62,16 @@ public class ExecutionProposalTest {
     Assert.assertEquals(1, p.replicasToMoveBetweenDisksByBroker().size());
   }
 
-  @Test (expected = IllegalArgumentException.class)
-  public void testMingleReplicaMovements() {
-    new ExecutionProposal(TP, 0, _r0d0, Arrays.asList(_r0d0, _r1), Arrays.asList(_r0d1, _r2));
+  @Test
+  public void testInterBrokerAndIntraBrokerReplicaMovements() {
+    // The replica on broker 0 moves from tmp0 to tmp1, and the replica on broker 1 moves to tmp1 of broker 2.
+    ExecutionProposal p = new ExecutionProposal(TP, 10, _r0d0, Arrays.asList(_r0d0, _r1), Arrays.asList(_r0d1, _r2d1));
+    assertEquals(Collections.singleton(_r2d1), p.replicasToAdd());
+    assertEquals(Collections.singleton(_r1), p.replicasToRemove());
+    assertEquals(Collections.singletonMap(0, _r0d1), p.replicasToMoveBetweenDisksByBroker());
+    assertEquals(10, p.interBrokerDataToMoveInMB());
+    assertEquals(10, p.intraBrokerDataToMoveInMB());
+    assertEquals(20, p.dataToMoveInMB());
   }
 
   @Test

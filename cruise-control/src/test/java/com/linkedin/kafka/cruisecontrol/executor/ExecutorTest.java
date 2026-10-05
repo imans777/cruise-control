@@ -69,6 +69,7 @@ import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.TopicPartitionInfo;
+import org.apache.kafka.common.TopicPartitionReplica;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
@@ -85,6 +86,7 @@ import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.*;
 import static com.linkedin.kafka.cruisecontrol.monitor.sampling.MetricSampler.SamplingMode.*;
 import static org.easymock.EasyMock.*;
 import static org.junit.Assert.*;
+import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.ReplicaLogDirInfo;
 
 
 public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
@@ -98,6 +100,11 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
   private static final Random RANDOM = new Random(0xDEADBEEF);
   private static final int MOCK_BROKER_ID_TO_DROP = 1;
   private static final long MOCK_CURRENT_TIME = 1596842708000L;
+  private static final int BROKER_ID_2 = 2;
+  private static final String LOG_DIRS_CONFIG = "log.dirs";
+  private static final String JBOD_LOGDIR_0 = "/tmp/kafka-jbod-logs-0";
+  private static final String JBOD_LOGDIR_1 = "/tmp/kafka-jbod-logs-1";
+  private static final String PADDING_TOPIC = "padding-topic";
 
   private CCContainerizedKraftCluster _cluster;
   private Admin _adminClient;
@@ -607,6 +614,104 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
                   "Proposal execution did not finish within the time limit",
                   EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
     EasyMock.verify(mockMetadataClient, mockLoadMonitor, mockAnomalyDetectorManager, mockUserTaskInfo, mockUserTaskManager);
+  }
+
+  @Test
+  public void testInterBrokerAndIntraBrokerReplicaMovementsWithLogdirs() throws Exception {
+    restartClusterWithJbodBrokers();
+    // TOPIC0 has a replica on broker 0. TOPIC1 has replicas on broker 0 (i.e. the leader) and broker 1.
+    createTopics(0);
+    // Put more partitions on JBOD_LOGDIR_0 of broker 1 than on JBOD_LOGDIR_1, so that broker 1 would create a new replica
+    // on JBOD_LOGDIR_1 (i.e. the logdir with the fewest partitions) unless requested otherwise.
+    createPartitionsOnLogdir(PADDING_TOPIC, 6, BROKER_ID_1, JBOD_LOGDIR_0);
+    Map<String, Integer> numReplicasByLogdir = numReplicasByLogdir(BROKER_ID_1);
+    assertTrue("Unexpected number of replicas by logdir " + numReplicasByLogdir,
+               numReplicasByLogdir.get(JBOD_LOGDIR_0) > numReplicasByLogdir.get(JBOD_LOGDIR_1));
+
+    String tp0LogdirOnBroker0 = currentLogdir(TP0, BROKER_ID_0);
+    String tp1LogdirOnBroker0 = currentLogdir(TP1, BROKER_ID_0);
+    String tp1LogdirOnBroker1 = currentLogdir(TP1, BROKER_ID_1);
+    String newTp1LogdirOnBroker1 = JBOD_LOGDIR_0.equals(tp1LogdirOnBroker1) ? JBOD_LOGDIR_1 : JBOD_LOGDIR_0;
+    // Move the replica of TOPIC0 to JBOD_LOGDIR_0 of broker 1.
+    ExecutionProposal interBrokerReplicaMovement =
+        new ExecutionProposal(TP0, 0, new ReplicaPlacementInfo(BROKER_ID_0, tp0LogdirOnBroker0),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_0, tp0LogdirOnBroker0)),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_1, JBOD_LOGDIR_0)));
+    // Move the replica of TOPIC1 on broker 0 to JBOD_LOGDIR_1 of broker 2, and the replica of TOPIC1 on broker 1 to its other logdir.
+    ExecutionProposal interAndIntraBrokerReplicaMovements =
+        new ExecutionProposal(TP1, 0, new ReplicaPlacementInfo(BROKER_ID_0, tp1LogdirOnBroker0),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_0, tp1LogdirOnBroker0),
+                                      new ReplicaPlacementInfo(BROKER_ID_1, tp1LogdirOnBroker1)),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_1, newTp1LogdirOnBroker1),
+                                      new ReplicaPlacementInfo(BROKER_ID_2, JBOD_LOGDIR_1)));
+    List<ExecutionProposal> proposals = List.of(interBrokerReplicaMovement, interAndIntraBrokerReplicaMovements);
+    executeAndVerifyProposals(_adminClient, proposals, proposals, false, null, false, true);
+
+    // A single execution moves the replicas both across brokers (i.e. to the requested logdirs) and across logdirs of the same broker.
+    assertEquals(JBOD_LOGDIR_0, currentLogdir(TP0, BROKER_ID_1));
+    assertEquals(newTp1LogdirOnBroker1, currentLogdir(TP1, BROKER_ID_1));
+    assertEquals(JBOD_LOGDIR_1, currentLogdir(TP1, BROKER_ID_2));
+  }
+
+  /**
+   * Restart the cluster with brokers using two logdirs (i.e. {@link #JBOD_LOGDIR_0} and {@link #JBOD_LOGDIR_1}).
+   */
+  private void restartClusterWithJbodBrokers() {
+    tearDown();
+    List<Map<Object, Object>> brokerConfigs = buildBrokerConfigs();
+    brokerConfigs.forEach(brokerConfig -> brokerConfig.put(LOG_DIRS_CONFIG, String.join(",", JBOD_LOGDIR_0, JBOD_LOGDIR_1)));
+    Properties adminClientProps = new Properties();
+    adminClientProps.setProperty(AdminClientConfig.METADATA_MAX_AGE_CONFIG, "0");
+    setSecurityConfigs(adminClientProps, "admin");
+
+    _cluster = new CCContainerizedKraftCluster(clusterSize(), brokerConfigs, adminClientProps);
+    _cluster.start();
+    _brokerAddressList = _cluster.getBrokerAddressList();
+    _bootstrapUrl = _cluster.getExternalBootstrapAddress();
+    _adminClient = _cluster.adminClient();
+  }
+
+  /**
+   * Create a topic with the given number of single-replica partitions on the given logdir of the given broker.
+   *
+   * @param topic Topic to create.
+   * @param numPartitions Number of partitions of the topic.
+   * @param brokerId Broker to host the replicas.
+   * @param logdir Logdir of the broker to host the replicas.
+   */
+  private void createPartitionsOnLogdir(String topic, int numPartitions, int brokerId, String logdir)
+      throws InterruptedException, ExecutionException {
+    Map<Integer, List<Integer>> replicasByPartition = new HashMap<>();
+    Map<TopicPartitionReplica, String> logdirByReplica = new HashMap<>();
+    for (int partition = 0; partition < numPartitions; partition++) {
+      replicasByPartition.put(partition, Collections.singletonList(brokerId));
+      logdirByReplica.put(new TopicPartitionReplica(topic, partition, brokerId), logdir);
+    }
+    _adminClient.createTopics(Collections.singleton(new NewTopic(topic, replicasByPartition))).all().get();
+    _cluster.waitForTopicMetadata(List.of(topic), Duration.ofSeconds(15), Duration.ofSeconds(60),
+                                  topicDescription -> topicDescription.partitions().size() == numPartitions
+                                                      && topicDescription.partitions().stream().allMatch(p -> p.leader() != null));
+    _adminClient.alterReplicaLogDirs(logdirByReplica).all().get();
+    waitUntilTrue(() -> logdirByReplica.keySet().stream().allMatch(replica -> {
+      try {
+        ReplicaLogDirInfo info = _adminClient.describeReplicaLogDirs(Collections.singleton(replica)).all().get().get(replica);
+        return logdir.equals(info.getCurrentReplicaLogDir()) && info.getFutureReplicaLogDir() == null;
+      } catch (InterruptedException | ExecutionException e) {
+        return false;
+      }
+    }), "Failed to move replicas of " + topic + " to logdir " + logdir, EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
+  }
+
+  private Map<String, Integer> numReplicasByLogdir(int brokerId) throws InterruptedException, ExecutionException {
+    Map<String, Integer> numReplicasByLogdir = new HashMap<>();
+    _adminClient.describeLogDirs(Collections.singleton(brokerId)).allDescriptions().get().get(brokerId)
+                .forEach((logdir, description) -> numReplicasByLogdir.put(logdir, description.replicaInfos().size()));
+    return numReplicasByLogdir;
+  }
+
+  private String currentLogdir(TopicPartition tp, int brokerId) throws InterruptedException, ExecutionException {
+    TopicPartitionReplica replica = new TopicPartitionReplica(tp.topic(), tp.partition(), brokerId);
+    return _adminClient.describeReplicaLogDirs(Collections.singleton(replica)).all().get().get(replica).getCurrentReplicaLogDir();
   }
 
   /**
