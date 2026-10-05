@@ -318,7 +318,7 @@ public class MaintenanceEventTest {
                                                           ANOMALY_DETECTION_TIME_MS_OBJECT_CONFIG, MOCK_TIME_MS);
 
     // Expect mocks.
-    EasyMock.expect(_mockKafkaCruiseControl.config()).andReturn(_config).times(3);
+    EasyMock.expect(_mockKafkaCruiseControl.config()).andReturn(_config).times(4);
     // This is for rebalance runnable
     _mockKafkaCruiseControl.sanityCheckDryRun(false, true);
     EasyMock.expect(_mockKafkaCruiseControl.hasOngoingExecution()).andReturn(false).once();
