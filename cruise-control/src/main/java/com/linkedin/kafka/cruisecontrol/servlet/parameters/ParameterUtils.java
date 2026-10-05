@@ -4,6 +4,7 @@
 
 package com.linkedin.kafka.cruisecontrol.servlet.parameters;
 
+import com.google.gson.JsonParseException;
 import com.linkedin.cruisecontrol.detector.AnomalyType;
 import com.linkedin.cruisecontrol.servlet.EndPoint;
 import com.linkedin.cruisecontrol.servlet.parameters.CruiseControlParameters;
@@ -162,6 +163,7 @@ public final class ParameterUtils {
   public static final String RIGHTSIZE_PARAMETER_OBJECT_CONFIG = "rightsize.parameter.object";
   public static final String PERMISSIONS_PARAMETER_OBJECT_CONFIG = "permissions.parameter.object";
   public static final String REMOVE_DISKS_PARAMETER_OBJECT_CONFIG = "remove.disks.parameter.object";
+  public static final String REASSIGN_PARTITIONS_PARAMETER_OBJECT_CONFIG = "reassign.partitions.parameter.object";
 
   private ParameterUtils() {
   }
@@ -499,6 +501,35 @@ public final class ParameterUtils {
                                                    + "factor\" : \"topic name regex\".", TOPIC_BY_REPLICATION_FACTOR));
     }
     return topicPatternByReplicationFactor;
+  }
+
+  /**
+   * Parse the manual partition reassignment from the JSON body of the given request. See {@link ReassignPartitionsBodyParser}
+   * for the expected format.
+   *
+   * @param requestContext The Http request.
+   * @return The requested partition reassignments, or {@code null} if the request has no body because it polls an existing
+   * user task via its User-Task-ID header.
+   */
+  static List<RequestedPartitionReassignment> requestedReassignments(CruiseControlRequestContext requestContext) {
+    Map<String, Object> body;
+    try {
+      body = requestContext.getJson();
+    } catch (IOException | JsonParseException e) {
+      throw new UserRequestException(String.format("Malformed request body (%s). Send the partition reassignment as a JSON object "
+                                                   + "with header 'Content-Type: application/json'.", e.getMessage()));
+    }
+    if (body == null) {
+      String userTaskId = requestContext.getUserTaskIdString();
+      if (userTaskId != null && !userTaskId.isEmpty()) {
+        // The body was parsed when the polled user task was created.
+        return null;
+      }
+      throw new UserRequestException("Missing request body. Send the partition reassignment as a JSON object -- e.g. "
+                                     + "{\"partitions\": [{\"topic\": \"t\", \"partition\": 0, \"leader\": 1}]} -- with header "
+                                     + "'Content-Type: application/json'.");
+    }
+    return ReassignPartitionsBodyParser.parse(body);
   }
 
   static Map<Short, Pattern> topicPatternByReplicationFactor(CruiseControlRequestContext requestContext) {

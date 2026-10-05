@@ -4,6 +4,7 @@
 
 package com.linkedin.kafka.cruisecontrol.config.constants;
 
+import com.linkedin.kafka.cruisecontrol.servlet.parameters.ReassignPartitionsParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.RemoveDisksParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.PauseResumeParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.StopProposalParameters;
@@ -195,6 +196,13 @@ public final class CruiseControlParametersConfig {
   public static final String DEFAULT_REMOVE_DISKS_PARAMETERS_CLASS = RemoveDisksParameters.class.getName();
   public static final String REMOVE_DISKS_PARAMETERS_CLASS_DOC = "The class for parameters of a disks removal request.";
 
+  /**
+   * <code>reassign.partitions.parameters.class</code>
+   */
+  public static final String REASSIGN_PARTITIONS_PARAMETERS_CLASS_CONFIG = "reassign.partitions.parameters.class";
+  public static final String DEFAULT_REASSIGN_PARTITIONS_PARAMETERS_CLASS = ReassignPartitionsParameters.class.getName();
+  public static final String REASSIGN_PARTITIONS_PARAMETERS_CLASS_DOC = "The class for parameters of a manual partition reassignment request.";
+
   private CruiseControlParametersConfig() {
   }
 
@@ -319,6 +327,11 @@ public final class CruiseControlParametersConfig {
                             ConfigDef.Type.CLASS,
                             DEFAULT_REMOVE_DISKS_PARAMETERS_CLASS,
                             ConfigDef.Importance.MEDIUM,
-                            REMOVE_DISKS_PARAMETERS_CLASS_DOC);
+                            REMOVE_DISKS_PARAMETERS_CLASS_DOC)
+                    .define(REASSIGN_PARTITIONS_PARAMETERS_CLASS_CONFIG,
+                            ConfigDef.Type.CLASS,
+                            DEFAULT_REASSIGN_PARTITIONS_PARAMETERS_CLASS,
+                            ConfigDef.Importance.MEDIUM,
+                            REASSIGN_PARTITIONS_PARAMETERS_CLASS_DOC);
   }
 }

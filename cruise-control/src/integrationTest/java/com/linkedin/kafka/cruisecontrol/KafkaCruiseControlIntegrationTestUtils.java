@@ -5,10 +5,13 @@
 package com.linkedin.kafka.cruisecontrol;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
@@ -155,6 +158,73 @@ public final class KafkaCruiseControlIntegrationTestUtils {
       return IOUtils.toString(stateEndpointConnection.getInputStream(), Charset.defaultCharset());
     } catch (Exception e) {
       throw new RuntimeException(e);
+    }
+  }
+
+  /**
+   * Call a POST endpoint of the cruise control REST API with a JSON request body.
+   *
+   * @param serverUrl the server base URL
+   * @param path the path with query parameters -- unlike {@link #callCruiseControl(String, String)}, it is used as is
+   * @param body the JSON request body, or {@code null} to send no body
+   * @param headers the request headers
+   * @return the status code, headers and body of the response
+   */
+  public static HttpResult callCruiseControlPost(String serverUrl, String path, String body, Map<String, String> headers) {
+    try {
+      HttpURLConnection connection = (HttpURLConnection) new URI(serverUrl).resolve(path).toURL().openConnection();
+      connection.setRequestMethod("POST");
+      connection.setRequestProperty("Content-Type", "application/json");
+      headers.forEach(connection::setRequestProperty);
+      if (body != null) {
+        connection.setDoOutput(true);
+        try (OutputStream out = connection.getOutputStream()) {
+          out.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+      }
+      int statusCode = connection.getResponseCode();
+      InputStream in = statusCode < HttpURLConnection.HTTP_BAD_REQUEST ? connection.getInputStream() : connection.getErrorStream();
+      String responseBody = in == null ? "" : IOUtils.toString(in, StandardCharsets.UTF_8);
+      return new HttpResult(statusCode, connection.getHeaderFields(), responseBody);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  /**
+   * The status code, headers and body of an HTTP response.
+   */
+  public static final class HttpResult {
+    private final int _statusCode;
+    private final Map<String, List<String>> _headers;
+    private final String _body;
+
+    HttpResult(int statusCode, Map<String, List<String>> headers, String body) {
+      _statusCode = statusCode;
+      _headers = headers;
+      _body = body;
+    }
+
+    public int statusCode() {
+      return _statusCode;
+    }
+
+    /**
+     * @param name Name of the header -- case-insensitive.
+     * @return The first value of the given header, or {@code null} if the response has no such header.
+     */
+    public String header(String name) {
+      return _headers.entrySet().stream().filter(e -> name.equalsIgnoreCase(e.getKey())).findFirst()
+                     .map(e -> e.getValue().get(0)).orElse(null);
+    }
+
+    public String body() {
+      return _body;
+    }
+
+    @Override
+    public String toString() {
+      return String.format("HTTP %d: %s", _statusCode, _body);
     }
   }
 
