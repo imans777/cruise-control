@@ -114,11 +114,24 @@ public class ExecutionProposal {
    * Check whether the successful completion of inter-broker replica movement from this proposal is reflected in the current
    * ordered replicas in the given cluster and all replicas are in-sync.
    *
+   * If the proposal preserves the replica set (see {@link #isReplicaSetPreserved()}), the in-sync check is skipped: such a
+   * reassignment moves no data across brokers and Kafka applies it as soon as it is accepted. Waiting for all replicas to be
+   * in-sync would otherwise block the execution indefinitely for under-replicated partitions.
+   *
    * @param partitionInfo Current partition state.
    * @return {@code true} if successfully completed, {@code false} otherwise.
    */
   public boolean isInterBrokerMovementCompleted(PartitionInfo partitionInfo) {
-    return brokerOrderMatched(partitionInfo.replicas(), _newReplicas) && areAllReplicasInSync(partitionInfo);
+    return brokerOrderMatched(partitionInfo.replicas(), _newReplicas)
+           && (isReplicaSetPreserved() || areAllReplicasInSync(partitionInfo));
+  }
+
+  /**
+   * @return {@code true} if the proposal neither adds nor removes replicas -- i.e. it may only change the order of replicas
+   * and/or move replicas between disks of the same broker, {@code false} otherwise.
+   */
+  public boolean isReplicaSetPreserved() {
+    return _replicasToAdd.isEmpty() && _replicasToRemove.isEmpty();
   }
 
   /**

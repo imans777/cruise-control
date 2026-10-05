@@ -18,7 +18,10 @@ import java.util.concurrent.ExecutionException;
 import javax.annotation.Nullable;
 import org.apache.kafka.clients.admin.AlterPartitionReassignmentsResult;
 import org.apache.kafka.clients.admin.ElectLeadersResult;
+import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.ElectionNotNeededException;
 import org.apache.kafka.common.errors.InvalidTopicException;
@@ -261,6 +264,25 @@ public class ExecutionUtilsTest {
     ExecutionUtils.processElectLeadersResult(result, Collections.emptySet());
     EasyMock.verify(partitions);
     EasyMock.reset(partitions);
+  }
+
+  @Test
+  public void testIsInterBrokerReplicaActionDoneForReorderOnUnderReplicatedPartition() {
+    ReplicaPlacementInfo r0 = new ReplicaPlacementInfo(0);
+    ReplicaPlacementInfo r1 = new ReplicaPlacementInfo(1);
+    ReplicaPlacementInfo r2 = new ReplicaPlacementInfo(2);
+    ExecutionProposal reorder = new ExecutionProposal(P0, 0, r0, List.of(r0, r1, r2), List.of(r1, r0, r2));
+    ExecutionTask task = new ExecutionTask(0L, reorder, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, 1000L);
+    task.inProgress(0L);
+
+    Node node0 = new Node(0, "host0", 100);
+    Node node1 = new Node(1, "host1", 100);
+    Node node2 = new Node(2, "host2", 100);
+    // The new order is in place, but broker 2 is out of sync.
+    PartitionInfo partitionInfo = new PartitionInfo(TOPIC_NAME, P0.partition(), node0, new Node[]{node1, node0, node2},
+                                                    new Node[]{node0, node1});
+    Cluster cluster = new Cluster("cluster", List.of(node0, node1, node2), List.of(partitionInfo), Set.of(), Set.of());
+    Assert.assertTrue(ExecutionUtils.isInterBrokerReplicaActionDone(cluster, task));
   }
 
   private static Map<TopicPartition, KafkaFuture<Void>> getKafkaFutureByTopicPartition(@Nullable Exception futureException) throws Exception {
