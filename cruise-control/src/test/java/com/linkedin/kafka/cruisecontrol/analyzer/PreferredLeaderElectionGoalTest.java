@@ -310,6 +310,114 @@ public class PreferredLeaderElectionGoalTest {
     }
   }
 
+  @Test
+  public void testOptimizeWithDemotedBrokersAndExcludedTopics() {
+    ClusterModel clusterModel = createClusterModel(true, false).clusterModel();
+    // Broker 1 is the leader of T0P1 and T1P0.
+    clusterModel.setBrokerState(1, Broker.State.DEMOTED);
+
+    Map<TopicPartition, ReplicaPlacementInfo> originalLeaderDistribution = clusterModel.getLeaderDistribution();
+    Map<TopicPartition, List<ReplicaPlacementInfo>> originalReplicaDistribution = clusterModel.getReplicaDistribution();
+    PreferredLeaderElectionGoal goal = new PreferredLeaderElectionGoal(false, false, null, true);
+    // Before the optimization, goals are expected to be undecided wrt their provision status.
+    assertEquals(ProvisionStatus.UNDECIDED, goal.provisionResponse().status());
+    goal.optimize(clusterModel, Collections.emptySet(), new OptimizationOptions(Collections.singleton(TOPIC0),
+                                                                                Collections.emptySet(),
+                                                                                Collections.emptySet()));
+    // After the optimization, PreferredLeaderElectionGoal is expected to be undecided wrt its provision status.
+    assertEquals(ProvisionStatus.UNDECIDED, goal.provisionResponse().status());
+
+    // The replica order and leadership of the partitions of the excluded topic are expected to remain unchanged.
+    assertPartitionsUnchanged(clusterModel, TOPIC0, originalReplicaDistribution, originalLeaderDistribution);
+    assertEquals(1, clusterModel.partition(T0P1).leader().broker().id());
+    // The leadership of the partitions of the other topics is expected to be moved away from the demoted broker.
+    assertDemoted(clusterModel, T1P0, 1);
+  }
+
+  @Test
+  public void testOptimizeWithDemotedBrokersIgnoresExcludedTopicsByDefault() {
+    ClusterModel clusterModel = createClusterModel(true, false).clusterModel();
+    // Broker 1 is the leader of T0P1 and T1P0.
+    clusterModel.setBrokerState(1, Broker.State.DEMOTED);
+
+    // Unless the goal is asked to honor the excluded topics, it ignores them.
+    PreferredLeaderElectionGoal goal = new PreferredLeaderElectionGoal(false, false, null);
+    goal.optimize(clusterModel, Collections.emptySet(), new OptimizationOptions(Collections.singleton(TOPIC0),
+                                                                                Collections.emptySet(),
+                                                                                Collections.emptySet()));
+
+    assertDemoted(clusterModel, T0P1, 1);
+    assertDemoted(clusterModel, T1P0, 1);
+  }
+
+  @Test
+  public void testOptimizeWithDemotedDisksAndExcludedTopics() {
+    ClusterModel clusterModel = createClusterModel(true, true).clusterModel();
+    // LOGDIR0 of broker 4 hosts the leaders of T2P0, T2P2, and T3P2.
+    clusterModel.broker(4).disk(LOGDIR0).setState(Disk.State.DEMOTED);
+
+    Map<TopicPartition, ReplicaPlacementInfo> originalLeaderDistribution = clusterModel.getLeaderDistribution();
+    Map<TopicPartition, List<ReplicaPlacementInfo>> originalReplicaDistribution = clusterModel.getReplicaDistribution();
+    PreferredLeaderElectionGoal goal = new PreferredLeaderElectionGoal(false, false, null, true);
+    goal.optimize(clusterModel, Collections.emptySet(), new OptimizationOptions(Collections.singleton(TOPIC2),
+                                                                                Collections.emptySet(),
+                                                                                Collections.emptySet()));
+
+    // The replica order and leadership of the partitions of the excluded topic are expected to remain unchanged.
+    assertPartitionsUnchanged(clusterModel, TOPIC2, originalReplicaDistribution, originalLeaderDistribution);
+    assertEquals(4, clusterModel.partition(T2P0).leader().broker().id());
+    assertEquals(4, clusterModel.partition(T2P2).leader().broker().id());
+    // The leadership of the partitions of the other topics is expected to be moved away from the demoted disk.
+    assertDemoted(clusterModel, T3P2, 4);
+  }
+
+  @Test
+  public void testOptimizeWithoutDemotedBrokersAndWithExcludedTopics() {
+    ClusterModel clusterModel = createClusterModel(true, false).clusterModel();
+
+    Map<TopicPartition, ReplicaPlacementInfo> originalLeaderDistribution = clusterModel.getLeaderDistribution();
+    Map<TopicPartition, List<ReplicaPlacementInfo>> originalReplicaDistribution = clusterModel.getReplicaDistribution();
+    PreferredLeaderElectionGoal goal = new PreferredLeaderElectionGoal(false, false, null, true);
+    goal.optimize(clusterModel, Collections.emptySet(), new OptimizationOptions(Collections.singleton(TOPIC1),
+                                                                                Collections.emptySet(),
+                                                                                Collections.emptySet()));
+
+    // The leaders of the partitions of the excluded topic (i.e. not the first replicas) are expected to remain unchanged.
+    assertPartitionsUnchanged(clusterModel, TOPIC1, originalReplicaDistribution, originalLeaderDistribution);
+    for (String t : Arrays.asList(TOPIC0, TOPIC2)) {
+      for (int p = 0; p < 3; p++) {
+        List<Replica> replicas = clusterModel.partition(new TopicPartition(t, p)).replicas();
+        for (int i = 0; i < 3; i++) {
+          // only the first replica should be leader.
+          assertEquals(i == 0, replicas.get(i).isLeader());
+        }
+      }
+    }
+  }
+
+  // Assert that the given partition is led by its first replica, and its replica on the given demoted broker is the last replica.
+  private static void assertDemoted(ClusterModel clusterModel, TopicPartition tp, int demotedBrokerId) {
+    List<Replica> replicas = clusterModel.partition(tp).replicas();
+    for (int i = 0; i < replicas.size(); i++) {
+      assertEquals("Tp " + tp, i == 0, replicas.get(i).isLeader());
+    }
+    assertEquals("Tp " + tp, demotedBrokerId, replicas.get(replicas.size() - 1).broker().id());
+  }
+
+  // Assert that the replica order and leadership of the partitions of the given topic are unchanged.
+  private static void assertPartitionsUnchanged(ClusterModel clusterModel,
+                                                String topic,
+                                                Map<TopicPartition, List<ReplicaPlacementInfo>> originalReplicaDistribution,
+                                                Map<TopicPartition, ReplicaPlacementInfo> originalLeaderDistribution) {
+    Map<TopicPartition, List<ReplicaPlacementInfo>> replicaDistribution = clusterModel.getReplicaDistribution();
+    Map<TopicPartition, ReplicaPlacementInfo> leaderDistribution = clusterModel.getLeaderDistribution();
+    for (int p = 0; p < 3; p++) {
+      TopicPartition tp = new TopicPartition(topic, p);
+      assertEquals("Tp " + tp, originalReplicaDistribution.get(tp), replicaDistribution.get(tp));
+      assertEquals("Tp " + tp, originalLeaderDistribution.get(tp), leaderDistribution.get(tp));
+    }
+  }
+
   private static class ClusterModelAndInfo {
     private final ClusterModel _clusterModel;
     private final Cluster _clusterInfo;

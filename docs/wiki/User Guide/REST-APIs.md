@@ -493,6 +493,7 @@ Supported parameters are:
 | concurrent_leader_movements       | integer   | upper bound of ongoing leadership movements                                                                                           | null                  | yes                                       |
 | skip_urp_demotion                 | boolean   | whether skip demoting leader replicas for under replicated partitions                                                                 | true                  | yes                                       |
 | exclude_follower_demotion         | boolean   | whether skip demoting follower replicas on the broker to be demoted                                                                   | true                  | yes                                       |
+| excluded_topics                   | regex     | regular expression to specify topics whose leadership and replica order are kept unchanged by the demotion                            | null                  | yes                                       |
 | exclude_recently_demoted_brokers  | boolean   | whether to allow leader replicas to be moved to recently demoted brokers                                                              | false                 | yes                                       |
 | replica_movement_strategies       | string    | [replica movement strategy](https://github.com/linkedin/cruise-control/wiki/Pluggable-Components#replica-movement-strategy) to use    | null                  | yes                                       |
 | replication_throttle              | long      | upper bound on the bandwidth used to move replicas (in bytes per second)                                                              | null                  | yes                                       |
@@ -507,6 +508,8 @@ Demoting a broker/disk is consist of tow steps.
   * Trigger a preferred leader election on the partitions to migrate the leader replicas off the broker/disk
 
 Set `skip_urp_demotion` to false will cancel outstanding operations if partitions stay under replicated; Set `exclude_follower_demotion` will skip operations on the partitions which only have follower replicas on the brokers/disks to be demoted. The purpose of the former is to prevent the URP recovery process from blocking the demotion execution, the latter ensures that the demotion operation is limited to leaders.
+
+Set `excluded_topics` to a regular expression to skip the partitions of matching topics: their leadership and replica order remain unchanged, e.g. to move only the leaders of some of the topics away from the brokers/disks. If `excluded_topics` is not set, all topics are demoted -- i.e. `topics.excluded.from.partition.movement` does not apply to demotion.
 
 ### Stop the current proposal execution task
 The following POST request will let Kafka Cruise Control stop an ongoing `rebalance`, `add_broker`,  `remove_broker`, `fix_offline_replica`, `topic_configuration` or `demote_broker` operation:
