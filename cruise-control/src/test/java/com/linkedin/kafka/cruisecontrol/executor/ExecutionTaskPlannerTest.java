@@ -502,6 +502,35 @@ public class ExecutionTaskPlannerTest {
     assertEquals(0, planner.remainingInterBrokerReplicaMovements().size());
   }
 
+  @Test
+  public void testLeadershipChangesOnUnderReplicatedPartitions() {
+    Node node0 = new Node(0, "null", -1);
+    Node node1 = new Node(1, "null", -1);
+    Node node2 = new Node(2, "null", -1);
+    Node[] replicas = {node0, node1, node2};
+    // Broker 2 is out of sync for both partitions.
+    Node[] isr = {node0, node1};
+    // Preferred leader election only: replica order already matches, leadership moves back from broker 1 to broker 0.
+    ExecutionProposal electionOnly =
+        new ExecutionProposal(new TopicPartition(TOPIC1, 0), 0, _r1, Arrays.asList(_r0, _r1, _r2), Arrays.asList(_r0, _r1, _r2));
+    // Reorder to make broker 1 the preferred leader, followed by a leadership movement from broker 0 to broker 1.
+    ExecutionProposal reorder =
+        new ExecutionProposal(new TopicPartition(TOPIC1, 1), 0, _r0, Arrays.asList(_r0, _r1, _r2), Arrays.asList(_r1, _r0, _r2));
+    Set<PartitionInfo> partitions = new HashSet<>();
+    partitions.add(new PartitionInfo(TOPIC1, 0, node1, replicas, isr));
+    partitions.add(new PartitionInfo(TOPIC1, 1, node0, replicas, isr));
+    Cluster cluster = new Cluster(null, Arrays.asList(node0, node1, node2), partitions, Collections.emptySet(), Collections.emptySet());
+
+    ExecutionTaskPlanner planner =
+        new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
+    planner.addExecutionProposals(Arrays.asList(electionOnly, reorder), new StrategyOptions.Builder(cluster).build(), null);
+
+    // Only the reorder needs an inter-broker task -- the election-only proposal must not wait for the out-of-sync replica.
+    assertEquals(1, planner.remainingInterBrokerReplicaMovements().size());
+    assertEquals(reorder, planner.remainingInterBrokerReplicaMovements().iterator().next().proposal());
+    assertEquals(2, planner.remainingLeadershipMovements().size());
+  }
+
   private Node[] generateExpectedReplicas(ExecutionProposal proposal) {
     int i = 0;
     Node[] expectedProposalReplicas = new Node[proposal.oldReplicas().size()];

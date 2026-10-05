@@ -66,6 +66,53 @@ public class ExecutionProposalTest {
   }
 
   @Test
+  public void testIsReplicaSetPreserved() {
+    // Reorder only.
+    assertTrue(new ExecutionProposal(TP, 0, _r0, Arrays.asList(_r0, _r1, _r2), Arrays.asList(_r1, _r0, _r2)).isReplicaSetPreserved());
+    // Intra-broker replica movement only.
+    assertTrue(new ExecutionProposal(TP, 0, _r0d0, Arrays.asList(_r0d0, _r1d1), Arrays.asList(_r0d1, _r1d1)).isReplicaSetPreserved());
+    // Replica movement across brokers.
+    assertFalse(new ExecutionProposal(TP, 0, _r0, Arrays.asList(_r0, _r1), Arrays.asList(_r0, _r2)).isReplicaSetPreserved());
+    // Replication factor increase and decrease.
+    assertFalse(new ExecutionProposal(TP, 0, _r0, Arrays.asList(_r0, _r1), Arrays.asList(_r0, _r1, _r2)).isReplicaSetPreserved());
+    assertFalse(new ExecutionProposal(TP, 0, _r0, Arrays.asList(_r0, _r1, _r2), Arrays.asList(_r0, _r1)).isReplicaSetPreserved());
+  }
+
+  @Test
+  public void testReorderOnUnderReplicatedPartitionIsCompletedOnceOrderMatches() {
+    // Promote broker 1 as the preferred leader while broker 2 is out of sync.
+    ExecutionProposal reorder = new ExecutionProposal(TP, 0, _r0, Arrays.asList(_r0, _r1, _r2), Arrays.asList(_r1, _r0, _r2));
+    Node[] inSync = {NODE_0, NODE_1};
+    // The new order is not reflected yet.
+    PartitionInfo beforeReorder = new PartitionInfo(TP.topic(), TP.partition(), NODE_0, new Node[]{NODE_0, NODE_1, NODE_2}, inSync);
+    assertFalse(reorder.isInterBrokerMovementCompleted(beforeReorder));
+    // The new order is reflected: completed despite the out-of-sync replica, since a reorder moves no data.
+    PartitionInfo afterReorder = new PartitionInfo(TP.topic(), TP.partition(), NODE_0, new Node[]{NODE_1, NODE_0, NODE_2}, inSync);
+    assertTrue(reorder.isInterBrokerMovementCompleted(afterReorder));
+    assertTrue(reorder.isInterBrokerMovementAborted(afterReorder));
+    // A rollback to the original order is considered aborted.
+    assertTrue(reorder.isInterBrokerMovementAborted(beforeReorder));
+  }
+
+  @Test
+  public void testReplicaAdditionIsCompletedOnlyOnceAllReplicasAreInSync() {
+    ExecutionProposal move = new ExecutionProposal(TP, 0, _r0, Arrays.asList(_r0, _r1), Arrays.asList(_r0, _r2));
+    Node[] newReplicas = {NODE_0, NODE_2};
+    // The new replica on broker 2 has not caught up yet.
+    PartitionInfo catchingUp = new PartitionInfo(TP.topic(), TP.partition(), NODE_0, newReplicas, new Node[]{NODE_0});
+    assertFalse(move.isInterBrokerMovementCompleted(catchingUp));
+    PartitionInfo inSync = new PartitionInfo(TP.topic(), TP.partition(), NODE_0, newReplicas, newReplicas);
+    assertTrue(move.isInterBrokerMovementCompleted(inSync));
+  }
+
+  @Test
+  public void testIntraBrokerOnlyMovementOnUnderReplicatedPartitionIsInterBrokerComplete() {
+    ExecutionProposal diskMove = new ExecutionProposal(TP, 0, _r0d0, Arrays.asList(_r0d0, _r1d1), Arrays.asList(_r0d1, _r1d1));
+    PartitionInfo underReplicated = new PartitionInfo(TP.topic(), TP.partition(), NODE_0, new Node[]{NODE_0, NODE_1}, new Node[]{NODE_0});
+    assertTrue(diskMove.isInterBrokerMovementCompleted(underReplicated));
+  }
+
+  @Test
   public void testAreAllReplicasInSync() {
     // Verify: If isr is the same as replicas, all replicas are in-sync
     Node[] replicas = new Node[2];
