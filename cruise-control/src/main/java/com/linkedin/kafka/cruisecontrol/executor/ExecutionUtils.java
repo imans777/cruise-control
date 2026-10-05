@@ -670,7 +670,9 @@ public final class ExecutionUtils {
    * For an inter-broker replica movement action, the completion depends on the task state:
    * <ul>
    *   <li>{@link ExecutionTaskState#IN_PROGRESS}: when the current replica list is the same as the new replica list
-   *   and all replicas are in-sync.</li>
+   *   and all replicas are in-sync. The in-sync check is skipped for proposals that preserve the replica set (e.g. a pure
+   *   reorder of replicas), because such a reassignment moves no data (see
+   *   {@link ExecutionProposal#isInterBrokerMovementCompleted(PartitionInfo)}).</li>
    *   <li>{@link ExecutionTaskState#ABORTING}: done when the current replica list is the same as the old replica list.
    *   Due to race condition, we also consider it done if the current replica list is the same as the new replica list
    *   and all replicas are in-sync.</li>

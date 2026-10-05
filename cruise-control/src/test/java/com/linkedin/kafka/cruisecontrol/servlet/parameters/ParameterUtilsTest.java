@@ -4,13 +4,18 @@
 
 package com.linkedin.kafka.cruisecontrol.servlet.parameters;
 
+import com.google.gson.JsonSyntaxException;
 import com.linkedin.cruisecontrol.http.CruiseControlRequestContext;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
+import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint;
+import com.linkedin.kafka.cruisecontrol.servlet.UserRequestException;
+import org.apache.kafka.common.TopicPartition;
 import org.easymock.EasyMock;
 import org.junit.Assert;
 import org.junit.Test;
@@ -243,6 +248,55 @@ public class ParameterUtilsTest {
     EasyMock.replay(mockRequest);
 
     Assert.assertEquals(CruiseControlEndPoint.STATE, ParameterUtils.endPoint(mockRequest));
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testRequestedReassignments() throws IOException {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    Map<String, Object> body = Map.of(ReassignPartitionsBodyParser.PARTITIONS,
+                                      List.of(Map.of(ReassignPartitionsBodyParser.TOPIC, "t",
+                                                     ReassignPartitionsBodyParser.PARTITION, 1.0,
+                                                     ReassignPartitionsBodyParser.LEADER, 2.0)));
+    EasyMock.expect(mockRequest.getJson()).andReturn(body);
+    EasyMock.replay(mockRequest);
+
+    List<RequestedPartitionReassignment> requested = ParameterUtils.requestedReassignments(mockRequest);
+    Assert.assertEquals(1, requested.size());
+    Assert.assertEquals(new TopicPartition("t", 1), requested.get(0).topicPartition());
+    Assert.assertEquals(Integer.valueOf(2), requested.get(0).leader());
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testRequestedReassignmentsWithoutBody() throws IOException {
+    // A request without body is valid only to poll an existing user task.
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getJson()).andReturn(null).times(3);
+    EasyMock.expect(mockRequest.getUserTaskIdString()).andReturn("9e1d8a27-8e60-4c5a-9a9b-6c1f1f0f6e3b").andReturn(null).andReturn("");
+    EasyMock.replay(mockRequest);
+
+    Assert.assertNull(ParameterUtils.requestedReassignments(mockRequest));
+    for (int i = 0; i < 2; i++) {
+      UserRequestException exception = Assert.assertThrows(UserRequestException.class,
+                                                           () -> ParameterUtils.requestedReassignments(mockRequest));
+      Assert.assertTrue(exception.getMessage(), exception.getMessage().startsWith("Missing request body."));
+    }
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testRequestedReassignmentsWithMalformedBody() throws IOException {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getJson()).andThrow(new JsonSyntaxException("Expected BEGIN_OBJECT but was BEGIN_ARRAY"))
+            .andThrow(new IOException("Stream closed"));
+    EasyMock.replay(mockRequest);
+
+    for (String cause : List.of("Expected BEGIN_OBJECT but was BEGIN_ARRAY", "Stream closed")) {
+      UserRequestException exception = Assert.assertThrows(UserRequestException.class,
+                                                           () -> ParameterUtils.requestedReassignments(mockRequest));
+      Assert.assertTrue(exception.getMessage(), exception.getMessage().startsWith("Malformed request body (" + cause + ")."));
+    }
     EasyMock.verify(mockRequest);
   }
 }

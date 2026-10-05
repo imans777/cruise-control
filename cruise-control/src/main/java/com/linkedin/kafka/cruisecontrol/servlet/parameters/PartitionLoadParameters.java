@@ -17,12 +17,14 @@ import java.util.regex.Pattern;
 
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.ALLOW_CAPACITY_ESTIMATION_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.AVG_LOAD_PARAM;
+import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.BROKER_ID_AND_LOGDIRS_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.BROKER_ID_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.END_MS_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.ENTRIES_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.MAX_LOAD_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.MIN_VALID_PARTITION_RATIO_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.PARTITION_PARAM;
+import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.POPULATE_DISK_INFO_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.REASON_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.RESOURCE_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.START_MS_PARAM;
@@ -39,7 +41,14 @@ import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils
  *    &amp;min_valid_partition_ratio=[min_valid_partition_ratio]&amp;allow_capacity_estimation=[true/false]
  *    &amp;max_load=[true/false]&amp;avg_load=[true/false]&amp;json=[true/false]&amp;brokerid=[brokerid]
  *    &amp;get_response_schema=[true/false]&amp;doAs=[user]&amp;reason=[reason-for-request]
+ *    &amp;populate_disk_info=[true/false]&amp;brokerid_and_logdirs=[broker_id1-logdir1,broker_id2-logdir2...]
  * </pre>
+ *
+ * <ul>
+ *   <li>"populate_disk_info" adds the log directory of each replica of the returned partitions, as reported by Kafka.</li>
+ *   <li>"brokerid_and_logdirs" returns only partitions with a replica on one of the given log directories, and implies
+ *   "populate_disk_info".</li>
+ * </ul>
  */
 public class PartitionLoadParameters extends AbstractParameters {
   protected static final SortedSet<String> CASE_INSENSITIVE_PARAMETER_NAMES;
@@ -57,6 +66,8 @@ public class PartitionLoadParameters extends AbstractParameters {
     validParameterNames.add(AVG_LOAD_PARAM);
     validParameterNames.add(BROKER_ID_PARAM);
     validParameterNames.add(REASON_PARAM);
+    validParameterNames.add(POPULATE_DISK_INFO_PARAM);
+    validParameterNames.add(BROKER_ID_AND_LOGDIRS_PARAM);
     validParameterNames.addAll(AbstractParameters.CASE_INSENSITIVE_PARAMETER_NAMES);
     CASE_INSENSITIVE_PARAMETER_NAMES = Collections.unmodifiableSortedSet(validParameterNames);
   }
@@ -72,6 +83,8 @@ public class PartitionLoadParameters extends AbstractParameters {
   protected boolean _wantMaxLoad;
   protected boolean _wantAvgLoad;
   protected Set<Integer> _brokerIds;
+  protected Map<Integer, Set<String>> _logDirsByBrokerId;
+  protected boolean _populateDiskInfo;
 
   public PartitionLoadParameters() {
     super();
@@ -103,6 +116,8 @@ public class PartitionLoadParameters extends AbstractParameters {
     _startMs = ParameterUtils.startMsOrDefault(_requestContext, ParameterUtils.DEFAULT_START_TIME_FOR_CLUSTER_MODEL);
     _endMs = ParameterUtils.endMsOrDefault(_requestContext, System.currentTimeMillis());
     ParameterUtils.validateTimeRange(_startMs, _endMs);
+    _logDirsByBrokerId = ParameterUtils.brokerIdAndLogdirs(_requestContext);
+    _populateDiskInfo = ParameterUtils.populateDiskInfo(_requestContext) || !_logDirsByBrokerId.isEmpty();
   }
 
   public Resource resource() {
@@ -151,6 +166,21 @@ public class PartitionLoadParameters extends AbstractParameters {
 
   public Set<Integer> brokerIds() {
     return Collections.unmodifiableSet(_brokerIds);
+  }
+
+  /**
+   * @return Log directories by broker id to filter the returned partitions by -- i.e. only partitions with a replica on one of these log
+   * directories are returned, or an empty map to not filter partitions by log directory.
+   */
+  public Map<Integer, Set<String>> brokerIdAndLogdirs() {
+    return Collections.unmodifiableMap(_logDirsByBrokerId);
+  }
+
+  /**
+   * @return {@code true} to include the log directory of each replica of the returned partitions, {@code false} otherwise.
+   */
+  public boolean populateDiskInfo() {
+    return _populateDiskInfo;
   }
 
   @Override

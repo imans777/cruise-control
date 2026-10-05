@@ -26,11 +26,19 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.LogDirDescription;
+import org.apache.kafka.clients.admin.ReplicaInfo;
 import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -167,6 +175,76 @@ public final class RunnableUtils {
     return substates.stream()
                     .anyMatch(substate -> substate == CruiseControlState.SubState.ANALYZER
                                           || substate == CruiseControlState.SubState.MONITOR);
+  }
+
+  /**
+   * Describe the log directories of the given brokers, waiting at most the given timeout in total. Failures are recorded per
+   * broker in the given map, rather than failing the whole request.
+   *
+   * @param adminClient The admin client to describe the log directories with.
+   * @param brokers Brokers whose log directories to describe.
+   * @param timeoutMs The maximum time to wait for the response of all brokers.
+   * @param errorByBroker A map to populate with the error message of each broker whose log directories could not be described.
+   * @return Log directory descriptions by log directory by broker, for the brokers that responded successfully.
+   */
+  public static Map<Integer, Map<String, LogDirDescription>> describeLogDirs(Admin adminClient,
+                                                                            Set<Integer> brokers,
+                                                                            long timeoutMs,
+                                                                            Map<Integer, String> errorByBroker) {
+    Map<Integer, Map<String, LogDirDescription>> logDirsByBroker = new HashMap<>();
+    if (brokers.isEmpty()) {
+      return logDirsByBroker;
+    }
+    Map<Integer, KafkaFuture<Map<String, LogDirDescription>>> descriptions = adminClient.describeLogDirs(brokers).descriptions();
+    long deadlineMs = System.currentTimeMillis() + timeoutMs;
+    for (Map.Entry<Integer, KafkaFuture<Map<String, LogDirDescription>>> entry : descriptions.entrySet()) {
+      try {
+        long remainingMs = Math.max(0L, deadlineMs - System.currentTimeMillis());
+        logDirsByBroker.put(entry.getKey(), entry.getValue().get(remainingMs, TimeUnit.MILLISECONDS));
+      } catch (TimeoutException te) {
+        errorByBroker.put(entry.getKey(), String.format("Describing log directories timed out after %d ms.", timeoutMs));
+      } catch (ExecutionException ee) {
+        errorByBroker.put(entry.getKey(), String.format("Failed to describe log directories (%s).", ee.getCause()));
+      } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+        errorByBroker.put(entry.getKey(), "Interrupted while describing log directories.");
+      }
+    }
+    return logDirsByBroker;
+  }
+
+  /**
+   * @param logDir A log directory.
+   * @return The given log directory without trailing separators -- e.g. to match user-provided log directories with those reported
+   * by brokers.
+   */
+  public static String withoutTrailingSeparator(String logDir) {
+    String result = logDir;
+    while (result.length() > 1 && result.endsWith("/")) {
+      result = result.substring(0, result.length() - 1);
+    }
+    return result;
+  }
+
+  /**
+   * Get the current (i.e. not future) log directory of each replica of the given partitions from the given log directory
+   * descriptions.
+   *
+   * @param logDirsByBroker Log directory descriptions by log directory by broker.
+   * @param partitions Partitions of interest.
+   * @return The current log directory by broker by partition.
+   */
+  public static Map<TopicPartition, Map<Integer, String>> currentLogDirByReplica(Map<Integer, Map<String, LogDirDescription>> logDirsByBroker,
+                                                                                Set<TopicPartition> partitions) {
+    Map<TopicPartition, Map<Integer, String>> logDirByReplica = new HashMap<>();
+    logDirsByBroker.forEach((broker, logDirs) -> logDirs.forEach((logDir, description) -> {
+      for (Map.Entry<TopicPartition, ReplicaInfo> entry : description.replicaInfos().entrySet()) {
+        if (!entry.getValue().isFuture() && partitions.contains(entry.getKey())) {
+          logDirByReplica.computeIfAbsent(entry.getKey(), tp -> new HashMap<>()).put(broker, logDir);
+        }
+      }
+    }));
+    return logDirByReplica;
   }
 
   /**
