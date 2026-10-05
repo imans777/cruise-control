@@ -23,6 +23,7 @@
     * [Change Cruise Control configuration](#change-cruise-control-configuration)
     * [2-step Verification](#2-step-verification)
     * [Rightsize the cluster with the Provisioner](#rightsize-the-cluster-with-the-provisioner)
+    * [Reassign partitions, move leadership or move replicas between disks](#reassign-partitions-move-leadership-or-move-replicas-between-disks)
 
 ## Asynchronous Endpoints
 
@@ -67,6 +68,8 @@ Here is an example of how to use **cookies** with requests using `cURL`:
  `curl -X POST -b /tmp/mycookie-jar.txt "http://CRUISE_CONTROL_HOST:9090/kafkacruisecontrol/remove_broker?brokerid=1234&dryrun=false"`
 
 Note that a `User-Task-ID` or a `sessionId` and is applicable for an entire `URL`, including its parameters. Hence, the same endpoint with different parameters would create and use a different `User-Task-Id`.
+
+Cookies cannot identify requests whose payload is in the request body -- e.g. [reassign_partitions](#reassign-partitions-move-leadership-or-move-replicas-between-disks). Use the `User-Task-ID` header to poll such requests.
 
 ## GET Requests
 
@@ -185,12 +188,18 @@ Supported parameters are:
 | partition                 | integer/range | partition number(e.g. 10) range(e.g. 1-10) to filter partition load to report                                     | null                          | yes       |
 | min_valid_partition_ratio | double        | minimal valid partition ratio requirement for cluster model                                                       | null                          | yes       |
 | brokerid                  | int           | broker id to to filter partition load to report                                                                   | null                          | yes       |
+| populate_disk_info        | boolean       | whether to report the log directory of each replica (`leaderLogdir` and `followerLogdirs`)                        | false                         | yes       |
+| brokerid_and_logdirs      | list          | broker id and log directory pairs (e.g. `101-/data/d1`) to report only partitions with a replica on these log directories; implies `populate_disk_info` | null | yes |
 | doAs                      | string        | propagated user by the trusted proxy service                                                                      | null                          | yes       |
 | reason                    | string        | reason for the request                                                                                            | "No reason provided"          | yes       | 
 
 The returned result would be a partition list sorted by the utilization of the specified resource in the time range specified by `start` and `end`. The resource can be `CPU`, `NW_IN`, `NW_OUT` and `DISK`. By default, the `start` is the earliest monitored time, the `end` is current wall clock time, `resource` is `DISK`, and `entries` is the all partitions in the cluster.
 
 By specifying `topic`,`partition` and/or `brokerid` parameter, client can filter returned partition entries.
+
+With `populate_disk_info=true`, each returned partition also reports the log directory of its leader (`leaderLogdir`) and followers (`followerLogdirs`, in the order of `followers`), as reported by the brokers. The `brokerid_and_logdirs` parameter returns only partitions with a replica on one of the given log directories -- e.g. the following request lists the 20 partitions with the highest outbound network load among those with a replica on disk `/data/d1` of broker 101, and shows which of them are led from that disk:
+
+    GET /kafkacruisecontrol/partition_load?brokerid_and_logdirs=101-/data/d1&resource=NW_OUT&entries=20
 
 The `min_valid_partition_ratio` specifies minimal monitored valid partition percentage needed to calculate the partition load. If this parameter is not set in request, the config value `min.valid.partition.ratio` will be used.
 
@@ -317,6 +326,7 @@ The post requests of Kafka Cruise Control REST API are operations that will have
 * [Resume metrics load sampling](#resume-metrics-load-sampling)
 * [Change Kafka topic configuration](#change-kafka-topic-configuration)
 * [Change Cruise Control configuration](#change-cruise-control-configuration)
+* [Reassign partitions, move leadership or move replicas between disks](#reassign-partitions-move-leadership-or-move-replicas-between-disks)
 
 **Most of the POST actions has a dry-run mode, which only generate the proposals and estimated result but not really execute the proposals.** To avoid accidentally triggering of data movement, by default all the POST actions are in dry run mode. **To let Kafka Cruise Control actually move data, users need to explicitly set `dryrun=false`.**
 
@@ -509,7 +519,7 @@ Demoting a broker/disk is consist of tow steps.
 Set `skip_urp_demotion` to false will cancel outstanding operations if partitions stay under replicated; Set `exclude_follower_demotion` will skip operations on the partitions which only have follower replicas on the brokers/disks to be demoted. The purpose of the former is to prevent the URP recovery process from blocking the demotion execution, the latter ensures that the demotion operation is limited to leaders.
 
 ### Stop the current proposal execution task
-The following POST request will let Kafka Cruise Control stop an ongoing `rebalance`, `add_broker`,  `remove_broker`, `fix_offline_replica`, `topic_configuration` or `demote_broker` operation:
+The following POST request will let Kafka Cruise Control stop an ongoing `rebalance`, `add_broker`,  `remove_broker`, `fix_offline_replica`, `topic_configuration`, `demote_broker` or `reassign_partitions` operation:
 
     POST /kafkacruisecontrol/stop_proposal_execution
 
@@ -655,3 +665,102 @@ Supported parameters are:
 | get_response_schema                 | boolean   | return JSON schema in response header or not                                      | false                 | yes       |
 | json                                | boolean   | return in JSON format or not                                                      | false                 | yes       |
 | reason                              | string    | reason for the request                                                            | "No reason provided"  | yes       | 
+
+### Reassign partitions, move leadership or move replicas between disks
+The following POST request executes a manual partition reassignment through Cruise Control -- as an alternative to
+`kafka-reassign-partitions.sh`, but with the safety of Cruise Control: dry run by default, validation against the live cluster,
+an analysis of the impact on the cluster load and goals, replication throttling, concurrency limits, progress tracking via the
+`state` endpoint, `stop_proposal_execution` and 2-step verification.
+
+    POST /kafkacruisecontrol/reassign_partitions
+
+The reassignment is given in the request body as JSON (send the header `Content-Type: application/json`). It accepts the format of
+`kafka-reassign-partitions.sh` and two shorthands, so that you never need to copy the current replica list of a partition. Each
+partition entry uses exactly one of the following forms:
+
+```json
+{
+  "version": 1,
+  "partitions": [
+    {"topic": "orders", "partition": 3, "leader": 102},
+    {"topic": "orders", "partition": 7, "log_dirs": {"101": "/data/d2"}},
+    {"topic": "events", "partition": 0, "replicas": [104, 105, 106], "log_dirs": ["any", "any", "/data/d3"]}
+  ]
+}
+```
+
+| FORM                                      | MEANING                                                                                                                                                                                                                                                                         |
+|-------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `"leader": b`                             | Promote replica `b` -- an existing, in-sync replica -- to leader. The replica set is kept and `b` becomes the first (preferred) replica; no data is moved.                                                                                                                         |
+| `"log_dirs": {"b": "dir", ...}` (object)  | Move the replicas on the given brokers to the given log directories of these brokers. The replica list is kept.                                                                                                                                                                 |
+| `"replicas": [...]` (and optional `"log_dirs": [...]`) | The new ordered replica list, as in `kafka-reassign-partitions.sh`. The first replica becomes the leader after execution. A log directory of `any` keeps the log directory of an existing replica, or lets the broker pick one for an added replica. An explicit log directory moves an existing replica to it, or creates an added replica directly on it. |
+
+Supported parameters are:
+
+| PARAMETER                                   | TYPE      | DESCRIPTION                                                                                                                                       | DEFAULT                | OPTIONAL  |
+|---------------------------------------------|-----------|---------------------------------------------------------------------------------------------------------------------------------------------------|------------------------|-----------|
+| dryrun                                      | boolean   | whether dry-run the request or not                                                                                                                | true                   | yes       |
+| reason                                      | string    | reason for the request                                                                                                                            | "No reason provided"   | yes       |
+| stop_ongoing_execution                      | boolean   | whether to stop the ongoing execution (if any) and start executing the given request                                                             | false                  | yes       |
+| review_id                                   | integer   | review id for 2-step verification                                                                                                                 | N/A                    | yes       |
+| goals                                       | list      | list of goals to analyze the impact against                                                                                                       | default goals (intra-broker goals for log directory moves) | yes |
+| skip_hard_goal_check                        | boolean   | whether to execute even if the reassignment violates hard goals, or its impact on hard goals cannot be verified                                   | false                  | yes       |
+| allow_capacity_estimation                   | boolean   | whether to allow broker capacity to be estimated                                                                                                  | true                   | yes       |
+| concurrent_partition_movements_per_broker   | integer   | upper bound of ongoing replica movements going into/out of each broker -- including the replica reorders that leadership movements need          | config default         | yes       |
+| max_partition_movements_in_cluster          | integer   | upper bound of ongoing inter-broker partition movements in the cluster                                                                            | config default         | yes       |
+| concurrent_intra_broker_partition_movements | integer   | upper bound of ongoing replica movements between disks within each broker                                                                         | config default         | yes       |
+| concurrent_leader_movements                 | integer   | upper bound of ongoing leadership movements in the cluster                                                                                        | config default         | yes       |
+| broker_concurrent_leader_movements          | integer   | upper bound of ongoing leadership movements per broker                                                                                            | config default         | yes       |
+| execution_progress_check_interval_ms        | long      | execution progress check interval in milliseconds                                                                                                 | config default         | yes       |
+| replica_movement_strategies                 | string    | [replica movement strategy](https://github.com/linkedin/cruise-control/wiki/Pluggable-Components#replica-movement-strategy) to use                | null                   | yes       |
+| replication_throttle                        | long      | upper bound on the bandwidth used to move replicas between brokers (in bytes per second)                                                          | null                   | yes       |
+| json                                        | boolean   | return in JSON format or not                                                                                                                      | false                  | yes       |
+| get_response_schema                         | boolean   | return JSON schema in response header or not                                                                                                      | false                  | yes       |
+| doAs                                        | string    | propagated user by the trusted proxy service                                                                                                      | null                   | yes       |
+
+For example, the following requests first review and then execute a reassignment given in `plan.json`:
+
+    curl -X POST -H 'Content-Type: application/json' -d @plan.json "http://CRUISE_CONTROL_HOST:9090/kafkacruisecontrol/reassign_partitions?json=true"
+    curl -X POST -H 'Content-Type: application/json' -d @plan.json "http://CRUISE_CONTROL_HOST:9090/kafkacruisecontrol/reassign_partitions?dryrun=false&reason=hot-disk"
+
+Without the `Content-Type` header, `cURL` sends the body as a form, which Cruise Control rejects.
+
+The response shows for each partition its current and new replicas, leader and log directories, the actions to reach the new
+assignment and the data to move, as well as a summary. It also shows the **impact analysis** of the reassignment -- as the summary
+of a `rebalance` does: the broker load before and after the reassignment (per disk for log directory moves, if the capacity config
+specifies the capacity of each log directory), the cluster load statistics, and for each goal whether it is violated before and
+after the reassignment (`OK`, `VIOLATION_INTRODUCED`, `VIOLATION_FIXED` or `STILL_VIOLATED`) with the on-demand balancedness score.
+The impact analysis needs a ready load monitor; otherwise, it is reported as `UNAVAILABLE` with the reason. Note that Cruise Control
+models the `DISK` resource as storage size, not as I/O -- e.g. a leadership movement shows up as outbound network and CPU load
+moving between brokers.
+
+**Unless `skip_hard_goal_check=true`, Cruise Control refuses to execute a reassignment that would violate a hard goal, or whose
+impact on hard goals cannot be verified** (e.g. right after Cruise Control starts, before the load monitor is ready).
+
+The request is all-or-nothing: Cruise Control validates the whole request against the current state of the cluster and reports all
+problems together -- e.g. unknown partitions, dead brokers, a new leader out of the in-sync replicas, unknown, offline or full log
+directories, or partitions with an ongoing reassignment. The request is declarative: re-submitting it after its execution reports
+`NO_CHANGE` for every partition. Note that:
+* Moving existing replicas between log directories cannot be combined with replica set or order changes (including leader
+  promotions that reorder replicas) in the same request, because the executor runs them in separate phases -- the error message
+  lists the partitions to submit first, and those to submit once that execution finishes.
+* Leadership movements reorder the replicas (so that the new leader becomes the preferred leader, which Kafka's automatic leader
+  rebalance then keeps) and then trigger a preferred leader election. The reorder counts towards
+  `concurrent_partition_movements_per_broker`, which you may raise to promote many leaders at once.
+* A log directory requested for a replica added to a new broker is passed to the broker before the move -- as
+  `kafka-reassign-partitions.sh` does -- so that the replica is created directly on it. If the destination broker restarts before the
+  replica is created, the broker picks the log directory instead; check with `partition_load?populate_disk_info=true`.
+* `replication_throttle` does not apply to moving replicas between log directories of a broker; use the broker config
+  `replica.alter.log.dirs.io.max.bytes.per.second` to throttle these moves.
+* Goal-based operations of Cruise Control (e.g. `rebalance` and self-healing) may later move the reassigned partitions again;
+  exclude their topics (e.g. via `topics.excluded.from.partition.movement`) to keep them in place.
+
+A typical way to relieve a disk that has become a bottleneck (e.g. causing consumer lag):
+1. Find the hottest partitions on the disk, and which of them are led from it:
+   `GET /kafkacruisecontrol/partition_load?brokerid_and_logdirs=101-/data/d1&resource=NW_OUT&entries=20`
+2. For immediate relief, promote an in-sync follower to leader: `{"partitions": [{"topic": "orders", "partition": 3, "leader": 102}]}`.
+3. For lasting relief, move the replica to a less loaded disk of the broker in a separate request:
+   `{"partitions": [{"topic": "orders", "partition": 3, "log_dirs": {"101": "/data/d2"}}]}`. Note that the move reads the replica
+   from the busy disk.
+
+To move the leadership of all partitions away from a disk at once, use `demote_broker?brokerid_and_logdirs=...` instead.
