@@ -42,9 +42,9 @@ class ReplicationThrottleHelper {
   static final String FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG = "follower.replication.throttled.replicas";
   public static final long CLIENT_REQUEST_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(30);
   static final int RETRIES = 30;
-  // Backoff parameters for the config verification retry loop. The sleep between attempts is
-  // scale * base^attempt, capped at MAX_RETRY_SLEEP_MS so that a slow-to-verify config cannot
-  // park the executor thread for an unbounded exponential sleep.
+  // Backoff parameters for the config verification retry loop. The sleep before the n-th retry
+  // (n >= 1) is scale * base^n (10s, 20s, 30s, 30s, ...), capped at MAX_RETRY_SLEEP_MS so that a
+  // slow-to-verify config cannot park the executor thread for an unbounded exponential sleep.
   static final long RETRY_BACKOFF_SCALE_MS = TimeUnit.SECONDS.toMillis(5);
   static final int RETRY_BACKOFF_BASE = 2;
   static final int MAX_RETRY_SLEEP_MS = (int) TimeUnit.SECONDS.toMillis(30);
@@ -378,13 +378,41 @@ class ReplicationThrottleHelper {
             .collect(HashMap::new, (m, o) -> m.put(o.configEntry().name(), o.configEntry().value()), HashMap::putAll);
     boolean retryResponse = CruiseControlMetricsUtils.retry(() -> {
       try {
-        return !configsEqual(getEntityConfigs(cf), expectedConfigs);
-      } catch (ExecutionException | InterruptedException | TimeoutException e) {
+        try {
+          return !configsEqual(getEntityConfigs(cf), expectedConfigs);
+        } catch (ExecutionException | TimeoutException e) {
+          if (isDeletedTopic(cf)) {
+            LOG.debug("Skipping config verification for topic {} since it no longer exists", cf.name());
+            return false;
+          }
+          // Keep retrying: a failed read must not let an unverified config pass silently.
+          LOG.warn("Failed to read configs for {}, will retry", cf, e);
+          return true;
+        }
+      } catch (InterruptedException e) {
+        LOG.warn("Interrupted while verifying configs {} for {}, skipping verification", ops, cf, e);
+        Thread.currentThread().interrupt();
         return false;
       }
     }, RETRY_BACKOFF_SCALE_MS, RETRY_BACKOFF_BASE, _retries, MAX_RETRY_SLEEP_MS);
     if (!retryResponse) {
       throw new IllegalStateException("The following configs " + ops + " were not applied to " + cf + " within the time limit");
+    }
+  }
+
+  /**
+   * @param cf The config resource whose read failed.
+   * @return {@code true} if the resource is a topic that is confirmed to no longer exist, {@code false} otherwise
+   * (including when existence cannot be determined).
+   */
+  private boolean isDeletedTopic(ConfigResource cf) throws InterruptedException {
+    if (cf.type() != ConfigResource.Type.TOPIC) {
+      return false;
+    }
+    try {
+      return !topicExists(cf.name());
+    } catch (ExecutionException | TimeoutException e) {
+      return false;
     }
   }
 
