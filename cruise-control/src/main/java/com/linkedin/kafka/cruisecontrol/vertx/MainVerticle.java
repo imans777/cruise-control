@@ -100,6 +100,7 @@ public class MainVerticle extends AbstractVerticle {
     builder.operation("admin").handler(_endPoints::handle);
     builder.operation("rightsize").handler(_endPoints::handle);
     builder.operation("permissions").handler(_endPoints::handle);
+    builder.operation("reassignPartitions").handler(_endPoints::handle);
     builder.rootHandler(StaticHandler
             .create()
             .setCachingEnabled(false)
