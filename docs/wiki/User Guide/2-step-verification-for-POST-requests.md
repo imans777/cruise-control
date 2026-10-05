@@ -18,6 +18,9 @@ Set `two.step.verification.enabled` config to `true` in your `config/cruisecontr
 7. `resume_sampling`
 8. `demote_broker`
 9. `admin`
+10. `reassign_partitions` -- note that the review board shows only the endpoint and its query parameters, not the partition
+    reassignment in the request body. The body is parsed when the request is submitted for review, and executing the approved
+    request (with `review_id`, without a body) executes exactly that reassignment.
 
 ## How does 2-step verification work?
 
