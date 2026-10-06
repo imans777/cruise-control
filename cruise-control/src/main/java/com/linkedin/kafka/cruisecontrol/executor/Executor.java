@@ -1626,6 +1626,7 @@ public class Executor {
           throttleHelper.setThrottles(tasksToExecute.stream().map(ExecutionTask::proposal).collect(Collectors.toList()));
           // Execute the tasks.
           _executionTaskManager.markTasksInProgress(tasksToExecute);
+          setLogdirsOfReplicasToAdd(tasksToExecute, _adminClient, _config);
           result = ExecutionUtils.submitReplicaReassignmentTasks(_adminClient, tasksToExecute);
         }
         // Wait indefinitely for partition movements to finish.

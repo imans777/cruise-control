@@ -369,7 +369,9 @@ public class ClusterModel implements Serializable {
    * For replica movement across the broker:
    *    (1) Remove the replica from the source broker,
    *    (2) Set the broker of the removed replica as the destination broker,
-   *    (3) Add this replica to the destination broker.
+   *    (3) If the replica placement over disks is populated, set the disk of the removed replica as the disk of the
+   *        destination broker to host the replica (see {@link Broker#diskForRelocatedReplica(Replica)}),
+   *    (4) Add this replica to the destination broker.
    * There is no need to make any modifications to _partitionsByTopicPartition because even after the move,
    * partitions will contain the same replicas.
    *
@@ -384,7 +386,10 @@ public class ClusterModel implements Serializable {
       throw new IllegalArgumentException("Replica is not in the cluster.");
     }
     // Updates the broker of the removed replica with destination broker.
-    replica.setBroker(broker(destinationBrokerId));
+    Broker destinationBroker = broker(destinationBrokerId);
+    replica.setBroker(destinationBroker);
+    // Updates the disk of the removed replica with the disk of the destination broker to host it.
+    replica.setDisk(destinationBroker.isUsingJBOD() ? destinationBroker.diskForRelocatedReplica(replica) : null);
 
     // Add this replica and related load to the destination broker / destination rack / cluster.
     replica.broker().rack().addReplica(replica);

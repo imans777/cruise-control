@@ -90,6 +90,7 @@ public class GoalOptimizer implements Runnable {
   private final double _strictnessWeight;
   private final OptimizationOptionsGenerator _optimizationOptionsGenerator;
   private volatile boolean _hasUnfixableProposalOptimization;
+  private final KafkaCruiseControlConfig _config;
 
   /**
    * Constructor for Goal Optimizer takes the goals as input. The order of the list determines the priority of goals
@@ -140,6 +141,7 @@ public class GoalOptimizer implements Runnable {
     _optimizationOptionsGenerator = config.getConfiguredInstance(AnalyzerConfig.OPTIMIZATION_OPTIONS_GENERATOR_CLASS_CONFIG,
                                                                  OptimizationOptionsGenerator.class,
                                                                  overrideConfigs);
+    _config = config;
   }
 
   /**
@@ -439,6 +441,7 @@ public class GoalOptimizer implements Runnable {
                                        OptimizationOptions optimizationOptions)
       throws KafkaCruiseControlException {
     LOG.trace("Cluster before optimization is {}", clusterModel);
+    sanityCheckIntraBrokerGoalPriorities(goalsByPriority);
     BrokerStats brokerStatsBeforeOptimization = clusterModel.brokerStats(null);
     Map<TopicPartition, List<ReplicaPlacementInfo>> initReplicaDistribution = clusterModel.getReplicaDistribution();
     Map<TopicPartition, ReplicaPlacementInfo> initLeaderDistribution = clusterModel.getLeaderDistribution();
@@ -447,6 +450,10 @@ public class GoalOptimizer implements Runnable {
     // Set of balancing proposals that will be applied to the given cluster state to satisfy goals (leadership
     // transfer AFTER partition transfer.)
     Set<Goal> optimizedGoals = new HashSet<>();
+    // Intra-broker goals only move replicas between the disks of the same broker, which changes neither the load nor the
+    // replica and leadership distribution across brokers. Hence, intra-broker goals cannot violate the optimized
+    // inter-broker goals, and only need to respect the optimized intra-broker goals.
+    Set<Goal> optimizedIntraBrokerGoals = new HashSet<>();
     Set<String> violatedGoalNamesBeforeOptimization = new HashSet<>();
     Set<String> violatedGoalNamesAfterOptimization = new HashSet<>();
     LinkedHashMap<Goal, ClusterModelStats> statsByGoalPriority = new LinkedHashMap<>(goalsByPriority.size());
@@ -462,14 +469,18 @@ public class GoalOptimizer implements Runnable {
       operationProgress.addStep(step);
       LOG.debug("Optimizing goal {}", goal.name());
       long startTimeMs = _time.milliseconds();
+      boolean isIntraBrokerGoal = AnalyzerUtils.isIntraBrokerGoal(goal, _config);
       boolean succeeded;
       try {
-        succeeded = goal.optimize(clusterModel, optimizedGoals, optimizationOptions);
+        succeeded = goal.optimize(clusterModel, isIntraBrokerGoal ? optimizedIntraBrokerGoals : optimizedGoals, optimizationOptions);
       } catch (OptimizationFailureException e) {
         setHasUnfixableProposalOptimization(true, goalsByPriority);
         throw e;
       }
       optimizedGoals.add(goal);
+      if (isIntraBrokerGoal) {
+        optimizedIntraBrokerGoals.add(goal);
+      }
       statsByGoalPriority.put(goal, clusterModel.getClusterStats(_balancingConstraint, optimizationOptions));
       optimizationDurationByGoal.put(goal.name(), Duration.ofMillis(_time.milliseconds() - startTimeMs));
 
@@ -521,6 +532,29 @@ public class GoalOptimizer implements Runnable {
                                balancednessCostByGoal(goalsByPriority, _priorityWeight, _strictnessWeight),
                                optimizationDurationByGoal,
                                provisionResponse);
+  }
+
+  /**
+   * Sanity check that no inter-broker goal is prioritized after an intra-broker goal. Intra-broker goals can be optimized
+   * after inter-broker goals, because moving replicas between the disks of the same broker cannot violate inter-broker goals.
+   * But inter-broker goals cannot be optimized after intra-broker goals, because moving replicas across brokers may violate
+   * intra-broker goals.
+   *
+   * @param goalsByPriority The goals ordered by priority.
+   */
+  private void sanityCheckIntraBrokerGoalPriorities(List<Goal> goalsByPriority) {
+    Goal intraBrokerGoal = null;
+    for (Goal goal : goalsByPriority) {
+      if (AnalyzerUtils.isIntraBrokerGoal(goal, _config)) {
+        if (intraBrokerGoal == null) {
+          intraBrokerGoal = goal;
+        }
+      } else if (intraBrokerGoal != null) {
+        throw new IllegalArgumentException(String.format("Inter-broker goal %s cannot be prioritized after intra-broker goal %s. "
+                                                         + "Intra-broker goals must be prioritized after all inter-broker goals.",
+                                                         goal.name(), intraBrokerGoal.name()));
+      }
+    }
   }
 
   private void setHasUnfixableProposalOptimization(boolean hasUnfixableProposalOptimization, List<Goal> goalsByPriority) {
