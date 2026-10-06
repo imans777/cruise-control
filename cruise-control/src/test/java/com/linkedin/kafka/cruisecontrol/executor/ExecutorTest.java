@@ -691,15 +691,29 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
     _cluster.waitForTopicMetadata(List.of(topic), Duration.ofSeconds(15), Duration.ofSeconds(60),
                                   topicDescription -> topicDescription.partitions().size() == numPartitions
                                                       && topicDescription.partitions().stream().allMatch(p -> p.leader() != null));
+    // The broker may create the replicas after the topic metadata shows their leaders. Requesting to move a replica that
+    // the broker does not host yet fails with ReplicaNotAvailableException, hence wait for the broker to host the replicas.
+    waitUntilTrue(() -> logdirByReplica.keySet().stream().allMatch(replica -> {
+      ReplicaLogDirInfo info = replicaLogDirInfo(replica);
+      return info != null && info.getCurrentReplicaLogDir() != null;
+    }), "Failed to create replicas of " + topic + " on broker " + brokerId, EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
     _adminClient.alterReplicaLogDirs(logdirByReplica).all().get();
     waitUntilTrue(() -> logdirByReplica.keySet().stream().allMatch(replica -> {
-      try {
-        ReplicaLogDirInfo info = _adminClient.describeReplicaLogDirs(Collections.singleton(replica)).all().get().get(replica);
-        return logdir.equals(info.getCurrentReplicaLogDir()) && info.getFutureReplicaLogDir() == null;
-      } catch (InterruptedException | ExecutionException e) {
-        return false;
-      }
+      ReplicaLogDirInfo info = replicaLogDirInfo(replica);
+      return info != null && logdir.equals(info.getCurrentReplicaLogDir()) && info.getFutureReplicaLogDir() == null;
     }), "Failed to move replicas of " + topic + " to logdir " + logdir, EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
+  }
+
+  /**
+   * @param replica Replica to query.
+   * @return Log dir information of the given replica, or {@code null} if it cannot be retrieved.
+   */
+  private ReplicaLogDirInfo replicaLogDirInfo(TopicPartitionReplica replica) {
+    try {
+      return _adminClient.describeReplicaLogDirs(Collections.singleton(replica)).all().get().get(replica);
+    } catch (InterruptedException | ExecutionException e) {
+      return null;
+    }
   }
 
   private Map<String, Integer> numReplicasByLogdir(int brokerId) throws InterruptedException, ExecutionException {
