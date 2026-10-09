@@ -2,13 +2,30 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.monitor.sampling;
 
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityConfigResolver;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
+import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityMetricsListener;
 import com.linkedin.kafka.cruisecontrol.exception.BrokerCapacityResolutionException;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.exception.UnknownVersionException;
+import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.BrokerMetric;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.CruiseControlMetric;
+import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.RawMetricType;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.BrokerLoad;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.BrokerMetricSample;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.PartitionMetricSample;
@@ -40,8 +57,11 @@ public class CruiseControlMetricsProcessor {
   // TODO: Use the cached number of cores in estimation of partition CPU utilization.
   private final Map<Integer, Double> _cachedNumCoresByBroker;
   private final BrokerCapacityConfigResolver _brokerCapacityConfigResolver;
+  // The resolver as a listener for capacity metrics, or null if the resolver does not use them.
+  private final BrokerCapacityMetricsListener _brokerCapacityMetricsListener;
   private final boolean _allowCpuCapacityEstimation;
   private long _maxMetricTimestamp;
+  private int _numIgnoredCapacityMetrics;
 
   /**
    * @param brokerCapacityConfigResolver The resolver for retrieving broker capacities.
@@ -51,11 +71,19 @@ public class CruiseControlMetricsProcessor {
     _brokerLoad = new HashMap<>();
     _cachedNumCoresByBroker = new HashMap<>();
     _brokerCapacityConfigResolver = brokerCapacityConfigResolver;
+    _brokerCapacityMetricsListener = brokerCapacityConfigResolver instanceof BrokerCapacityMetricsListener
+                                     ? (BrokerCapacityMetricsListener) brokerCapacityConfigResolver : null;
     _allowCpuCapacityEstimation = allowCpuCapacityEstimation;
     _maxMetricTimestamp = INIT_METRIC_TIMESTAMP;
+    _numIgnoredCapacityMetrics = 0;
   }
 
   void addMetric(CruiseControlMetric metric) {
+    if (metric.rawMetricType().isCapacityMetric()) {
+      // Capacity metrics describe the broker rather than its load, so they never take part in metric samples.
+      addCapacityMetric(metric);
+      return;
+    }
     int brokerId = metric.brokerId();
     LOG.trace("Adding cruise control metric {}", metric);
     _maxMetricTimestamp = Math.max(metric.time(), _maxMetricTimestamp);
@@ -64,6 +92,19 @@ public class CruiseControlMetricsProcessor {
       brokerLoad.recordMetric(metric);
       return brokerLoad;
     });
+  }
+
+  private void addCapacityMetric(CruiseControlMetric metric) {
+    if (_brokerCapacityMetricsListener == null || !(metric instanceof BrokerMetric)) {
+      _numIgnoredCapacityMetrics++;
+      return;
+    }
+    LOG.trace("Adding capacity metric {}", metric);
+    _brokerCapacityMetricsListener.onBrokerCapacityMetric((BrokerMetric) metric);
+    if (metric.rawMetricType() == RawMetricType.BROKER_CPU_CORES) {
+      // Resolve the number of cores of the broker again, so that a newly discovered value replaces the cached one.
+      _cachedNumCoresByBroker.remove(metric.brokerId());
+    }
   }
 
   /**
@@ -82,16 +123,25 @@ public class CruiseControlMetricsProcessor {
           return null;
         }
         try {
-          BrokerCapacityInfo capacity =
-              _brokerCapacityConfigResolver.capacityForBroker(getRackHandleNull(node), node.host(), bid, BROKER_CAPACITY_FETCH_TIMEOUT_MS,
-                                                              _allowCpuCapacityEstimation);
-          return capacity == null ? null : capacity.numCpuCores();
+          return numCpuCores(node);
         } catch (TimeoutException | BrokerCapacityResolutionException e) {
           LOG.warn("Unable to get number of CPU cores for broker {}.", node.id(), e);
           return null;
         }
       });
     }
+  }
+
+  private Double numCpuCores(Node node) throws TimeoutException, BrokerCapacityResolutionException {
+    String rack = getRackHandleNull(node);
+    if (_brokerCapacityMetricsListener != null) {
+      // Resolve the number of cores alone, so a missing or estimated capacity of another resource does not stop sampling.
+      return _brokerCapacityMetricsListener.numCpuCores(rack, node.host(), node.id(), _allowCpuCapacityEstimation);
+    }
+    BrokerCapacityInfo capacity = _brokerCapacityConfigResolver.capacityForBroker(rack, node.host(), node.id(),
+                                                                                 BROKER_CAPACITY_FETCH_TIMEOUT_MS,
+                                                                                 _allowCpuCapacityEstimation);
+    return capacity == null ? null : capacity.numCpuCores();
   }
 
   /**
@@ -114,6 +164,14 @@ public class CruiseControlMetricsProcessor {
   MetricSampler.Samples process(Cluster cluster,
                                 Set<TopicPartition> partitionsDotNotHandled,
                                 MetricSampler.SamplingMode samplingMode) {
+    if (_numIgnoredCapacityMetrics > 0) {
+      LOG.debug("Ignored {} broker capacity metrics, because the broker capacity resolver does not use them.",
+                _numIgnoredCapacityMetrics);
+    }
+    if (_brokerLoad.isEmpty()) {
+      // Only capacity metrics were added, so there is nothing to sample.
+      return MetricSampler.EMPTY_SAMPLES;
+    }
     updateCachedNumCoresByBroker(cluster);
     // Theoretically we should not move forward at all if a broker reported a different all topic bytes in from all
     // its resident replicas. However, it is not clear how often this would happen yet. At this point we still
@@ -178,6 +236,7 @@ public class CruiseControlMetricsProcessor {
   void clear() {
     _brokerLoad.clear();
     _maxMetricTimestamp = INIT_METRIC_TIMESTAMP;
+    _numIgnoredCapacityMetrics = 0;
   }
 
   /**
