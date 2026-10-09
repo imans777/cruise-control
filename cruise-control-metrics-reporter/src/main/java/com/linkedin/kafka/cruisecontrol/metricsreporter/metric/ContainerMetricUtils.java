@@ -2,6 +2,20 @@
  * Copyright 2020 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.metricsreporter.metric;
 
 import java.io.BufferedReader;
@@ -106,6 +120,21 @@ public final class ContainerMetricUtils {
      * it will always be that: cpuLimit >= cpus and the result is in the [0.0,1.0] interval.
      */
     return cpus / cpuLimit;
+  }
+
+  /**
+   * Get the number of CPUs that the operating environment of this process may use, i.e. the cgroup CPU quota divided by
+   * the cgroup CPU period. The value may be fractional.
+   *
+   * @return The number of CPUs that the operating environment may use, or {@link #NO_CPU_QUOTA} if the cgroup does not
+   * restrict CPU time.
+   */
+  public static double getCpuLimit() throws IOException {
+    double cpuQuota = getCpuQuota();
+    if (cpuQuota == NO_CPU_QUOTA) {
+      return NO_CPU_QUOTA;
+    }
+    return cpuQuota / getCpuPeriod();
   }
 
   private enum CgroupFiles {

@@ -2,10 +2,25 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.metricsreporter;
 
 import com.linkedin.kafka.cruisecontrol.metricsreporter.exception.CruiseControlMetricsReporterException;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.exception.KafkaTopicDescriptionException;
+import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.CapacityDiscoveryUtils;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.CruiseControlMetric;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.MetricsUtils;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.MetricSerde;
@@ -20,6 +35,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -88,6 +104,11 @@ public class CruiseControlMetricsReporter implements MetricsReporter, Runnable {
   protected static final String CRUISE_CONTROL_METRICS_TOPIC_CLEAN_UP_POLICY = "delete";
   protected static final Duration PRODUCER_CLOSE_TIMEOUT = Duration.ofSeconds(5);
   private boolean _kubernetesMode;
+  private boolean _capacityDiscoveryEnabled;
+  private String _capacityDiscoveryNetworkInterface;
+  private long _capacityDiscoveryNetworkBytesPerSec;
+  private boolean _warnedUnknownNetworkCapacity = false;
+  private String _lastDiscoveredCapacity;
   private MetricsRegistry _metricsRegistry;
   public static final String DEFAULT_BOOTSTRAP_SERVERS_HOST = "localhost";
   public static final String DEFAULT_BOOTSTRAP_SERVERS_PORT = "9092";
@@ -191,6 +212,17 @@ public class CruiseControlMetricsReporter implements MetricsReporter, Runnable {
     _cruiseControlMetricsTopic = reporterConfig.getString(CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_TOPIC_CONFIG);
     _reportingIntervalMs = reporterConfig.getLong(CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_REPORTER_INTERVAL_MS_CONFIG);
     _kubernetesMode = reporterConfig.getBoolean(CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_REPORTER_KUBERNETES_MODE_CONFIG);
+    _capacityDiscoveryEnabled = reporterConfig.getBoolean(
+        CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_ENABLED_CONFIG);
+    _capacityDiscoveryNetworkInterface = reporterConfig.getString(
+        CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_INTERFACE_CONFIG).trim();
+    _capacityDiscoveryNetworkBytesPerSec = reporterConfig.getLong(
+        CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_BYTES_PER_SEC_CONFIG);
+    if (_capacityDiscoveryEnabled) {
+      LOG.info("Capacity discovery is enabled. Network interface: {}, network capacity override: {}.",
+               _capacityDiscoveryNetworkInterface.isEmpty() ? "fastest available" : _capacityDiscoveryNetworkInterface,
+               _capacityDiscoveryNetworkBytesPerSec > 0 ? _capacityDiscoveryNetworkBytesPerSec + " bytes/s" : "none");
+    }
 
     if (reporterConfig.getBoolean(CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_TOPIC_AUTO_CREATE_CONFIG)) {
       try {
@@ -411,6 +443,9 @@ public class CruiseControlMetricsReporter implements MetricsReporter, Runnable {
             reportYammerMetrics(now);
             reportKafkaMetrics(now);
             reportCpuUtils(now);
+            if (_capacityDiscoveryEnabled) {
+              reportCapacityMetrics(now);
+            }
           }
           try {
             _producer.flush();
@@ -496,6 +531,32 @@ public class CruiseControlMetricsReporter implements MetricsReporter, Runnable {
       LOG.debug("Finished reporting CPU util.");
     } catch (IOException e) {
       LOG.warn("Failed reporting CPU util.", e);
+    }
+  }
+
+  private void reportCapacityMetrics(long now) {
+    LOG.debug("Reporting capacity metrics.");
+    try {
+      double numCpuCores = CapacityDiscoveryUtils.numCpuCores(_kubernetesMode);
+      OptionalLong networkCapacity = CapacityDiscoveryUtils.networkCapacityBytesPerSec(_capacityDiscoveryNetworkInterface,
+                                                                                         _capacityDiscoveryNetworkBytesPerSec);
+      if (networkCapacity.isEmpty() && !_warnedUnknownNetworkCapacity) {
+        LOG.warn("Unable to discover the network capacity of broker {}. Set {} to report it.", _brokerId,
+                 CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_BYTES_PER_SEC_CONFIG);
+        _warnedUnknownNetworkCapacity = true;
+      }
+      String discoveredCapacity = String.format("CPU cores: %s, network capacity: %s", numCpuCores,
+                                                networkCapacity.isPresent() ? networkCapacity.getAsLong() + " bytes/s" : "unknown");
+      if (!discoveredCapacity.equals(_lastDiscoveredCapacity)) {
+        LOG.info("Discovered capacity of broker {}. {}.", _brokerId, discoveredCapacity);
+        _lastDiscoveredCapacity = discoveredCapacity;
+      }
+      for (CruiseControlMetric metric : CapacityDiscoveryUtils.buildCapacityMetrics(now, _brokerId, numCpuCores, networkCapacity)) {
+        sendCruiseControlMetric(metric);
+      }
+      LOG.debug("Finished reporting capacity metrics.");
+    } catch (RuntimeException e) {
+      LOG.warn("Failed reporting capacity metrics.", e);
     }
   }
 
