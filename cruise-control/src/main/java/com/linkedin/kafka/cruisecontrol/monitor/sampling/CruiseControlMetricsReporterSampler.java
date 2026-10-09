@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.monitor.sampling;
 
 import com.linkedin.kafka.cruisecontrol.exception.SamplingException;
@@ -88,14 +102,15 @@ public class CruiseControlMetricsReporterSampler extends AbstractMetricSampler {
     LOG.debug("Starting consuming from metrics reporter topic {} for partitions {}.", _metricReporterTopic, partitionIds);
     _metricConsumer.resume(_metricConsumer.paused());
     int totalMetricsAdded = 0;
+    int totalMetricsSkipped = 0;
     Set<TopicPartition> partitionsToPause = new HashSet<>();
     do {
       ConsumerRecords<String, CruiseControlMetric> records = _metricConsumer.poll(METRIC_REPORTER_CONSUMER_POLL_TIMEOUT);
       for (ConsumerRecord<String, CruiseControlMetric> record : records) {
-        if (record == null) {
-          // This means we cannot parse the metrics. It might happen when a newer type of metrics has been added and
+        if (record.value() == null) {
+          // This means we cannot parse the metric. It might happen when a newer type of metrics has been added and
           // the current code is still old. We simply ignore that metric in this case.
-          LOG.warn("Cannot parse record, please update your Cruise Control version.");
+          totalMetricsSkipped++;
           continue;
         }
         long recordTime = record.value().time();
@@ -120,6 +135,10 @@ public class CruiseControlMetricsReporterSampler extends AbstractMetricSampler {
     } while (!consumptionDone(_metricConsumer, endOffsets) && System.currentTimeMillis() < metricSamplerOptions.timeoutMs());
     LOG.info("Finished sampling from topic {} for partitions {} in time range [{},{}]. Collected {} metrics.",
              _metricReporterTopic, partitionIds, metricSamplerOptions.startTimeMs(), metricSamplerOptions.endTimeMs(), totalMetricsAdded);
+    if (totalMetricsSkipped > 0) {
+      LOG.warn("Skipped {} metrics from topic {} that cannot be parsed. They may come from a newer metrics reporter, please update "
+               + "your Cruise Control version.", totalMetricsSkipped, _metricReporterTopic);
+    }
 
     return totalMetricsAdded;
   }
