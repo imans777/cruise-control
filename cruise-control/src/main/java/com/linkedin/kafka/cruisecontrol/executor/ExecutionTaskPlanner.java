@@ -20,6 +20,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -288,6 +289,19 @@ public class ExecutionTaskPlanner {
    */
   public Set<ExecutionTask> remainingInterBrokerReplicaMovements() {
     return Collections.unmodifiableSet(_remainingInterBrokerReplicaMovements);
+  }
+
+  /**
+   * @return The number of remaining inter-broker replica movement tasks by broker id, sorted by the number of tasks in descending order.
+   * A task is counted under its source broker and each of its destination brokers.
+   */
+  public Map<Integer, Integer> numRemainingInterBrokerReplicaMovementsByBrokerId() {
+    Map<Integer, Integer> numTasksByBrokerId = new LinkedHashMap<>();
+    _interPartMoveTasksByBrokerId.entrySet().stream()
+                                 .filter(e -> !e.getValue().isEmpty())
+                                 .sorted((e1, e2) -> Integer.compare(e2.getValue().size(), e1.getValue().size()))
+                                 .forEach(e -> numTasksByBrokerId.put(e.getKey(), e.getValue().size()));
+    return numTasksByBrokerId;
   }
 
   /**
