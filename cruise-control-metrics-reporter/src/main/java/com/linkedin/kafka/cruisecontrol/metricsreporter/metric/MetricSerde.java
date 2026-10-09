@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.metricsreporter.metric;
 
 import com.linkedin.kafka.cruisecontrol.metricsreporter.exception.UnknownVersionException;
@@ -32,21 +46,26 @@ public class MetricSerde implements Serializer<CruiseControlMetric>, Deserialize
   /**
    * Deserialize from byte array to Cruise Control metric
    * @param bytes Bytes array corresponding to Cruise Control metric.
-   * @return Deserialized byte array as Cruise Control metric.
+   * @return Deserialized byte array as Cruise Control metric, or {@code null} if the metric class or the raw metric type is
+   * unknown to this version, e.g. because a newer metrics reporter added it.
    */
   public static CruiseControlMetric fromBytes(byte[] bytes) throws UnknownVersionException {
     ByteBuffer buffer = ByteBuffer.wrap(bytes);
-    switch (CruiseControlMetric.MetricClassId.forId(buffer.get())) {
-      case BROKER_METRIC:
-        return BrokerMetric.fromBuffer(buffer);
-      case TOPIC_METRIC:
-        return TopicMetric.fromBuffer(buffer);
-      case PARTITION_METRIC:
-        return PartitionMetric.fromBuffer(buffer);
-      default:
-        // This could happen when a new type of metric is added but we are still running the old code.
-        // simply ignore the metric by returning a null.
-        return null;
+    try {
+      switch (CruiseControlMetric.MetricClassId.forId(buffer.get())) {
+        case BROKER_METRIC:
+          return BrokerMetric.fromBuffer(buffer);
+        case TOPIC_METRIC:
+          return TopicMetric.fromBuffer(buffer);
+        case PARTITION_METRIC:
+          return PartitionMetric.fromBuffer(buffer);
+        default:
+          return null;
+      }
+    } catch (IllegalArgumentException e) {
+      // This happens when a new metric class or raw metric type is added but we are still running the old code.
+      // Simply ignore the metric by returning a null.
+      return null;
     }
   }
 
