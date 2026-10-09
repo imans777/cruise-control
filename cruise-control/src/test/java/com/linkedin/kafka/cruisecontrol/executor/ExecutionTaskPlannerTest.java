@@ -429,7 +429,12 @@ public class ExecutionTaskPlannerTest {
     ExecutionTaskPlanner basePlanner =
         new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
     basePlanner.addExecutionProposals(proposals, strategyOptions, null);
+    // Brokers 0 and 2 are involved in two movements each, brokers 3 and 5 in one movement each.
+    Map<Integer, Integer> numMovementsByBrokerId = basePlanner.numRemainingInterBrokerReplicaMovementsByBrokerId();
+    assertEquals(Map.of(0, 2, 2, 2, 3, 1, 5, 1), numMovementsByBrokerId);
+    assertEquals(List.of(2, 2, 1, 1), new ArrayList<>(numMovementsByBrokerId.values()));
     assertEquals(List.of(p0, p1, p2), getInterBrokerReplicaMovementsOneByOne(basePlanner, proposals.size()));
+    assertTrue(basePlanner.numRemainingInterBrokerReplicaMovementsByBrokerId().isEmpty());
 
     // The round-robin broker strategy picks broker 0 again only after the other brokers had their turn.
     Properties roundRobinProps = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
