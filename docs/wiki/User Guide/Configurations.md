@@ -15,6 +15,7 @@
     - [MaintenanceEventTopicReader configurations](#maintenanceeventtopicreader-configurations)
     - [BrokerCapacityConfigurationFileResolver configurations](#brokercapacityconfigurationfileresolver-configurations)
         - [Populating the Capacity Config File](#populating-the-capacity-config-file)
+    - [AutoDiscoveryBrokerCapacityConfigResolver configurations](#autodiscoverybrokercapacityconfigresolver-configurations)
     - [SelfHealingNotifier configurations](#selfhealingnotifier-configurations)
     - [CruiseControlMetricsReporter configurations](#cruisecontrolmetricsreporter-configurations)
     - [PercentileMetricAnomalyFinder configurations](#percentilemetricanomalyfinder-configurations)
@@ -72,7 +73,7 @@ The following configurations are inherited from the open source Kafka client con
 | broker.metrics.window.ms                                      | Integer | Y         | 3,600,000                                                                               | The size of the window in milliseconds to aggregate the Kafka broker metrics. The window must be greater than the metric.sampling.interval.ms.                                                                                                                                                                                                                                                                      |
 | num.broker.metrics.windows                                    | Integer | Y         | 5                                                                                       | The maximum number of broker window the load monitor would keep. Each window covers a time window defined by broker.metrics.window.ms.                                                                                                                                                                                                                                                                              |
 | min.samples.per.broker.metrics.window                         | Integer | N         | 3                                                                                       | The minimum number of metric samples a valid broker window should have. If a broker does not have enough samples in a broker window, this broker will be removed from the window due to in sufficient data.                                                                                                                                                                                                         |
-| broker.capacity.config.resolver.class                         | Class   | N         | com.linkedin.kafka.cruisecontrol.config.BrokerCapacityConfigFileResolver                | The broker capacity configuration resolver class name. The broker capacity configuration resolver is responsible for getting the broker capacity. The default implementation is a file based solution.                                                                                                                                                                                                              |
+| broker.capacity.config.resolver.class                         | Class   | N         | com.linkedin.kafka.cruisecontrol.config.BrokerCapacityConfigFileResolver                | The broker capacity configuration resolver class name. The broker capacity configuration resolver is responsible for getting the broker capacity. The default implementation is a file based solution. `com.linkedin.kafka.cruisecontrol.config.AutoDiscoveryBrokerCapacityConfigResolver` discovers the capacity instead, see [AutoDiscoveryBrokerCapacityConfigResolver configurations](#autodiscoverybrokercapacityconfigresolver-configurations). |
 | monitor.state.update.interval.ms                              | Long    | N         | 30,000                                                                                  | The load monitor interval to refresh the monitor state.                                                                                                                                                                                                                                                                                                                                                             |
 | metadata.factor.exponent                                      | Double  | N         | 1.0                                                                                     | The exponent for the metadata factor, which corresponds to (number of replicas) * (number of brokers with replicas) ^ exponent.                                                                                                                                                                                                                                                                                     |
 | min.valid.partition.ratio                                     | Double  | N         | 0.995                                                                                   | The minimum percentage of the total partitions required to be monitored in order to generate a valid load model. Because the topic and partitions in a Kafka cluster are dynamically changing. The load monitor will exclude some of the topics that does not have sufficient metric samples. This configuration defines the minimum required percentage of the partitions that must be included in the load model. |
@@ -343,6 +344,82 @@ with a non-default capacity. See:
 2. Its default implementation by [BrokerCapacityConfigFileResolver](https://github.com/linkedin/cruise-control/blob/migrate_to_kafka_2_4/cruise-control/src/main/java/com/linkedin/kafka/cruisecontrol/config/BrokerCapacityConfigFileResolver.java), and 
 3. The [relevant configuration](https://github.com/linkedin/cruise-control/blob/migrate_to_kafka_2_4/cruise-control/src/main/java/com/linkedin/kafka/cruisecontrol/config/constants/MonitorConfig.java#L294) to set the config resolver to be used.
 
+`Option-3 (auto discovery)`: Use `AutoDiscoveryBrokerCapacityConfigResolver` to discover broker capacities from Kafka and from
+the metrics reporter, and keep a capacity file only to override or back up the discovered values. See
+[AutoDiscoveryBrokerCapacityConfigResolver configurations](#autodiscoverybrokercapacityconfigresolver-configurations).
+
+### AutoDiscoveryBrokerCapacityConfigResolver configurations
+`com.linkedin.kafka.cruisecontrol.config.AutoDiscoveryBrokerCapacityConfigResolver` discovers broker capacities instead of
+reading them only from a file:
+* **Disk:** Cruise Control reads the log dirs of every alive broker from Kafka and counts each online log dir with the size
+  of its volume. Offline log dirs, for example on a read-only or corrupt disk, and log dirs that are no longer configured
+  are never counted. The log dirs are refreshed every `metric.sampling.interval.ms`. This needs nothing on the brokers.
+* **CPU cores and network capacity:** `CruiseControlMetricsReporter` reports them when
+  `cruise.control.metrics.reporter.capacity.discovery.enabled` is set on the brokers, see
+  [CruiseControlMetricsReporter configurations](#cruisecontrolmetricsreporter-configurations). The network capacity is the
+  link speed of the network interface. On brokers whose interface reports no speed or a wrong one, such as some virtual
+  machines and containers, set `cruise.control.metrics.reporter.capacity.discovery.network.bytes.per.sec`.
+
+| Name                 | Type   | Required? | Default Value | Description                                                                                                                                                                                                                    |
+|----------------------|--------|-----------|---------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| capacity.config.file | String | N         |               | Optional capacity file in the format of `BrokerCapacityConfigFileResolver` that overrides or backs up the discovered capacities. Entries may list only some resources, and CPU capacity must be given as `{"num.cores": "<number of cores>"}`. |
+
+For each resource of a broker, the first source that has a value wins:
+1. The entry of the broker in `capacity.config.file`. Use it to override a discovered value, for example a wrong network
+   speed or a lower disk capacity than the volume has.
+2. The discovered value.
+3. The default entry (`"brokerId": "-1"`) in `capacity.config.file`. Values taken from it are flagged as estimated, as with
+   `BrokerCapacityConfigFileResolver`.
+
+For disk capacity, Kafka always decides which log dirs count, and the file only sizes the log dirs it lists, so a file entry
+for an offline or removed log dir is ignored. Before Kafka reports the log dirs of a broker, the disk capacity in the file is
+used as written and flagged as estimated. If no source has a value for a resource, requests that need the capacity of the
+broker fail with an error that names the missing resources and how to provide them.
+
+Example `config/capacityAutoDiscovery.json`: log dir `/data/kafka-1` of broker 3 counts as 500000 MB instead of the size of
+its volume, and broker 3 has a lower network capacity. Everything else is discovered, and the default entry only fills what
+could not be discovered. The units are the same as for `BrokerCapacityConfigFileResolver`: MB for disk and KB/s for network.
+```json
+{
+  "brokerCapacities":[
+    {
+      "brokerId": "-1",
+      "capacity": {
+        "CPU": {"num.cores": "8"},
+        "NW_IN": "1220703",
+        "NW_OUT": "1220703"
+      }
+    },
+    {
+      "brokerId": "3",
+      "capacity": {
+        "DISK": {"/data/kafka-1": "500000"},
+        "NW_IN": "610351",
+        "NW_OUT": "610351"
+      }
+    }
+  ]
+}
+```
+
+To keep headroom on every broker without listing the brokers, lower the capacity thresholds of the goals instead, for example
+`disk.capacity.threshold` and `network.inbound.capacity.threshold`.
+
+To switch to auto discovery:
+1. Upgrade Cruise Control to a version that includes `AutoDiscoveryBrokerCapacityConfigResolver`. Older versions cannot parse
+   the capacity metrics of the metrics reporter.
+2. Set `cruise.control.metrics.reporter.capacity.discovery.enabled=true` on the brokers, and optionally the network interface
+   or the network capacity.
+3. Set `broker.capacity.config.resolver.class=com.linkedin.kafka.cruisecontrol.config.AutoDiscoveryBrokerCapacityConfigResolver`,
+   point `capacity.config.file` to your overrides or remove it, and restart Cruise Control.
+
+Caveats:
+* Log dirs that share one volume each report the size of the whole volume. Give their sizes in the entry of the broker.
+* `PrometheusMetricSampler` does not receive capacity metrics, so CPU cores and network capacity then come from the file.
+  Disk capacity is still discovered.
+* The log dirs are refreshed once per sampling interval, so a log dir that fails between two refreshes is counted until the
+  next refresh.
+
 ### SelfHealingNotifier configurations
 | Name                                     | Type    | Required? | Default Value            | Description                                                                                                                                                                                                                                                          |
 |------------------------------------------|---------|-----------|--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -363,6 +440,9 @@ with a non-default capacity. See:
 | cruise.control.metrics.reporter.bootstrap.servers             | String    | Y         |                          | The Kafka cluster to which CruiseControlMetricsReporter should produce the interested metrics. It is usually just the hosting Kafka cluster where the metrics reporter is running, but users can choose to produce to another cluster if they want to. |
 | cruise.control.metrics.reporter.metrics.reporting.interval.ms | Long      | N         | 60,000                   | The interval of collecting and sending the interested metrics. |
 | cruise.control.metrics.reporter.kubernetes.mode               | Boolean   | N         | false                    | Whether the CruiseControlMetricsReporter should report metrics using methods that are aware of container boundaries. |
+| cruise.control.metrics.reporter.capacity.discovery.enabled    | Boolean   | N         | false                    | Whether the CruiseControlMetricsReporter also reports the CPU cores and the network capacity of the broker for `AutoDiscoveryBrokerCapacityConfigResolver`. Upgrade Cruise Control before enabling it, because older versions cannot parse these metrics. |
+| cruise.control.metrics.reporter.capacity.discovery.network.interface | String | N     | ""                       | The network interface whose link speed is reported as the network capacity. If empty, the fastest network interface that is up and is not a loopback interface is used. |
+| cruise.control.metrics.reporter.capacity.discovery.network.bytes.per.sec | Long | N    | -1                       | A positive value overrides the discovered network capacity in bytes per second, for both inbound and outbound traffic. |
 | cruise.control.metrics.topic.auto.create                      | Boolean   | N         | false                    | Whether the metrics reporter should enforce the creation of the topic at launch. |
 | cruise.control.metrics.topic.auto.create.timeout.ms           | Long      | N         | 10000                    | Timeout on the Cruise Control metrics topic creation. |
 | cruise.control.metrics.topic.auto.create.retries              | Integer   | N         | 5                        | The number of retries the metrics reporter will attempt for the topic creation. |

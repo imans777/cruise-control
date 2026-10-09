@@ -94,8 +94,11 @@ Control). The metrics reporter periodically samples the Kafka raw metrics on the
 2. Start Kafka server ([See tutorial](https://kafka.apache.org/quickstart)), and if you're using a ZooKeeper-based Kafka cluster also start a ZooKeeper server.
 3. Modify `config/cruisecontrol.properties` of Cruise Control:
     * (Required) fill in `bootstrap.servers` to the Kafka cluster to be monitored.
-    * (Required) update `capacity.config.file` to the path of your capacity file.  
+    * (Required unless you use `AutoDiscoveryBrokerCapacityConfigResolver`) update `capacity.config.file` to the path of your capacity file.  
       * Capacity file is a JSON file that provides the capacity of the brokers
+      * With `broker.capacity.config.resolver.class=com.linkedin.kafka.cruisecontrol.config.AutoDiscoveryBrokerCapacityConfigResolver`,
+        Cruise Control discovers the broker capacities and the capacity file is optional, see
+        [AutoDiscoveryBrokerCapacityConfigResolver configurations](docs/wiki/User%20Guide/Configurations.md#autodiscoverybrokercapacityconfigresolver-configurations)
       * You can start Cruise Control server with the default file (`config/capacityJBOD.json`), but it may not reflect the actual capacity of the brokers 
       * See [BrokerCapacityConfigurationFileResolver configurations](https://github.com/linkedin/cruise-control/wiki/Configurations#brokercapacityconfigurationfileresolver-configurations) for more information and examples
     * (Optional) set `metric.sampler.class` to your implementation (the default sampler class is `CruiseControlMetricsReporterSampler`) 

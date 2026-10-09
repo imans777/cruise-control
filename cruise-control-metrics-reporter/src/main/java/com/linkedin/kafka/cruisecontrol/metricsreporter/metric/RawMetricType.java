@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.metricsreporter.metric;
 
 import java.util.ArrayList;
@@ -16,6 +30,7 @@ import java.util.TreeMap;
 import static com.linkedin.kafka.cruisecontrol.metricsreporter.metric.RawMetricType.MetricScope.BROKER;
 import static com.linkedin.kafka.cruisecontrol.metricsreporter.metric.RawMetricType.MetricScope.TOPIC;
 import static com.linkedin.kafka.cruisecontrol.metricsreporter.metric.RawMetricType.MetricScope.PARTITION;
+import static com.linkedin.kafka.cruisecontrol.metricsreporter.metric.RawMetricType.MetricScope.BROKER_CAPACITY;
 
 
 /**
@@ -92,12 +107,27 @@ public enum RawMetricType {
   BROKER_FOLLOWER_FETCH_LOCAL_TIME_MS_50TH(BROKER, (byte) 59, (byte) 5),
   BROKER_FOLLOWER_FETCH_LOCAL_TIME_MS_999TH(BROKER, (byte) 60, (byte) 5),
   BROKER_LOG_FLUSH_TIME_MS_50TH(BROKER, (byte) 61, (byte) 5),
-  BROKER_LOG_FLUSH_TIME_MS_999TH(BROKER, (byte) 62, (byte) 5);
+  BROKER_LOG_FLUSH_TIME_MS_999TH(BROKER, (byte) 62, (byte) 5),
+  // The following metrics describe the capacity of a broker rather than its load. The metrics reporter sends them only when
+  // capacity discovery is enabled. Their scope keeps them out of broker, topic and partition metric samples.
+  /**
+   * Number of CPU cores available to the broker process. It may be fractional when a container CPU quota applies.
+   */
+  BROKER_CPU_CORES(BROKER_CAPACITY, (byte) 63),
+  /**
+   * Inbound network capacity of the broker in bytes per second.
+   */
+  BROKER_NW_IN_CAPACITY(BROKER_CAPACITY, (byte) 64),
+  /**
+   * Outbound network capacity of the broker in bytes per second.
+   */
+  BROKER_NW_OUT_CAPACITY(BROKER_CAPACITY, (byte) 65);
 
   private static final List<RawMetricType> CACHED_VALUES = List.of(RawMetricType.values());
   private static final SortedMap<Byte, Set<RawMetricType>> BROKER_METRIC_TYPES_DIFF_BY_VERSION = buildBrokerMetricTypesDiffByVersion();
   private static final List<RawMetricType> TOPIC_METRIC_TYPES = Collections.unmodifiableList(buildMetricTypeList(TOPIC));
   private static final List<RawMetricType> PARTITION_METRIC_TYPES = Collections.unmodifiableList(buildMetricTypeList(PARTITION));
+  private static final List<RawMetricType> CAPACITY_METRIC_TYPES = Collections.unmodifiableList(buildMetricTypeList(BROKER_CAPACITY));
   private final byte _id;
   private final MetricScope _metricScope;
   private final byte _supportedVersionSince;
@@ -145,19 +175,37 @@ public enum RawMetricType {
   }
 
   /**
+   * @return Metric types that describe the capacity of a broker rather than its load.
+   */
+  public static List<RawMetricType> capacityMetricTypes() {
+    return Collections.unmodifiableList(CAPACITY_METRIC_TYPES);
+  }
+
+  /**
+   * @return {@code true} if this metric type describes the capacity of a broker rather than its load, {@code false} otherwise.
+   */
+  public boolean isCapacityMetric() {
+    return _metricScope == BROKER_CAPACITY;
+  }
+
+  /**
    * @param id Cruise Control Metric type.
    * @return Raw metric type.
    */
   public static RawMetricType forId(byte id) {
-    if (id < values().length) {
+    if (id >= 0 && id < values().length) {
       return values()[id];
     } else {
       throw new IllegalArgumentException("CruiseControlMetric type " + id + " does not exist.");
     }
   }
 
+  /**
+   * The scope of a metric type. {@link #BROKER_CAPACITY} metrics describe the capacity of a broker and are never part of
+   * broker, topic or partition metric samples.
+   */
   public enum MetricScope {
-    BROKER, TOPIC, PARTITION
+    BROKER, TOPIC, PARTITION, BROKER_CAPACITY
   }
 
   private static SortedMap<Byte, Set<RawMetricType>> buildBrokerMetricTypesDiffByVersion() {

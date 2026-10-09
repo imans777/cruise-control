@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.config;
 
 import com.google.gson.Gson;
@@ -17,6 +31,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 
@@ -194,13 +209,13 @@ public class BrokerCapacityConfigFileResolver implements BrokerCapacityConfigRes
 
   /**
    * Get the number of cores specified by user -- i.e. requires the {@link Resource#CPU} capacity to specify
-   * {@link #NUM_CORES_CONFIG} in a Map.
+   * {@link #NUM_CORES_CONFIG} in a Map. Package private for {@link AutoDiscoveryBrokerCapacityConfigResolver}.
    *
    * @param brokerCapacity Broker capacity for each resource.
    * @return Number of cores if specified by user, {@code null} otherwise.
    */
   @SuppressWarnings("unchecked")
-  private static Double getUserSpecifiedNumCores(Map<Resource, Object> brokerCapacity) {
+  static Double getUserSpecifiedNumCores(Map<Resource, Object> brokerCapacity) {
     if (brokerCapacity.get(Resource.CPU) instanceof Map) {
       String stringNumCores = ((Map<String, String>) brokerCapacity.get(Resource.CPU)).get(NUM_CORES_CONFIG);
       if (stringNumCores == null) {
@@ -212,8 +227,16 @@ public class BrokerCapacityConfigFileResolver implements BrokerCapacityConfigRes
     }
   }
 
+  /**
+   * Get the total capacity of each resource listed in the given broker capacity. Package private for
+   * {@link AutoDiscoveryBrokerCapacityConfigResolver}, which accepts entries that list only some resources.
+   *
+   * @param brokerCapacity Broker capacity for each listed resource.
+   * @param hasNumCores {@code true} if the CPU capacity is specified with {@link #NUM_CORES_CONFIG}.
+   * @return Total capacity of each listed resource.
+   */
   @SuppressWarnings("unchecked")
-  private static Map<Resource, Double> getTotalCapacity(Map<Resource, Object> brokerCapacity, boolean hasNumCores) {
+  static Map<Resource, Double> getTotalCapacity(Map<Resource, Object> brokerCapacity, boolean hasNumCores) {
     Map<Resource, Double> totalCapacity = new HashMap<>();
     if (isJBOD(brokerCapacity)) {
       for (Map.Entry<Resource, Object> entry : brokerCapacity.entrySet()) {
@@ -244,12 +267,13 @@ public class BrokerCapacityConfigFileResolver implements BrokerCapacityConfigRes
 
   /**
    * Get disk capacity by absolute logDir path if the capacity is specified per logDir, null otherwise.
+   * Package private for {@link AutoDiscoveryBrokerCapacityConfigResolver}.
    *
    * @param brokerCapacity Broker capacity for each resource.
    * @return Disk capacity by absolute logDir path if the capacity is specified per logDir, null otherwise.
    */
   @SuppressWarnings("unchecked")
-  private static Map<String, Double> getDiskCapacityByLogDir(Map<Resource, Object> brokerCapacity) {
+  static Map<String, Double> getDiskCapacityByLogDir(Map<Resource, Object> brokerCapacity) {
     if (!isJBOD(brokerCapacity)) {
       return null;
     }
@@ -268,14 +292,14 @@ public class BrokerCapacityConfigFileResolver implements BrokerCapacityConfigRes
     }
   }
 
-  private BrokerCapacityInfo getBrokerCapacityInfo(BrokerCapacity bc, Set<Boolean> numCoresConfigConsistency) {
-    Double userSpecifiedNumCores = getUserSpecifiedNumCores(bc.capacity);
+  private BrokerCapacityInfo getBrokerCapacityInfo(int brokerId, Map<Resource, Object> capacity, Set<Boolean> numCoresConfigConsistency) {
+    Double userSpecifiedNumCores = getUserSpecifiedNumCores(capacity);
     boolean hasNumCores = userSpecifiedNumCores != null;
     numCoresConfigConsistency.add(hasNumCores);
     numCoresConfigConsistencyChecker(numCoresConfigConsistency);
-    boolean isDefault = bc.brokerId == DEFAULT_CAPACITY_BROKER_ID;
-    Map<Resource, Double> totalCapacity = getTotalCapacity(bc.capacity, hasNumCores);
-    Map<String, Double> diskCapacityByLogDir = getDiskCapacityByLogDir(bc.capacity);
+    boolean isDefault = brokerId == DEFAULT_CAPACITY_BROKER_ID;
+    Map<Resource, Double> totalCapacity = getTotalCapacity(capacity, hasNumCores);
+    Map<String, Double> diskCapacityByLogDir = getDiskCapacityByLogDir(capacity);
 
     BrokerCapacityInfo brokerCapacityInfo;
     if (hasNumCores) {
@@ -291,18 +315,34 @@ public class BrokerCapacityConfigFileResolver implements BrokerCapacityConfigRes
   }
 
   private void loadCapacities() throws FileNotFoundException {
+    Map<Integer, Map<Resource, Object>> rawCapacities = readRawCapacities(_configFile);
+    capacitiesForBrokers = new HashMap<>();
+    Set<Boolean> numCoresConfigConsistency = new HashSet<>();
+    for (Map.Entry<Integer, Map<Resource, Object>> entry : rawCapacities.entrySet()) {
+      capacitiesForBrokers.put(entry.getKey(), getBrokerCapacityInfo(entry.getKey(), entry.getValue(), numCoresConfigConsistency));
+    }
+  }
+
+  /**
+   * Read the broker capacities from the given capacity config file without validating them. Package private for
+   * {@link AutoDiscoveryBrokerCapacityConfigResolver}.
+   *
+   * @param configFile The capacity config file.
+   * @return The capacity of each resource listed in the file by broker id, in the order of the file.
+   */
+  static Map<Integer, Map<Resource, Object>> readRawCapacities(String configFile) throws FileNotFoundException {
     JsonReader reader = null;
     try {
-      reader = new JsonReader(new InputStreamReader(new FileInputStream(_configFile), StandardCharsets.UTF_8));
+      reader = new JsonReader(new InputStreamReader(new FileInputStream(configFile), StandardCharsets.UTF_8));
       Gson gson = new Gson();
       Set<BrokerCapacity> brokerCapacities = ((BrokerCapacities) gson.fromJson(reader, BrokerCapacities.class)).brokerCapacities;
-      capacitiesForBrokers = new HashMap<>();
-      Set<Boolean> numCoresConfigConsistency = new HashSet<>();
+      Map<Integer, Map<Resource, Object>> rawCapacities = new LinkedHashMap<>();
       if (brokerCapacities != null) {
         for (BrokerCapacity bc : brokerCapacities) {
-          capacitiesForBrokers.put(bc.brokerId, getBrokerCapacityInfo(bc, numCoresConfigConsistency));
+          rawCapacities.put(bc.brokerId, bc.capacity);
         }
       }
+      return rawCapacities;
     } finally {
       try {
         if (reader != null) {

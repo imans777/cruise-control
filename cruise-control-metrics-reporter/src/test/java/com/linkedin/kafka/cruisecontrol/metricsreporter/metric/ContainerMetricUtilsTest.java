@@ -2,6 +2,20 @@
  * Copyright 2020 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.metricsreporter.metric;
 
 import org.junit.Test;
@@ -52,5 +66,25 @@ public class ContainerMetricUtilsTest {
     mockGetContainerProcessCpuLoad(2, 2500.0, 0.0125, 1.0);
 
     mockGetContainerProcessCpuLoad(2, ContainerMetricUtils.NO_CPU_QUOTA, 0.125, 0.125);
+  }
+
+  private void mockGetCpuLimit(double cpuQuota, double expectedCpuLimit) throws Exception {
+    PowerMock.mockStaticPartial(ContainerMetricUtils.class, "getCpuPeriod", "getCpuQuota");
+    PowerMock.expectPrivate(ContainerMetricUtils.class, "getCpuPeriod").andReturn(CPU_PERIOD).anyTimes();
+    PowerMock.expectPrivate(ContainerMetricUtils.class, "getCpuQuota").andReturn(cpuQuota).anyTimes();
+    PowerMock.replay(ContainerMetricUtils.class);
+
+    assertEquals(expectedCpuLimit, ContainerMetricUtils.getCpuLimit(), DELTA);
+  }
+
+  @Test
+  public void testGetCpuLimit() throws Exception {
+    /*
+     *  expectedCpuLimit = cpuQuota / cpuPeriod
+     */
+    mockGetCpuLimit(50000.0, 0.5);
+    mockGetCpuLimit(100000.0, 1.0);
+    mockGetCpuLimit(250000.0, 2.5);
+    mockGetCpuLimit(ContainerMetricUtils.NO_CPU_QUOTA, ContainerMetricUtils.NO_CPU_QUOTA);
   }
 }

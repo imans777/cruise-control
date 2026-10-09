@@ -53,6 +53,8 @@ import org.testcontainers.kafka.KafkaContainer;
 
 import static com.linkedin.kafka.cruisecontrol.metricsreporter.CruiseControlMetricsReporter.DEFAULT_BOOTSTRAP_SERVERS_HOST;
 import static com.linkedin.kafka.cruisecontrol.metricsreporter.CruiseControlMetricsReporter.DEFAULT_BOOTSTRAP_SERVERS_PORT;
+import static com.linkedin.kafka.cruisecontrol.metricsreporter.CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_ENABLED_CONFIG;
+import static com.linkedin.kafka.cruisecontrol.metricsreporter.CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_BYTES_PER_SEC_CONFIG;
 import static com.linkedin.kafka.cruisecontrol.metricsreporter.CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_REPORTER_INTERVAL_MS_CONFIG;
 import static com.linkedin.kafka.cruisecontrol.metricsreporter.CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_TOPIC_AUTO_CREATE_CONFIG;
 import static com.linkedin.kafka.cruisecontrol.metricsreporter.CruiseControlMetricsReporterConfig.CRUISE_CONTROL_METRICS_TOPIC_CONFIG;
@@ -121,6 +123,9 @@ public class CruiseControlMetricsReporterTest extends CCKafkaClientsIntegrationT
       CCContainerizedKraftCluster.INTERNAL_LISTENER_NAME + ":PLAINTEXT",
       CCContainerizedKraftCluster.EXTERNAL_LISTENER_NAME + ":PLAINTEXT"));
     props.setProperty(CRUISE_CONTROL_METRICS_REPORTER_INTERVAL_MS_CONFIG, "100");
+    props.setProperty(CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_ENABLED_CONFIG, "true");
+    // Containers usually do not report a link speed, so set the network capacity explicitly to get deterministic metrics.
+    props.setProperty(CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_BYTES_PER_SEC_CONFIG, "125000000");
     props.setProperty(CRUISE_CONTROL_METRICS_TOPIC_CONFIG, TOPIC);
     props.setProperty("log.flush.interval.messages", "1");
     props.setProperty("offsets.topic.replication.factor", "1");
@@ -206,7 +211,10 @@ public class CruiseControlMetricsReporterTest extends CCKafkaClientsIntegrationT
                                                                        (int) BROKER_FOLLOWER_FETCH_LOCAL_TIME_MS_50TH.id(),
                                                                        (int) BROKER_FOLLOWER_FETCH_LOCAL_TIME_MS_999TH.id(),
                                                                        (int) BROKER_LOG_FLUSH_TIME_MS_50TH.id(),
-                                                                       (int) BROKER_LOG_FLUSH_TIME_MS_999TH.id()));
+                                                                       (int) BROKER_LOG_FLUSH_TIME_MS_999TH.id(),
+                                                                       (int) BROKER_CPU_CORES.id(),
+                                                                       (int) BROKER_NW_IN_CAPACITY.id(),
+                                                                       (int) BROKER_NW_OUT_CAPACITY.id()));
     Set<Integer> metricTypes = new HashSet<>();
     ConsumerRecords<String, CruiseControlMetric> records;
     while (metricTypes.size() < expectedMetricTypes.size() && System.currentTimeMillis() < startMs + 15000) {
