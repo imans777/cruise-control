@@ -13,7 +13,7 @@ The Sample Store is used to store the collected metric samples and training samp
 The default implementation of Sample Store produces the samples back to the Kafka topic.
 
 ## Broker Capacity Config Resolver
-The broker Capacity Config Resolver is the way for Cruise Control to get the broker capacity for each of the resources. The default implementation is file based properties. Users can also have a customized implementation to retrieve the capacity of the brokers from some hardware resource management system.
+The broker Capacity Config Resolver is the way for Cruise Control to get the broker capacity for each of the resources. The default implementation is file based properties. `AutoDiscoveryBrokerCapacityConfigResolver` discovers the capacity instead: disk capacity from the log dirs that Kafka reports, and CPU cores and network capacity from `CruiseControlMetricsReporter`. It uses the capacity file only to override or back up the discovered values (see [AutoDiscoveryBrokerCapacityConfigResolver configurations](Configurations.md#autodiscoverybrokercapacityconfigresolver-configurations)). Users can also have a customized implementation to retrieve the capacity of the brokers from some hardware resource management system.
 
 ## Goals
 The goals in Kafka Cruise Control are pluggable with different priorities.

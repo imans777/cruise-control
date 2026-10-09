@@ -1,0 +1,22 @@
+{
+  "brokerCapacities":[
+    {
+      "brokerId": "-1",
+      "capacity": {
+        "CPU": {"num.cores": "8"},
+        "NW_IN": "1220703",
+        "NW_OUT": "1220703"
+      },
+      "doc": "Used by AutoDiscoveryBrokerCapacityConfigResolver only for capacity that is neither discovered nor in the entry of a broker, e.g. the network capacity of brokers whose network interface reports no speed. Values from this entry are flagged as estimated. CPU is in cores and network in KB/s: 1220703 KB/s is 10 Gbit/s."
+    },
+    {
+      "brokerId": "3",
+      "capacity": {
+        "DISK": {"/data/kafka-1": "500000"},
+        "NW_IN": "610351",
+        "NW_OUT": "610351"
+      },
+      "doc": "Overrides discovered values of broker 3: log dir /data/kafka-1 counts as 500000 MB instead of the size of its volume, and the network capacity is 5 Gbit/s. The other log dirs and the CPU cores of broker 3 are still discovered. An offline or removed log dir is never counted, even if it is listed here."
+    }
+  ]
+}
