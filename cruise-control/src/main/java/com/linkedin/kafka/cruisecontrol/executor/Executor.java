@@ -1613,6 +1613,7 @@ public class Executor {
       long totalDataToMoveInMB = _executionTaskManager.remainingInterBrokerDataToMoveInMB();
       long startTime = System.currentTimeMillis();
       LOG.info("User task {}: Starting {} inter-broker partition movements.", _uuid, numTotalPartitionMovements);
+      logInterBrokerReplicaMovementSkew(numTotalPartitionMovements);
 
       int partitionsToMove = numTotalPartitionMovements;
       // Exhaust all the pending partition movements.
@@ -1735,6 +1736,23 @@ public class Executor {
                  executionTasksSummary.remainingIntraBrokerDataToMoveInMB(),
                  executionTasksSummary.taskStat().get(LEADER_ACTION).get(ExecutionTaskState.PENDING));
       }
+    }
+
+    /**
+     * Log the number of inter-broker partition movements by broker and the share of the most involved broker, which indicates
+     * whether a single broker may become the bottleneck of the execution.
+     *
+     * @param numTotalPartitionMovements Total number of inter-broker partition movements.
+     */
+    private void logInterBrokerReplicaMovementSkew(int numTotalPartitionMovements) {
+      Map<Integer, Integer> numMovementsByBrokerId = _executionTaskManager.numRemainingInterBrokerReplicaMovementsByBrokerId();
+      if (numMovementsByBrokerId.isEmpty() || numTotalPartitionMovements == 0) {
+        return;
+      }
+      Map.Entry<Integer, Integer> mostInvolvedBroker = numMovementsByBrokerId.entrySet().iterator().next();
+      LOG.info("User task {}: Inter-broker partition movements by broker: {}. The most involved broker {} is involved in {} of {} "
+               + "movements ({}%).", _uuid, numMovementsByBrokerId, mostInvolvedBroker.getKey(), mostInvolvedBroker.getValue(),
+               numTotalPartitionMovements, String.format("%.1f", 100.0 * mostInvolvedBroker.getValue() / numTotalPartitionMovements));
     }
 
     /**
