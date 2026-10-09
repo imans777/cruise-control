@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.monitor;
 
 import com.codahale.metrics.Gauge;
@@ -151,8 +165,10 @@ public class LoadMonitor {
     _metadataClient = metadataClient;
     _adminClient = adminClient;
     _time = time;
+    // The admin client lets resolvers such as AutoDiscoveryBrokerCapacityConfigResolver read the log dirs of the brokers.
     _brokerCapacityConfigResolver = config.getConfiguredInstance(MonitorConfig.BROKER_CAPACITY_CONFIG_RESOLVER_CLASS_CONFIG,
-                                                                 BrokerCapacityConfigResolver.class);
+                                                                 BrokerCapacityConfigResolver.class,
+                                                                 Collections.singletonMap(KAFKA_ADMIN_CLIENT_OBJECT_CONFIG, _adminClient));
     long monitorStateUpdateIntervalMs = config.getLong(MonitorConfig.MONITOR_STATE_UPDATE_INTERVAL_MS_CONFIG);
     _monitorStateUpdateTimeoutMs = 10 * monitorStateUpdateIntervalMs;
     _topicConfigProvider = config.getConfiguredInstance(
