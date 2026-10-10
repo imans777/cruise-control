@@ -805,6 +805,8 @@ public class Executor {
    * @param replicaMovementStrategy The strategy used to determine the execution order of generated replica movement tasks.
    * @param replicationThrottle The replication throttle (bytes/second) to apply to both leaders and followers
    *                            when executing a proposal (if null, no throttling is applied).
+   * @param logDirThrottle The throttle (bytes/second) to apply to intra-broker replica movements -- i.e. moving replicas
+   *                       between the logdirs of a broker (if null, no throttling is applied).
    * @param isTriggeredByUserRequest Whether the execution is triggered by a user request.
    * @param uuid UUID of the execution.
    * @param isKafkaAssignerMode {@code true} if kafka assigner mode, {@code false} otherwise.
@@ -823,6 +825,7 @@ public class Executor {
                                             Long requestedExecutionProgressCheckIntervalMs,
                                             ReplicaMovementStrategy replicaMovementStrategy,
                                             Long replicationThrottle,
+                                            Long logDirThrottle,
                                             boolean isTriggeredByUserRequest,
                                             String uuid,
                                             boolean isKafkaAssignerMode,
@@ -835,7 +838,7 @@ public class Executor {
                             requestedIntraBrokerPartitionMovementConcurrency, requestedClusterLeadershipMovementConcurrency,
                             requestedBrokerLeadershipMovementConcurrency, requestedExecutionProgressCheckIntervalMs, replicaMovementStrategy,
                             isTriggeredByUserRequest, loadMonitor);
-      startExecution(loadMonitor, null, removedBrokers, replicationThrottle, isTriggeredByUserRequest);
+      startExecution(loadMonitor, null, removedBrokers, replicationThrottle, logDirThrottle, isTriggeredByUserRequest);
     } catch (Exception e) {
       if (e instanceof OngoingExecutionException) {
         LOG.info("User task {}: Broker removal operation aborted due to ongoing execution", uuid);
@@ -928,7 +931,7 @@ public class Executor {
       initProposalExecution(proposals, demotedBrokers, concurrentSwaps, null, 0,
                             requestedClusterLeadershipMovementConcurrency, requestedBrokerLeadershipMovementConcurrency,
                             requestedExecutionProgressCheckIntervalMs, replicaMovementStrategy, isTriggeredByUserRequest, loadMonitor);
-      startExecution(loadMonitor, demotedBrokers, null, replicationThrottle, isTriggeredByUserRequest);
+      startExecution(loadMonitor, demotedBrokers, null, replicationThrottle, null, isTriggeredByUserRequest);
     } catch (Exception e) {
       processExecuteProposalsFailure();
       throw e;
@@ -1009,12 +1012,15 @@ public class Executor {
    * @param removedBrokers Brokers to be removed, null if no broker has been removed.
    * @param replicationThrottle The replication throttle (bytes/second) to apply to both leaders and followers
    *                            while moving partitions (if null, no throttling is applied).
+   * @param logDirThrottle The throttle (bytes/second) to apply to intra-broker replica movements -- i.e. moving replicas
+   *                       between the logdirs of a broker (if null, no throttling is applied).
    * @param isTriggeredByUserRequest Whether the execution is triggered by a user request.
    */
   private void startExecution(LoadMonitor loadMonitor,
                               Collection<Integer> demotedBrokers,
                               Collection<Integer> removedBrokers,
                               Long replicationThrottle,
+                              Long logDirThrottle,
                               boolean isTriggeredByUserRequest) throws OngoingExecutionException {
     _executionStoppedByUser.set(false);
     sanityCheckOngoingMovement();
@@ -1050,7 +1056,8 @@ public class Executor {
       _numExecutionStartedInNonKafkaAssignerMode.incrementAndGet();
     }
     _proposalExecutor.execute(
-        new ProposalExecutionRunnable(loadMonitor, demotedBrokers, removedBrokers, replicationThrottle, isTriggeredByUserRequest));
+        new ProposalExecutionRunnable(loadMonitor, demotedBrokers, removedBrokers, replicationThrottle, logDirThrottle,
+                                      isTriggeredByUserRequest));
   }
 
   /**
@@ -1301,6 +1308,7 @@ public class Executor {
     private final Set<Integer> _recentlyDemotedBrokers;
     private final Set<Integer> _recentlyRemovedBrokers;
     private final Long _replicationThrottle;
+    private final LogDirThrottleHelper _logDirThrottleHelper;
     private Throwable _executionException;
     private final boolean _isTriggeredByUserRequest;
     private long _lastSlowTaskReportingTimeMs;
@@ -1315,6 +1323,7 @@ public class Executor {
                               Collection<Integer> demotedBrokers,
                               Collection<Integer> removedBrokers,
                               Long replicationThrottle,
+                              Long logDirThrottle,
                               boolean isTriggeredByUserRequest) {
       _loadMonitor = loadMonitor;
       _demotedBrokers = demotedBrokers;
@@ -1350,6 +1359,7 @@ public class Executor {
       _recentlyDemotedBrokers = recentlyDemotedBrokers();
       _recentlyRemovedBrokers = recentlyRemovedBrokers();
       _replicationThrottle = replicationThrottle;
+      _logDirThrottleHelper = new LogDirThrottleHelper(_adminClient, logDirThrottle);
       _isTriggeredByUserRequest = isTriggeredByUserRequest;
       _lastSlowTaskReportingTimeMs = -1L;
       if (_removedBrokers != null && !_removedBrokers.isEmpty()) {
@@ -1497,6 +1507,8 @@ public class Executor {
         LOG.error("User task {}: Executor got exception during execution", _uuid, t);
         _executionException = t;
       } finally {
+        // Restore the log dir throttles (if any) on all exit paths, before the execution is reported as finished.
+        _logDirThrottleHelper.clearAllThrottles();
         notifyFinishedTask(userTaskInfo);
       }
     }
@@ -1691,6 +1703,7 @@ public class Executor {
         LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
 
         if (!tasksToExecute.isEmpty()) {
+          _logDirThrottleHelper.setThrottles(tasksToExecute);
           // Execute the tasks.
           _executionTaskManager.markTasksInProgress(tasksToExecute);
           executeIntraBrokerReplicaMovements(tasksToExecute, _adminClient, _executionTaskManager, _config);
