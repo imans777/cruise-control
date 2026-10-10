@@ -13,39 +13,67 @@ Cruise Control metrics are useful to monitor the state of Cruise Control itself.
 
 ### Executor Sensors
 
-| DESCRIPTION                                                        | MBEAN NAME                                        						                               |
-|--------------------------------------------------------------------|----------------------------------------------------------------------------------------|
-| The number of replica action in progress                           | kafka.cruisecontrol:name=Executor.replica-action-in-progress                           |
-| The number of leadership action in progress                        | kafka.cruisecontrol:name=Executor.leadership-action-in-progress                        |
-| The number of replica action pending                               | kafka.cruisecontrol:name=Executor.replica-action-pending                               |
-| The number of leadership action pending                            | kafka.cruisecontrol:name=Executor.leadership-action-pending                            |
-| The number of replica action aborting                              | kafka.cruisecontrol:name=Executor.replica-action-aborting                              |
-| The number of leadership action aborting                           | kafka.cruisecontrol:name=Executor.leadership-action-aborting                           |
-| The number of replica action aborted                               | kafka.cruisecontrol:name=Executor.replica-action-aborted                               |
-| The number of leadership action aborted                            | kafka.cruisecontrol:name=Executor.leadership-action-aborted                            |
-| The number of replica action dead                                  | kafka.cruisecontrol:name=Executor.replica-action-dead                                  |
-| The number of leadership action dead                               | kafka.cruisecontrol:name=Executor.leadership-action-dead                               |
-| Has an ongoing execution in kafka_assigner mode                    | kafka.cruisecontrol:name=Executor.ongoing-execution-kafka_assigner                     |
-| Has an ongoing execution in non-kafka_assigner mode                | kafka.cruisecontrol:name=Executor.ongoing-execution-non-kafka_assigner                 |
-| The number of (all) execution stopped                              | kafka.cruisecontrol:name=Executor.execution-stopped                                    |
-| The number of execution stopped by user                            | kafka.cruisecontrol:name=Executor.execution-stopped-by-user                            |
-| The number of execution started in kafka_assigner mode             | kafka.cruisecontrol:name=Executor.execution-started-kafka_assigner                     |
-| The number of execution started in non-kafka_assigner mode         | kafka.cruisecontrol:name=Executor.execution-started-non-kafka_assigner                 |
-| Per broker cap on inter-broker partition movements (deprecated)    | kafka.cruisecontrol:name=Executor.inter-broker-partition-movements-per-broker-cap      |
-| Per broker cap on intra-broker partition movements (deprecated)    | kafka.cruisecontrol:name=Executor.intra-broker-partition-movements-per-broker-cap      |
-| Global cap on leadership movements                                 | kafka.cruisecontrol:name=Executor.leadership-movements-global-cap                      |
-| The time taken to exectute proposals involving broker removal      | kafka.cruisecontrol:name=Executor.proposal_execution-time-involve-broker-removal       |
-| The time taken to exectute proposals involving broker demotion     | kafka.cruisecontrol:name=Executor.proposal-execution-time-involve-broker-demotion-only |
-| The time taken to exectute proposals                               | kafka.cruisecontrol:name=Executor.proposal-execution-time                              |
-| Max inter-broker partition movement concurrency of all brokers     | kafka.cruisecontrol:name=inter-broker-partition-movements-max-concurrency              |
-| Min inter-broker partition movement concurrency of all brokers     | kafka.cruisecontrol:name=inter-broker-partition-movements-min-concurrency              |
-| Average inter-broker partition movement concurrency of all brokers | kafka.cruisecontrol:name=inter-broker-partition-movements-avg-concurrency              |
-| Max intra-broker partition movement concurrency of all brokers     | kafka.cruisecontrol:name=intra-broker-partition-movements-max-concurrency              |
-| Min intra-broker partition movement concurrency of all brokers     | kafka.cruisecontrol:name=intra-broker-partition-movements-min-concurrency              |
-| Average intra-broker partition movement concurrency of all brokers | kafka.cruisecontrol:name=intra-broker-partition-movements-avg-concurrency              |
-| Max leadership movement concurrency of all brokers                 | kafka.cruisecontrol:name=leadership-movements-max-concurrency                          |
-| Min leadership movement concurrency of all brokers                 | kafka.cruisecontrol:name=leadership-movements-min-concurrency                          |
-| Average leadership movement concurrency of all brokers             | kafka.cruisecontrol:name=leadership-movements-avg-concurrency                          |
+| DESCRIPTION                                                                                          | MBEAN NAME                                                                                     |
+|------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| The number of replica action in progress                                                             | kafka.cruisecontrol:name=Executor.replica-action-in-progress                                   |
+| The number of leadership action in progress                                                          | kafka.cruisecontrol:name=Executor.leadership-action-in-progress                                |
+| The number of intra-broker replica action in progress                                                | kafka.cruisecontrol:name=Executor.intra-broker-replica-action-in-progress                      |
+| The number of replica action pending                                                                 | kafka.cruisecontrol:name=Executor.replica-action-pending                                       |
+| The number of leadership action pending                                                              | kafka.cruisecontrol:name=Executor.leadership-action-pending                                    |
+| The number of intra-broker replica action pending                                                    | kafka.cruisecontrol:name=Executor.intra-broker-replica-action-pending                          |
+| The number of replica action aborting                                                                | kafka.cruisecontrol:name=Executor.replica-action-aborting                                      |
+| The number of leadership action aborting                                                             | kafka.cruisecontrol:name=Executor.leadership-action-aborting                                   |
+| The number of intra-broker replica action aborting                                                   | kafka.cruisecontrol:name=Executor.intra-broker-replica-action-aborting                         |
+| The number of replica action aborted                                                                 | kafka.cruisecontrol:name=Executor.replica-action-aborted                                       |
+| The number of leadership action aborted                                                              | kafka.cruisecontrol:name=Executor.leadership-action-aborted                                    |
+| The number of intra-broker replica action aborted                                                    | kafka.cruisecontrol:name=Executor.intra-broker-replica-action-aborted                          |
+| The number of replica action dead                                                                    | kafka.cruisecontrol:name=Executor.replica-action-dead                                          |
+| The number of leadership action dead                                                                 | kafka.cruisecontrol:name=Executor.leadership-action-dead                                       |
+| The number of intra-broker replica action dead                                                       | kafka.cruisecontrol:name=Executor.intra-broker-replica-action-dead                             |
+| The number of replica action completed                                                               | kafka.cruisecontrol:name=Executor.replica-action-completed                                     |
+| The number of leadership action completed                                                            | kafka.cruisecontrol:name=Executor.leadership-action-completed                                  |
+| The number of intra-broker replica action completed                                                  | kafka.cruisecontrol:name=Executor.intra-broker-replica-action-completed                        |
+| Has an ongoing execution in kafka_assigner mode                                                      | kafka.cruisecontrol:name=Executor.ongoing-execution-kafka_assigner                             |
+| Has an ongoing execution in non-kafka_assigner mode                                                  | kafka.cruisecontrol:name=Executor.ongoing-execution-non_kafka_assigner                         |
+| The duration of the ongoing execution in ms (0 if there is no ongoing execution)                     | kafka.cruisecontrol:name=Executor.ongoing-execution-duration-ms                                |
+| The inter-broker data to move in the ongoing execution in MB                                         | kafka.cruisecontrol:name=Executor.ongoing-execution-inter-broker-data-movement-total-MB        |
+| The finished (completed, aborted or dead) inter-broker data movement of the ongoing execution in MB  | kafka.cruisecontrol:name=Executor.ongoing-execution-inter-broker-data-movement-finished-MB     |
+| The in-execution (in progress or aborting) inter-broker data movement of the ongoing execution in MB | kafka.cruisecontrol:name=Executor.ongoing-execution-inter-broker-data-movement-in-execution-MB |
+| The remaining inter-broker data to move in the ongoing execution in MB (0 once a stop is requested)  | kafka.cruisecontrol:name=Executor.ongoing-execution-inter-broker-data-movement-remaining-MB    |
+| The intra-broker data to move in the ongoing execution in MB                                         | kafka.cruisecontrol:name=Executor.ongoing-execution-intra-broker-data-movement-total-MB        |
+| The finished (completed, aborted or dead) intra-broker data movement of the ongoing execution in MB  | kafka.cruisecontrol:name=Executor.ongoing-execution-intra-broker-data-movement-finished-MB     |
+| The in-execution (in progress or aborting) intra-broker data movement of the ongoing execution in MB | kafka.cruisecontrol:name=Executor.ongoing-execution-intra-broker-data-movement-in-execution-MB |
+| The remaining intra-broker data to move in the ongoing execution in MB (0 once a stop is requested)  | kafka.cruisecontrol:name=Executor.ongoing-execution-intra-broker-data-movement-remaining-MB    |
+| The number of (all) execution stopped                                                                | kafka.cruisecontrol:name=Executor.execution-stopped                                            |
+| The number of execution stopped by user                                                              | kafka.cruisecontrol:name=Executor.execution-stopped-by-user                                    |
+| The number of execution started in kafka_assigner mode                                               | kafka.cruisecontrol:name=Executor.execution-started-kafka_assigner                             |
+| The number of execution started in non-kafka_assigner mode                                           | kafka.cruisecontrol:name=Executor.execution-started-non-kafka_assigner                         |
+| Per broker cap on inter-broker partition movements (deprecated)                                      | kafka.cruisecontrol:name=Executor.inter-broker-partition-movements-per-broker-cap              |
+| Per broker cap on intra-broker partition movements (deprecated)                                      | kafka.cruisecontrol:name=Executor.intra-broker-partition-movements-per-broker-cap              |
+| Global cap on leadership movements                                                                   | kafka.cruisecontrol:name=Executor.leadership-movements-global-cap                              |
+| The time taken to execute proposals involving broker removal                                         | kafka.cruisecontrol:name=Executor.proposal_execution-time-involve-broker-removal               |
+| The time taken to execute proposals involving broker demotion                                        | kafka.cruisecontrol:name=Executor.proposal-execution-time-involve-broker-demotion-only         |
+| The time taken to execute proposals                                                                  | kafka.cruisecontrol:name=Executor.proposal-execution-time                                      |
+| The rate of completed inter-broker partition movements                                               | kafka.cruisecontrol:name=Executor.inter-broker-partition-movement-rate                         |
+| The rate of completed intra-broker partition movements                                               | kafka.cruisecontrol:name=Executor.intra-broker-partition-movement-rate                         |
+| The rate of completed leadership movements                                                           | kafka.cruisecontrol:name=Executor.leadership-movement-rate                                     |
+| The rate of finished partition data movement in MB                                                   | kafka.cruisecontrol:name=Executor.partition-data-movement-rate-MB                              |
+| The average number of finished partition movements per second in the latest replica movement phase   | kafka.cruisecontrol:name=Executor.partition-movement-count-per-second                          |
+| The average finished partition data movement in MB per second in the latest replica movement phase   | kafka.cruisecontrol:name=Executor.partition-movement-MB-per-second                             |
+| Max inter-broker partition movement concurrency of all brokers                                       | kafka.cruisecontrol:name=Executor.inter-broker-partition-movements-max-concurrency             |
+| Min inter-broker partition movement concurrency of all brokers                                       | kafka.cruisecontrol:name=Executor.inter-broker-partition-movements-min-concurrency             |
+| Average inter-broker partition movement concurrency of all brokers                                   | kafka.cruisecontrol:name=Executor.inter-broker-partition-movements-avg-concurrency             |
+| Max intra-broker partition movement concurrency of all brokers                                       | kafka.cruisecontrol:name=Executor.intra-broker-partition-movements-max-concurrency             |
+| Min intra-broker partition movement concurrency of all brokers                                       | kafka.cruisecontrol:name=Executor.intra-broker-partition-movements-min-concurrency             |
+| Average intra-broker partition movement concurrency of all brokers                                   | kafka.cruisecontrol:name=Executor.intra-broker-partition-movements-avg-concurrency             |
+| Max leadership movement concurrency of all brokers                                                   | kafka.cruisecontrol:name=Executor.leadership-movements-max-concurrency                         |
+| Min leadership movement concurrency of all brokers                                                   | kafka.cruisecontrol:name=Executor.leadership-movements-min-concurrency                         |
+| Average leadership movement concurrency of all brokers                                               | kafka.cruisecontrol:name=Executor.leadership-movements-avg-concurrency                         |
+
+The `ongoing-execution-*-data-movement-*-MB` and `ongoing-execution-duration-ms` sensors describe the ongoing execution and are
+reset to 0 once the execution finishes. They can be combined to monitor the progress of an execution: for example, the progress of
+inter-broker replica movements is `finished-MB / total-MB`, and its remaining time can be estimated as
+`(remaining-MB + in-execution-MB) / partition-movement-MB-per-second`.
 
 
 ### LoadMonitor Sensors
