@@ -550,6 +550,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
                               null,
                               null,
                               null,
+                              null,
                               true,
                               RANDOM_UUID,
                               false,
@@ -585,6 +586,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
                                                  null,
                                                  null,
                                                  null,
+                                                 null,
                                                  true,
                                                  RANDOM_UUID,
                                                  false,
@@ -598,6 +600,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
                               null,
                               mockLoadMonitor,
                               null, null,
+                              null,
                               null,
                               null,
                               null,
@@ -825,7 +828,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
     executor.setGeneratingProposalsForExecution(RANDOM_UUID, ExecutorTest.class::getSimpleName, isTriggeredByUserRequest);
     executor.executeProposals(proposalsToExecute, Collections.emptySet(), null, mockLoadMonitor, null, null,
                               null, null, null, null, null,
-                              replicationThrottle, isTriggeredByUserRequest, RANDOM_UUID, false, false);
+                              replicationThrottle, null, isTriggeredByUserRequest, RANDOM_UUID, false, false);
 
     if (verifyProgress) {
       verifyOngoingPartitionReassignments(Collections.singleton(TP0));
