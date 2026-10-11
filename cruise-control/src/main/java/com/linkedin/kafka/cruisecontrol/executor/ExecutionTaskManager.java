@@ -267,6 +267,13 @@ public class ExecutionTaskManager {
   }
 
   /**
+   * @return The number of remaining inter-broker replica movements by broker id, sorted by the number of movements in descending order.
+   */
+  public synchronized Map<Integer, Integer> numRemainingInterBrokerReplicaMovementsByBrokerId() {
+    return _executionTaskPlanner.numRemainingInterBrokerReplicaMovementsByBrokerId();
+  }
+
+  /**
    * @return Number of finished inter broker partition movements.
    */
   public synchronized int numFinishedInterBrokerPartitionMovements() {

@@ -82,6 +82,7 @@ Sometimes this could result in prolonged execution time due to some long tail ta
 * **PrioritizeLargeReplicaMovementStrategy**: prioritize large sized replicas
 * **PostponeUrpReplicaMovementStrategy**: prioritize replicas for partition having no out-of-sync replica
 * **PrioritizeMinIsrWithOfflineReplicasStrategy**: prioritize tasks with (At/Under)MinISR partitions with offline replicas
+* **RoundRobinBrokerReplicaMovementStrategy**: spread replica movements across brokers in a round-robin manner (i.e. a broker gets another movement only after the other brokers had their turn), and consider all brokers hosting a replica of the partition (before or after the movement) as involved in the movement, to avoid a single broker becoming the bottleneck of an execution
 
 The strategies can be chained to use and can be dynamically set using `replica_movement_strategies` in corresponding request(e.g. [rebalance request](https://github.com/linkedin/cruise-control/wiki/REST-APIs#trigger-a-workload-balance)).
 
