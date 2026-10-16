@@ -31,6 +31,7 @@ Cruise Control for Apache Kafka
   
   * Anomaly detection, alerting, and self-healing for the Kafka cluster, including:
     * Goal violation
+    * Intra-broker goal violation (i.e. imbalance across the disks of brokers in a JBOD deployment)
     * Broker failure detection
     * Metric anomaly detection
     * Disk failure detection (not available in `kafka_0_11_and_1_0` branch)
@@ -192,6 +193,7 @@ The goals in Cruise Control are pluggable with different priorities. The default
 The anomaly notifier allows users to be notified when an anomaly is detected. Anomalies include:
  * Broker failure
  * Goal violation
+ * Intra-broker goal violation
  * Metric anomaly
  * Disk failure (not available in `kafka_0_11_and_1_0` branch)
  * Slow brokers (not available in `kafka_0_11_and_1_0` branch)
