@@ -10,6 +10,8 @@ import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AlterConfigOp;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,6 +26,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.HashSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -47,6 +50,7 @@ class ReplicationThrottleHelper {
   private final Long _throttleRate;
   private final int _retries;
   private final Set<Integer> _deadBrokers;
+  private final AppliedThrottles _appliedThrottles;
 
   ReplicationThrottleHelper(AdminClient adminClient, Long throttleRate) {
     this(adminClient, throttleRate, RETRIES);
@@ -58,17 +62,20 @@ class ReplicationThrottleHelper {
 
   // for testing
   ReplicationThrottleHelper(AdminClient adminClient, Long throttleRate, int retries) {
-    this._adminClient = adminClient;
-    this._throttleRate = throttleRate;
-    this._retries = retries;
-    this._deadBrokers = new HashSet<Integer>();
+    this(adminClient, throttleRate, retries, new HashSet<>());
   }
 
   ReplicationThrottleHelper(AdminClient adminClient, Long throttleRate, int retries, Set<Integer> deadBrokers) {
+    this(adminClient, throttleRate, retries, deadBrokers, new AppliedThrottles());
+  }
+
+  ReplicationThrottleHelper(AdminClient adminClient, Long throttleRate, int retries, Set<Integer> deadBrokers,
+                            AppliedThrottles appliedThrottles) {
     this._adminClient = adminClient;
     this._throttleRate = throttleRate;
     this._retries = retries;
     this._deadBrokers = deadBrokers;
+    this._appliedThrottles = appliedThrottles;
   }
 
   void setThrottles(List<ExecutionProposal> replicaMovementProposals)
@@ -77,6 +84,9 @@ class ReplicationThrottleHelper {
       LOG.info("Setting a rebalance throttle of {} bytes/sec", _throttleRate);
       Set<Integer> participatingBrokers = getParticipatingBrokers(replicaMovementProposals);
       Map<String, Set<String>> throttledReplicas = getThrottledReplicasByTopic(replicaMovementProposals);
+      // Record the throttles before setting them, so that the throttles are removed even if setting them fails halfway.
+      _appliedThrottles._brokers.addAll(participatingBrokers);
+      _appliedThrottles._proposals.addAll(replicaMovementProposals);
       for (int broker : participatingBrokers) {
         setThrottledRateIfNecessary(broker);
       }
@@ -104,8 +114,7 @@ class ReplicationThrottleHelper {
   }
 
   // clear throttles for a specific list of execution tasks
-  void clearThrottles(List<ExecutionTask> completedTasks, List<ExecutionTask> inProgressTasks)
-  throws ExecutionException, InterruptedException, TimeoutException {
+  void clearThrottles(List<ExecutionTask> completedTasks, List<ExecutionTask> inProgressTasks) throws InterruptedException {
     if (throttlingEnabled()) {
       List<ExecutionProposal> completedProposals =
         completedTasks
@@ -136,13 +145,71 @@ class ReplicationThrottleHelper {
       brokersToRemoveThrottlesFrom.removeAll(brokersWithInProgressTasks);
 
       LOG.info("Removing replica movement throttles from brokers in the cluster: {}", brokersToRemoveThrottlesFrom);
-      for (int broker : brokersToRemoveThrottlesFrom) {
-        removeThrottledRateFromBroker(broker);
-      }
+      removeThrottles(brokersToRemoveThrottlesFrom, completedProposals);
+    }
+  }
 
-      Map<String, Set<String>> throttledReplicas = getThrottledReplicasByTopic(completedProposals);
-      for (Map.Entry<String, Set<String>> entry : throttledReplicas.entrySet()) {
-        removeThrottledReplicasFromTopic(entry.getKey(), entry.getValue());
+  /**
+   * Removes the throttles that were set, but not removed yet -- e.g. because the execution that set them failed while
+   * replicas were still moving, or a broker was unavailable when its throttle was to be removed. The throttles that the
+   * given ongoing partition reassignments still need, and the throttled rates of unavailable brokers are retained, so that
+   * a later call can remove them.
+   *
+   * @param partitionsBeingReassigned Partitions that are being reassigned.
+   */
+  void clearLeftoverThrottles(Set<TopicPartition> partitionsBeingReassigned)
+  throws ExecutionException, InterruptedException, TimeoutException {
+    if (_appliedThrottles.isEmpty()) {
+      return;
+    }
+    List<ExecutionProposal> finishedProposals = new ArrayList<>();
+    List<ExecutionProposal> inProgressProposals = new ArrayList<>();
+    for (ExecutionProposal proposal : _appliedThrottles._proposals) {
+      if (partitionsBeingReassigned.contains(proposal.topicPartition())) {
+        inProgressProposals.add(proposal);
+      } else {
+        finishedProposals.add(proposal);
+      }
+    }
+    Set<Integer> aliveBrokers = _adminClient.describeCluster().nodes().get(CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                                            .stream().map(Node::id).collect(Collectors.toSet());
+    Set<Integer> brokersToRemoveThrottlesFrom = new TreeSet<>(_appliedThrottles._brokers);
+    brokersToRemoveThrottlesFrom.retainAll(aliveBrokers);
+    brokersToRemoveThrottlesFrom.removeAll(getParticipatingBrokers(inProgressProposals));
+    if (!brokersToRemoveThrottlesFrom.isEmpty() || !finishedProposals.isEmpty()) {
+      LOG.info("Removing leftover replica movement throttles from brokers {} and from the replicas of {} finished partition movements "
+               + "(retaining the throttles of {} ongoing partition movements).", brokersToRemoveThrottlesFrom, finishedProposals.size(),
+               inProgressProposals.size());
+      removeThrottles(brokersToRemoveThrottlesFrom, finishedProposals);
+    }
+  }
+
+  /**
+   * Removes the throttled rate from the given brokers, and the throttled replicas of the given proposals from their topics.
+   * Failing to remove a throttle does not stop removing the others. Throttles that could not be removed are retained in
+   * {@link #_appliedThrottles}, so that they can be removed later via {@link #clearLeftoverThrottles(Set)}.
+   *
+   * @param brokers Brokers to remove the throttled rate from.
+   * @param proposals Proposals whose replicas are no longer to be throttled.
+   */
+  private void removeThrottles(Set<Integer> brokers, List<ExecutionProposal> proposals) throws InterruptedException {
+    for (int broker : brokers) {
+      try {
+        removeThrottledRateFromBroker(broker);
+        _appliedThrottles._brokers.remove(broker);
+      } catch (ExecutionException | TimeoutException | RuntimeException e) {
+        LOG.warn("Failed to remove the replication throttled rate from broker {}. Will retry later.", broker, e);
+      }
+    }
+
+    Map<String, List<ExecutionProposal>> proposalsByTopic = proposals.stream().collect(Collectors.groupingBy(ExecutionProposal::topic));
+    for (Map.Entry<String, List<ExecutionProposal>> entry : proposalsByTopic.entrySet()) {
+      String topic = entry.getKey();
+      try {
+        removeThrottledReplicasFromTopic(topic, getThrottledReplicasByTopic(entry.getValue()).get(topic));
+        _appliedThrottles._proposals.removeAll(entry.getValue());
+      } catch (ExecutionException | TimeoutException | RuntimeException e) {
+        LOG.warn("Failed to remove the throttled replicas of topic {}. Will retry later.", topic, e);
       }
     }
   }
@@ -388,5 +455,36 @@ class ReplicationThrottleHelper {
       }
     }
     return true;
+  }
+
+  /**
+   * The replication throttles that have been set, but not removed yet: the brokers whose throttled rate has been set, and
+   * the inter-broker replica movements whose replicas have been throttled. The helpers of consecutive executions share an
+   * instance, so that the throttles an execution could not remove are removed later via {@link #clearLeftoverThrottles(Set)}.
+   */
+  static final class AppliedThrottles {
+    private final Set<Integer> _brokers = ConcurrentHashMap.newKeySet();
+    private final Set<ExecutionProposal> _proposals = ConcurrentHashMap.newKeySet();
+
+    /**
+     * @return {@code true} if there is no throttle to remove, {@code false} otherwise.
+     */
+    boolean isEmpty() {
+      return _brokers.isEmpty() && _proposals.isEmpty();
+    }
+
+    /**
+     * @return Brokers whose throttled rate has been set, but not removed yet.
+     */
+    Set<Integer> brokers() {
+      return Collections.unmodifiableSet(_brokers);
+    }
+
+    /**
+     * @return Inter-broker replica movements whose replicas have been throttled, but not unthrottled yet.
+     */
+    Set<ExecutionProposal> proposals() {
+      return Collections.unmodifiableSet(_proposals);
+    }
   }
 }

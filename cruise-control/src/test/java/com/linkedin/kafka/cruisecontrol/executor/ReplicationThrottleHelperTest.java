@@ -30,12 +30,14 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC0;
 import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC1;
@@ -474,6 +476,107 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
       assertExpectedThrottledRateForBroker(i, null);
     }
     assertExpectedThrottledReplicas(TOPIC0, "");
+  }
+
+  @Test
+  public void testThrottlesThatFailToBeRemovedAreRemovedLater() throws Exception {
+    createTopics();
+
+    final long throttleRate = 100L;
+    final int brokerToFail = 1;
+    AtomicBoolean failRemoval = new AtomicBoolean(false);
+    ReplicationThrottleHelper.AppliedThrottles appliedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttleRate, ReplicationThrottleHelper.RETRIES,
+                                                                             new HashSet<>(), appliedThrottles) {
+      @Override
+      void changeBrokerConfigs(int brokerId, Collection<AlterConfigOp> ops)
+          throws ExecutionException, InterruptedException, TimeoutException {
+        if (failRemoval.get() && brokerId == brokerToFail) {
+          throw new TimeoutException("Injected failure");
+        }
+        super.changeBrokerConfigs(brokerId, ops);
+      }
+
+      @Override
+      void changeTopicConfigs(String topic, Collection<AlterConfigOp> ops)
+          throws ExecutionException, InterruptedException, TimeoutException {
+        if (failRemoval.get() && topic.equals(TOPIC1)) {
+          throw new TimeoutException("Injected failure");
+        }
+        super.changeTopicConfigs(topic, ops);
+      }
+    };
+    // Throttles brokers 0, 1, 2 and topic0 replicas 0:0, 0:1, 0:2.
+    ExecutionProposal proposal0 = new ExecutionProposal(new TopicPartition(TOPIC0, 0), 100, new ReplicaPlacementInfo(0),
+                                                        Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                        Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+    // Throttles brokers 0, 2, 3 and topic1 replicas 0:0, 0:2, 0:3.
+    ExecutionProposal proposal1 = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 100, new ReplicaPlacementInfo(3),
+                                                        Arrays.asList(new ReplicaPlacementInfo(3), new ReplicaPlacementInfo(0)),
+                                                        Arrays.asList(new ReplicaPlacementInfo(3), new ReplicaPlacementInfo(2)));
+    throttleHelper.setThrottles(Arrays.asList(proposal0, proposal1));
+    assertEquals(Set.of(0, 1, 2, 3), appliedThrottles.brokers());
+    assertEquals(Set.of(proposal0, proposal1), appliedThrottles.proposals());
+
+    // Failing to remove the throttled rate of broker 1 and the throttled replicas of topic1 does not prevent removing the others.
+    failRemoval.set(true);
+    throttleHelper.clearThrottles(Arrays.asList(completedTaskForProposal(0, proposal0), completedTaskForProposal(1, proposal1)),
+                                  Collections.emptyList());
+    for (int i = 0; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, i == brokerToFail ? throttleRate : null);
+    }
+    assertExpectedThrottledReplicas(TOPIC0, "");
+    assertExpectedThrottledReplicas(TOPIC1, "0:0,0:2,0:3");
+    assertEquals(Set.of(brokerToFail), appliedThrottles.brokers());
+    assertEquals(Set.of(proposal1), appliedThrottles.proposals());
+
+    // The throttles that could not be removed are removed later.
+    failRemoval.set(false);
+    throttleHelper.clearLeftoverThrottles(Collections.emptySet());
+    for (int i = 0; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, null);
+    }
+    assertExpectedThrottledReplicas(TOPIC1, "");
+    assertTrue(appliedThrottles.isEmpty());
+  }
+
+  @Test
+  public void testClearLeftoverThrottlesRetainsThrottlesOfOngoingMovements() throws Exception {
+    createTopics();
+
+    final long throttleRate = 100L;
+    ReplicationThrottleHelper.AppliedThrottles appliedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttleRate, ReplicationThrottleHelper.RETRIES,
+                                                                             new HashSet<>(), appliedThrottles);
+    // Throttles brokers 0, 1, 2 and topic0 replicas 0:0, 0:1, 0:2.
+    ExecutionProposal finishedProposal = new ExecutionProposal(new TopicPartition(TOPIC0, 0), 100, new ReplicaPlacementInfo(0),
+                                                               Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                               Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+    // Throttles brokers 1, 2, 3 and topic1 replicas 0:1, 0:2, 0:3.
+    ExecutionProposal ongoingProposal = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 100, new ReplicaPlacementInfo(2),
+                                                              Arrays.asList(new ReplicaPlacementInfo(2), new ReplicaPlacementInfo(3)),
+                                                              Arrays.asList(new ReplicaPlacementInfo(3), new ReplicaPlacementInfo(1)));
+    // E.g. the execution fails after setting the throttles, and Kafka carries on with the partition reassignments.
+    throttleHelper.setThrottles(Arrays.asList(finishedProposal, ongoingProposal));
+
+    // Retain the throttles that the ongoing partition reassignment needs.
+    throttleHelper.clearLeftoverThrottles(Collections.singleton(ongoingProposal.topicPartition()));
+    assertExpectedThrottledRateForBroker(0, null);
+    for (int i = 1; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, throttleRate);
+    }
+    assertExpectedThrottledReplicas(TOPIC0, "");
+    assertExpectedThrottledReplicas(TOPIC1, "0:1,0:2,0:3");
+    assertEquals(Set.of(1, 2, 3), appliedThrottles.brokers());
+    assertEquals(Set.of(ongoingProposal), appliedThrottles.proposals());
+
+    // Remove the rest once the partition reassignment is over.
+    throttleHelper.clearLeftoverThrottles(Collections.emptySet());
+    for (int i = 0; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, null);
+    }
+    assertExpectedThrottledReplicas(TOPIC1, "");
+    assertTrue(appliedThrottles.isEmpty());
   }
 
   @Test
