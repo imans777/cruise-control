@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,6 +28,7 @@ import java.util.HashSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -42,6 +44,17 @@ class ReplicationThrottleHelper {
   static final String FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG = "follower.replication.throttled.replicas";
   public static final long CLIENT_REQUEST_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(30);
   static final int RETRIES = 30;
+  // The backoff between attempts to read back the applied configs grows exponentially up to a cap. Without the cap,
+  // the backoff reaches hours within a dozen attempts, which blocks the execution indefinitely if the configs never
+  // converge (e.g. because they are changed outside of Cruise Control). With the cap, RETRIES attempts take ~14 minutes.
+  private static final long RETRY_BACKOFF_SCALE_MS = TimeUnit.SECONDS.toMillis(5);
+  private static final int RETRY_BACKOFF_BASE = 2;
+  private static final int MAX_RETRY_BACKOFF_MS = (int) TimeUnit.SECONDS.toMillis(30);
+  // Sources of config values that deleting a dynamic broker or topic config does not remove, as they have lower precedence.
+  private static final Set<ConfigEntry.ConfigSource> LOWER_PRECEDENCE_CONFIG_SOURCES = Collections.unmodifiableSet(
+      EnumSet.of(ConfigEntry.ConfigSource.DYNAMIC_DEFAULT_BROKER_CONFIG,
+                 ConfigEntry.ConfigSource.STATIC_BROKER_CONFIG,
+                 ConfigEntry.ConfigSource.DEFAULT_CONFIG));
 
   private final AdminClient _adminClient;
   private final Long _throttleRate;
@@ -337,16 +350,16 @@ class ReplicationThrottleHelper {
     ConfigEntry currFollowerThrottle = brokerConfigs.get(FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG);
     List<AlterConfigOp> ops = new ArrayList<>();
     if (currLeaderThrottle != null) {
-      if (currLeaderThrottle.source().equals(ConfigEntry.ConfigSource.STATIC_BROKER_CONFIG)) {
-        LOG.debug("Skipping removal for static leader throttle rate: {}", currFollowerThrottle);
+      if (LOWER_PRECEDENCE_CONFIG_SOURCES.contains(currLeaderThrottle.source())) {
+        LOG.debug("Skipping removal for leader throttle rate not set on broker {}: {}", brokerId, currLeaderThrottle);
       } else {
         LOG.debug("Removing leader throttle rate: {} on broker {}", currLeaderThrottle, brokerId);
         ops.add(new AlterConfigOp(new ConfigEntry(LEADER_REPLICATION_THROTTLED_RATE_CONFIG, null), AlterConfigOp.OpType.DELETE));
       }
     }
     if (currFollowerThrottle != null) {
-      if (currFollowerThrottle.source().equals(ConfigEntry.ConfigSource.STATIC_BROKER_CONFIG)) {
-        LOG.debug("Skipping removal for static follower throttle rate: {}", currFollowerThrottle);
+      if (LOWER_PRECEDENCE_CONFIG_SOURCES.contains(currFollowerThrottle.source())) {
+        LOG.debug("Skipping removal for follower throttle rate not set on broker {}: {}", brokerId, currFollowerThrottle);
       } else {
         LOG.debug("Removing follower throttle rate: {} on broker {}", currFollowerThrottle, brokerId);
         ops.add(new AlterConfigOp(new ConfigEntry(FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, null), AlterConfigOp.OpType.DELETE));
@@ -362,16 +375,31 @@ class ReplicationThrottleHelper {
     // Use HashMap::new instead of Collectors.toMap to allow inserting null values
     Map<String, String> expectedConfigs = ops.stream()
             .collect(HashMap::new, (m, o) -> m.put(o.configEntry().name(), o.configEntry().value()), HashMap::putAll);
+    AtomicInteger attempts = new AtomicInteger();
     boolean retryResponse = CruiseControlMetricsUtils.retry(() -> {
       try {
-        return !configsEqual(getEntityConfigs(cf), expectedConfigs);
+        Config configs = getEntityConfigs(cf);
+        if (configsEqual(configs, expectedConfigs)) {
+          return false;
+        }
+        LOG.warn("Attempt {}/{}: configs {} are not applied to {} yet, current values: {}. If this persists, check whether "
+                 + "these configs are being changed outside of Cruise Control.", attempts.incrementAndGet(), _retries,
+                 expectedConfigs, cf, currentValues(configs, expectedConfigs.keySet()));
+        return true;
       } catch (ExecutionException | InterruptedException | TimeoutException e) {
         return false;
       }
-    }, _retries);
+    }, RETRY_BACKOFF_SCALE_MS, RETRY_BACKOFF_BASE, _retries, MAX_RETRY_BACKOFF_MS);
     if (!retryResponse) {
       throw new IllegalStateException("The following configs " + ops + " were not applied to " + cf + " within the time limit");
     }
+  }
+
+  private static String currentValues(Config configs, Set<String> configNames) {
+    return configNames.stream().map(name -> {
+      ConfigEntry configEntry = configs.get(name);
+      return configEntry == null ? name + "=null" : String.format("%s=%s (%s)", name, configEntry.value(), configEntry.source());
+    }).collect(Collectors.joining(", ", "{", "}"));
   }
 
   static boolean configsEqual(Config configs, Map<String, String> expectedValues) {
@@ -381,8 +409,9 @@ class ReplicationThrottleHelper {
         if (entry.getValue() != null) {
           return false;
         }
-      } else if (configEntry.source().equals(ConfigEntry.ConfigSource.STATIC_BROKER_CONFIG) && entry.getValue() == null) {
-        LOG.debug("Found static broker config: {}, skipping comparison", configEntry);
+      } else if (LOWER_PRECEDENCE_CONFIG_SOURCES.contains(configEntry.source()) && entry.getValue() == null) {
+        // Deleting a dynamic config does not remove a value from a lower precedence source, e.g. the cluster-wide default.
+        LOG.debug("Found {} config: {}, skipping comparison", configEntry.source(), configEntry);
       } else if (!Objects.equals(entry.getValue(), configEntry.value())) {
         return false;
       }
