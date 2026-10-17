@@ -22,24 +22,32 @@ import com.codahale.metrics.Gauge;
 import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.Timer;
 import com.google.common.util.concurrent.AtomicDouble;
+import com.linkedin.cruisecontrol.monitor.sampling.aggregator.ValuesAndExtrapolations;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils;
 import com.linkedin.kafka.cruisecontrol.common.MetadataAdminClient;
+import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.common.TopicMinIsrCache;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorManager;
+import com.linkedin.kafka.cruisecontrol.exception.BrokerCapacityResolutionException;
 import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ConcurrencyAdjustingRecommendation;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ExecutionConcurrencyManager;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
+import com.linkedin.kafka.cruisecontrol.model.Broker;
+import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import com.linkedin.kafka.cruisecontrol.monitor.LoadMonitor;
+import com.linkedin.kafka.cruisecontrol.monitor.metricdefinition.KafkaMetricDef;
+import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.BrokerEntity;
 import com.linkedin.kafka.cruisecontrol.servlet.UserTaskManager;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -139,6 +147,9 @@ public class Executor {
   private final ScheduledExecutorService _concurrencyAdjusterExecutor;
   private final ConcurrentMap<ConcurrencyType, Boolean> _concurrencyAdjusterEnabled;
   private volatile boolean _concurrencyAdjusterMinIsrCheckEnabled;
+  private volatile boolean _replicationThrottleAdjusterEnabled;
+  // The replication throttle helper of the ongoing inter-broker replica movements (if any).
+  private volatile ReplicationThrottleHelper _replicationThrottleHelper;
   private final TopicMinIsrCache _topicMinIsrCache;
   private final long _minExecutionProgressCheckIntervalMs;
   private final long _slowTaskAlertingBackoffTimeMs;
@@ -240,6 +251,8 @@ public class Executor {
     // Support for intra-broker replica movement is pending https://github.com/linkedin/cruise-control/issues/1299.
     _concurrencyAdjusterEnabled.put(ConcurrencyType.INTRA_BROKER_REPLICA, false);
     _concurrencyAdjusterMinIsrCheckEnabled = config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG);
+    _replicationThrottleAdjusterEnabled = config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_CONFIG);
+    _replicationThrottleHelper = null;
     _concurrencyAdjusterExecutor = Executors.newSingleThreadScheduledExecutor(
         new KafkaCruiseControlThreadFactory(ConcurrencyAdjuster.class.getSimpleName()));
     int numMinIsrCheck = config.getInt(ExecutorConfig.CONCURRENCY_ADJUSTER_NUM_MIN_ISR_CHECK_CONFIG);
@@ -473,6 +486,8 @@ public class Executor {
     private int _numChecks;
     private final ExecutionConcurrencyManager _executionConcurrencyManager;
     private volatile boolean _started;
+    // Broker capacities used for replication throttle adjustment, cached for the ongoing execution.
+    private ClusterModel _clusterCapacity;
 
     public ConcurrencyAdjuster(int numMinIsrCheck) {
       _numMinIsrCheck = numMinIsrCheck;
@@ -513,6 +528,7 @@ public class Executor {
      */
     public synchronized void clearAdjustment() {
       _started = false;
+      _clusterCapacity = null;
       _executionConcurrencyManager.reset();
     }
 
@@ -664,12 +680,124 @@ public class Executor {
       return currentConcurrency;
     }
 
+    private boolean canRefreshReplicationThrottle(ReplicationThrottleHelper throttleHelper) {
+      return _replicationThrottleAdjusterEnabled && _loadMonitor != null && _stopSignal.get() == NO_STOP_EXECUTION
+             && _executorState.state() == ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS
+             && throttleHelper != null && throttleHelper.throttlingEnabled();
+    }
+
+    /**
+     * Get the cluster capacity, which is cached for the ongoing execution and refreshed if it misses any of the given brokers.
+     *
+     * @param brokerIds Ids of brokers whose capacity is needed.
+     * @return Cluster capacity, or {@code null} if the capacity is unavailable.
+     */
+    private ClusterModel clusterCapacity(Set<Integer> brokerIds) {
+      if (_clusterCapacity == null || brokerIds.stream().anyMatch(brokerId -> _clusterCapacity.broker(brokerId) == null)) {
+        try {
+          _clusterCapacity = _loadMonitor.clusterCapacity();
+        } catch (TimeoutException | BrokerCapacityResolutionException e) {
+          LOG.warn("Concurrency adjuster failed to retrieve broker capacity for replication throttle adjustment.", e);
+        }
+      }
+      return _clusterCapacity;
+    }
+
+    /**
+     * Adjust the leader and follower replication throttles of the brokers that are throttled by the ongoing inter-broker replica
+     * movements. For each such broker:
+     * <ul>
+     *   <li>Decrease its throttles multiplicatively if (1) (At/Under)MinISR-based check recommends decreasing concurrency on the
+     *   broker or stopping the execution, or (2) its metrics are unavailable or violate any concurrency adjuster limit.</li>
+     *   <li>Otherwise, move its follower (leader) throttle towards its inbound (outbound) network headroom -- see
+     *   {@link ExecutionUtils#recommendedReplicationThrottle(long, double, double, double)}.</li>
+     * </ul>
+     * Metric-based adjustment is performed only if {@code canRunMetricsBasedCheck} is {@code true}.
+     *
+     * @param canRunMetricsBasedCheck {@code true} if metric-based adjustment can be performed, {@code false} otherwise.
+     */
+    private synchronized void refreshReplicationThrottle(boolean canRunMetricsBasedCheck)
+        throws InterruptedException, ExecutionException, TimeoutException {
+      ReplicationThrottleHelper throttleHelper = _replicationThrottleHelper;
+      if (!canRefreshReplicationThrottle(throttleHelper)) {
+        return;
+      }
+      Set<Integer> throttledBrokers = throttleHelper.throttledBrokers();
+      if (throttledBrokers.isEmpty()) {
+        return;
+      }
+
+      ConcurrencyAdjustingRecommendation minIsrRecommendation = minIsrBasedConcurrency();
+      Set<Integer> brokersToDecreaseThrottle = minIsrRecommendation.shouldStopExecution()
+                                               ? throttledBrokers : minIsrRecommendation.getBrokersToDecreaseConcurrency();
+      Map<Integer, ValuesAndExtrapolations> currentMetricsByBrokerId = new HashMap<>();
+      Map<String, StringBuilder> overLimitDetailsByMetricName = new HashMap<>();
+      ClusterModel clusterCapacity = null;
+      if (canRunMetricsBasedCheck) {
+        clusterCapacity = clusterCapacity(throttledBrokers);
+        for (Map.Entry<BrokerEntity, ValuesAndExtrapolations> entry : _loadMonitor.currentBrokerMetricValues().entrySet()) {
+          currentMetricsByBrokerId.put(entry.getKey().brokerId(), entry.getValue());
+        }
+        for (String metricName : CONCURRENCY_ADJUSTER_LIMIT_BY_METRIC_NAME.keySet()) {
+          overLimitDetailsByMetricName.put(metricName, new StringBuilder());
+        }
+      }
+
+      for (int brokerId : throttledBrokers) {
+        long leaderThrottle = throttleHelper.leaderThrottleRate(brokerId);
+        long followerThrottle = throttleHelper.followerThrottleRate(brokerId);
+        long newLeaderThrottle;
+        long newFollowerThrottle;
+        String reason;
+        ValuesAndExtrapolations currentMetrics = currentMetricsByBrokerId.get(brokerId);
+        if (brokersToDecreaseThrottle.contains(brokerId)) {
+          newLeaderThrottle = decreasedReplicationThrottle(leaderThrottle);
+          newFollowerThrottle = decreasedReplicationThrottle(followerThrottle);
+          reason = "(At/Under)MinISR partitions";
+        } else if (!canRunMetricsBasedCheck) {
+          continue;
+        } else if (!withinConcurrencyAdjusterLimit(brokerId, currentMetrics, overLimitDetailsByMetricName)) {
+          newLeaderThrottle = decreasedReplicationThrottle(leaderThrottle);
+          newFollowerThrottle = decreasedReplicationThrottle(followerThrottle);
+          reason = "broker metrics over the concurrency adjuster limit or unavailable";
+        } else {
+          Broker broker = clusterCapacity == null ? null : clusterCapacity.broker(brokerId);
+          Double leaderBytesIn = latestBrokerMetricValue(currentMetrics, KafkaMetricDef.LEADER_BYTES_IN);
+          Double leaderBytesOut = latestBrokerMetricValue(currentMetrics, KafkaMetricDef.LEADER_BYTES_OUT);
+          Double replicationBytesIn = latestBrokerMetricValue(currentMetrics, KafkaMetricDef.REPLICATION_BYTES_IN_RATE);
+          Double replicationBytesOut = latestBrokerMetricValue(currentMetrics, KafkaMetricDef.REPLICATION_BYTES_OUT_RATE);
+          if (broker == null || leaderBytesIn == null || leaderBytesOut == null || replicationBytesIn == null || replicationBytesOut == null) {
+            LOG.debug("Skip replication throttle adjustment for broker {} due to unavailable capacity or network metrics.", brokerId);
+            continue;
+          }
+          newLeaderThrottle = recommendedReplicationThrottle(leaderThrottle, broker.capacityFor(Resource.NW_OUT),
+                                                             leaderBytesOut, replicationBytesOut);
+          newFollowerThrottle = recommendedReplicationThrottle(followerThrottle, broker.capacityFor(Resource.NW_IN),
+                                                               leaderBytesIn, replicationBytesIn);
+          reason = "network headroom";
+        }
+
+        if (newLeaderThrottle != leaderThrottle || newFollowerThrottle != followerThrottle) {
+          throttleHelper.updateThrottleRates(brokerId, newLeaderThrottle, newFollowerThrottle);
+          LOG.info("Concurrency adjuster changed the replication throttle of broker {} based on {} (leader: {} -> {}, follower: {} -> {} "
+                   + "bytes/sec).", brokerId, reason, leaderThrottle, newLeaderThrottle, followerThrottle, newFollowerThrottle);
+        }
+      }
+
+      for (Map.Entry<String, StringBuilder> entry : overLimitDetailsByMetricName.entrySet()) {
+        if (entry.getValue().length() > 0) {
+          LOG.info("{} was over the acceptable limit for brokers with values: {}.", entry.getKey(), entry.getValue());
+        }
+      }
+    }
+
     @Override
     public void run() {
       try {
         if (_started) {
           boolean canRunMetricsBasedCheck = (_numChecks++ % _numMinIsrCheck) == 0;
           refreshConcurrency(canRunMetricsBasedCheck, ConcurrencyType.INTER_BROKER_REPLICA);
+          refreshReplicationThrottle(canRunMetricsBasedCheck);
           // Both broker and cluster leadership movement concurrency can be refreshed with call below.
           refreshConcurrency(canRunMetricsBasedCheck, ConcurrencyType.LEADERSHIP_BROKER);
         }
@@ -781,6 +909,25 @@ public class Executor {
     boolean oldValue = _concurrencyAdjusterMinIsrCheckEnabled;
     _concurrencyAdjusterMinIsrCheckEnabled = isMinIsrBasedConcurrencyAdjustmentEnabled;
     return oldValue;
+  }
+
+  /**
+   * Enable or disable replication throttle adjustment by the concurrency adjuster.
+   *
+   * @param isReplicationThrottleAdjusterEnabled {@code true} to enable replication throttle adjustment, {@code false} otherwise.
+   * @return {@code true} if replication throttle adjustment was enabled before, {@code false} otherwise.
+   */
+  public boolean setReplicationThrottleAdjusterEnabled(boolean isReplicationThrottleAdjusterEnabled) {
+    boolean oldValue = _replicationThrottleAdjusterEnabled;
+    _replicationThrottleAdjusterEnabled = isReplicationThrottleAdjusterEnabled;
+    return oldValue;
+  }
+
+  /**
+   * @return {@code true} if replication throttle adjustment by the concurrency adjuster is enabled, {@code false} otherwise.
+   */
+  public boolean isReplicationThrottleAdjusterEnabled() {
+    return _replicationThrottleAdjusterEnabled;
   }
 
   /**
@@ -1609,6 +1756,16 @@ public class Executor {
       Set<Integer> currentDeadBrokersWithReplicas = _loadMonitor.deadBrokersWithReplicas(MAX_METADATA_WAIT_MS);
       ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, _replicationThrottle,
           currentDeadBrokersWithReplicas);
+      _replicationThrottleHelper = throttleHelper;
+      try {
+        interBrokerMoveReplicas(throttleHelper);
+      } finally {
+        _replicationThrottleHelper = null;
+      }
+    }
+
+    private void interBrokerMoveReplicas(ReplicationThrottleHelper throttleHelper)
+        throws InterruptedException, ExecutionException, TimeoutException {
       int numTotalPartitionMovements = _executionTaskManager.numRemainingInterBrokerPartitionMovements();
       long totalDataToMoveInMB = _executionTaskManager.remainingInterBrokerDataToMoveInMB();
       long startTime = System.currentTimeMillis();
