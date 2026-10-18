@@ -13,6 +13,7 @@ import com.linkedin.kafka.cruisecontrol.executor.concurrency.ConcurrencyAdjustin
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import com.linkedin.kafka.cruisecontrol.monitor.metricdefinition.KafkaMetricDef;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.BrokerEntity;
+import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.PartitionEntity;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -106,6 +107,7 @@ public final class ExecutionUtils {
   private static long additiveIncreaseReplicationThrottle;
   private static int multiplicativeDecreaseReplicationThrottle;
   private static double replicationThrottleTargetNetworkUtilization;
+  private static double replicationThrottleWriteRateMargin;
 
   private ExecutionUtils() { }
 
@@ -160,6 +162,7 @@ public final class ExecutionUtils {
         config.getInt(ExecutorConfig.CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE_CONFIG);
     replicationThrottleTargetNetworkUtilization =
         config.getDouble(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_CONFIG);
+    replicationThrottleWriteRateMargin = config.getDouble(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG);
   }
 
   /**
@@ -176,6 +179,67 @@ public final class ExecutionUtils {
   }
 
   /**
+   * Get the write rate of the given partitions, i.e. the latest value of their {@link KafkaMetricDef#LEADER_BYTES_IN} metric.
+   *
+   * @param currentMetricsByPartition Current metrics of partitions.
+   * @return The write rate (KB/sec) by partition, for the partitions whose write rate is available.
+   */
+  static Map<TopicPartition, Double> partitionWriteRatesKBps(Map<PartitionEntity, ValuesAndExtrapolations> currentMetricsByPartition) {
+    short leaderBytesInId = KafkaMetricDef.commonMetricDefId(KafkaMetricDef.LEADER_BYTES_IN);
+    Map<TopicPartition, Double> writeRateKBpsByPartition = new HashMap<>();
+    for (Map.Entry<PartitionEntity, ValuesAndExtrapolations> entry : currentMetricsByPartition.entrySet()) {
+      MetricValues metricValues = entry.getValue().metricValues().valuesFor(leaderBytesInId);
+      if (metricValues != null) {
+        writeRateKBpsByPartition.put(entry.getKey().tp(), (double) metricValues.latest());
+      }
+    }
+    return writeRateKBpsByPartition;
+  }
+
+  /**
+   * Populate the replication throttle (bytes/sec) that the given in-progress inter-broker replica movements need on each
+   * broker, i.e. (1 + {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG}) times the total
+   * write rate of the partitions being moved. A throttle below this rate stalls the movements, because the new replicas
+   * cannot catch up with the leader. For a partition with write rate {@code w}:
+   * <ul>
+   *   <li>Leader throttle: its old leader, which the new replicas fetch from, needs {@code w} for each replica to add.</li>
+   *   <li>Follower throttle: each broker to add a replica to needs {@code w}.</li>
+   * </ul>
+   * Tasks other than in-progress inter-broker replica movements, and partitions whose write rate is unknown, are ignored.
+   *
+   * @param tasks Execution tasks.
+   * @param writeRateKBpsByPartition The write rate (KB/sec) by partition.
+   * @param neededLeaderThrottleByBroker A map to populate with the leader throttle (bytes/sec) needed by each broker.
+   * @param neededFollowerThrottleByBroker A map to populate with the follower throttle (bytes/sec) needed by each broker.
+   */
+  static void neededReplicationThrottles(Collection<ExecutionTask> tasks,
+                                         Map<TopicPartition, Double> writeRateKBpsByPartition,
+                                         Map<Integer, Long> neededLeaderThrottleByBroker,
+                                         Map<Integer, Long> neededFollowerThrottleByBroker) {
+    Map<Integer, Double> leaderWriteRateKBpsByBroker = new HashMap<>();
+    Map<Integer, Double> followerWriteRateKBpsByBroker = new HashMap<>();
+    for (ExecutionTask task : tasks) {
+      if (task.type() != ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION || task.state() != ExecutionTaskState.IN_PROGRESS) {
+        continue;
+      }
+      ExecutionProposal proposal = task.proposal();
+      Double writeRateKBps = writeRateKBpsByPartition.get(proposal.topicPartition());
+      if (writeRateKBps == null || proposal.replicasToAdd().isEmpty()) {
+        continue;
+      }
+      leaderWriteRateKBpsByBroker.merge(proposal.oldLeader().brokerId(), writeRateKBps * proposal.replicasToAdd().size(), Double::sum);
+      proposal.replicasToAdd().forEach(r -> followerWriteRateKBpsByBroker.merge(r.brokerId(), writeRateKBps, Double::sum));
+    }
+    double bytesPerKBWithMargin = (1 + replicationThrottleWriteRateMargin) * BYTES_IN_KB;
+    for (Map.Entry<Integer, Double> entry : leaderWriteRateKBpsByBroker.entrySet()) {
+      neededLeaderThrottleByBroker.put(entry.getKey(), (long) (entry.getValue() * bytesPerKBWithMargin));
+    }
+    for (Map.Entry<Integer, Double> entry : followerWriteRateKBpsByBroker.entrySet()) {
+      neededFollowerThrottleByBroker.put(entry.getKey(), (long) (entry.getValue() * bytesPerKBWithMargin));
+    }
+  }
+
+  /**
    * Recommend the replication throttle of a broker in one traffic direction (i.e. inbound for the follower throttle and outbound
    * for the leader throttle) based on the network headroom of the broker in that direction.
    *
@@ -186,8 +250,11 @@ public final class ExecutionUtils {
    * {@code leader traffic + replication traffic - min(current throttle, replication traffic)}.</p>
    *
    * <ul>
+   *   <li>If the throttle needed by the in-progress replica movements (see {@link #neededReplicationThrottles}) is above the current
+   *   throttle, the throttle is increased to the needed throttle at once, but never above the target or the maximum throttle --
+   *   i.e. the network headroom wins over the needed throttle. A throttle below the needed throttle would stall the movements.</li>
    *   <li>If the target is below the current throttle, the throttle is decreased to the target at once (bounded by the minimum
-   *   throttle).</li>
+   *   throttle), even below the needed throttle.</li>
    *   <li>If the target is above the current throttle, the throttle is increased by at most the additive increase (bounded by the
    *   maximum throttle), and only if the replication traffic is at least the current throttle -- i.e. only if the throttle may be
    *   limiting the replica movements. Otherwise, increasing the throttle would not speed up the movements, and the network
@@ -195,12 +262,15 @@ public final class ExecutionUtils {
    * </ul>
    *
    * @param currentThrottle The current throttle (bytes/sec) of the broker in the relevant direction.
+   * @param neededThrottle The throttle (bytes/sec) needed by the in-progress replica movements of the broker in the relevant
+   *                       direction, or {@code 0} if unknown.
    * @param networkCapacityKBps The network capacity (KB/sec) of the broker in the relevant direction.
    * @param leaderBytesRateKBps The leader (i.e. client) traffic (KB/sec) of the broker in the relevant direction.
    * @param replicationBytesRateKBps The replication traffic (KB/sec) of the broker in the relevant direction.
    * @return The recommended throttle (bytes/sec) of the broker in the relevant direction.
    */
   static long recommendedReplicationThrottle(long currentThrottle,
+                                             long neededThrottle,
                                              double networkCapacityKBps,
                                              double leaderBytesRateKBps,
                                              double replicationBytesRateKBps) {
@@ -209,6 +279,11 @@ public final class ExecutionUtils {
     double targetThrottleKBps = replicationThrottleTargetNetworkUtilization * networkCapacityKBps - otherTrafficKBps;
     long targetThrottle = (long) Math.max(0.0, targetThrottleKBps * BYTES_IN_KB);
 
+    long neededThrottleWithinHeadroom = Math.min(neededThrottle, Math.min(targetThrottle, maxReplicationThrottle));
+    if (neededThrottleWithinHeadroom > currentThrottle) {
+      // Increase at once to the throttle needed by the in-progress movements (MAX: target throttle and maxReplicationThrottle).
+      return neededThrottleWithinHeadroom;
+    }
     if (targetThrottle < currentThrottle) {
       // Decrease at once (MIN: minReplicationThrottle).
       return Math.min(currentThrottle, Math.max(minReplicationThrottle, targetThrottle));
