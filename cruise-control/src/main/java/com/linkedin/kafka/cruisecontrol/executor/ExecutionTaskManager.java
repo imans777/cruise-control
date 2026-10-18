@@ -75,11 +75,26 @@ public class ExecutionTaskManager {
    * @return A list of execution tasks that move the replicas cross brokers.
    */
   public synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks() {
+    return getInterBrokerReplicaMovementTasks(null);
+  }
+
+  /**
+   * @param budget The replication throttle budget of brokers, or {@code null} to ignore the replication throttle.
+   * @return A list of execution tasks that move the replicas cross brokers.
+   */
+  synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks(ReplicationThrottleBudget budget) {
     Map<Integer, Integer> brokersReadyForReplicaMovement = brokersReadyForReplicaMovement(_inProgressInterBrokerReplicaMovementsByBrokerId,
                                                                                           ConcurrencyType.INTER_BROKER_REPLICA);
     return _executionTaskPlanner.getInterBrokerReplicaMovementTasks(
         brokersReadyForReplicaMovement, _inProgressPartitionsForInterBrokerMovement,
-        _executionConcurrencyManager.maxClusterInterBrokerPartitionMovements());
+        _executionConcurrencyManager.maxClusterInterBrokerPartitionMovements(), budget);
+  }
+
+  /**
+   * @return {@code true} if brokers are picked in a round-robin manner for inter-broker replica movements, {@code false} otherwise.
+   */
+  synchronized boolean isRoundRobinBrokers() {
+    return _executionTaskPlanner.isRoundRobinBrokers();
   }
 
   /**
