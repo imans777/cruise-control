@@ -221,6 +221,12 @@ public class KafkaCruiseControl {
   public void startUp() {
     LOG.info("Starting Kafka Cruise Control...");
     _loadMonitor.startUp();
+    // Recover the execution interrupted by a restart (if any) before starting the anomaly detection that may start a new execution.
+    try {
+      _executor.recoverInterruptedExecution(_loadMonitor);
+    } catch (RuntimeException e) {
+      LOG.error("Failed to recover the interrupted execution.", e);
+    }
     _anomalyDetectorManager.startDetection();
     _goalOptimizerExecutor.execute(_goalOptimizer);
     LOG.info("Kafka Cruise Control started.");
