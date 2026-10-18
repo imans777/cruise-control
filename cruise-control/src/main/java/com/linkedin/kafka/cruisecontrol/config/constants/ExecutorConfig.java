@@ -533,6 +533,20 @@ public final class ExecutorConfig {
       + "capacity minus its inbound (outbound) traffic that is not attributed to the throttled replica movements.";
 
   /**
+   * <code>concurrency.adjuster.replication.throttle.write.rate.margin</code>
+   */
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG
+      = "concurrency.adjuster.replication.throttle.write.rate.margin";
+  public static final double DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN = 0.2;
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_DOC = "The margin above the write rate of "
+      + "the partitions being moved that the concurrency adjuster (if enabled for replication throttle) keeps in the replication "
+      + "throttle of a broker, so that the new replicas can catch up. The follower (leader) throttled rate of a broker is raised at once "
+      + "to (1 + margin) times the total write rate of the partitions being moved to (from) the broker, but never above the network "
+      + "headroom of the broker (see concurrency.adjuster.replication.throttle.target.network.utilization) or "
+      + "concurrency.adjuster.max.replication.throttle. Without such a lower limit, a throttle below the write rate of the partitions "
+      + "being moved stalls their movements.";
+
+  /**
    * <code>concurrency.adjuster.min.isr.cache.size</code>
    */
   public static final String CONCURRENCY_ADJUSTER_MIN_ISR_CACHE_SIZE_CONFIG = "concurrency.adjuster.min.isr.cache.size";
@@ -876,6 +890,12 @@ public final class ExecutorConfig {
                             between(Double.MIN_VALUE, 1.0),
                             ConfigDef.Importance.MEDIUM,
                             CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_DOC)
+                    .define(CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG,
+                            ConfigDef.Type.DOUBLE,
+                            DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_DOC)
                     .define(CONCURRENCY_ADJUSTER_MIN_ISR_CACHE_SIZE_CONFIG,
                             ConfigDef.Type.INT,
                             DEFAULT_CONCURRENCY_ADJUSTER_MIN_ISR_CACHE_SIZE,

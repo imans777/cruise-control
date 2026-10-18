@@ -14,9 +14,11 @@ import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.MonitorConfig;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ConcurrencyAdjustingRecommendation;
+import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import com.linkedin.kafka.cruisecontrol.monitor.metricdefinition.KafkaMetricDef;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.NoopSampler;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.BrokerEntity;
+import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.PartitionEntity;
 import com.nimbusds.jose.util.Pair;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -61,6 +63,7 @@ public class ConcurrencyAdjusterTest {
   private static final long MOCK_ADDITIVE_INCREASE_REPLICATION_THROTTLE = 10 * MB_IN_BYTES;
   private static final int MOCK_MD_REPLICATION_THROTTLE = 2;
   private static final double MOCK_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION = 0.8;
+  private static final double MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN = 0.2;
   private static final String TOPIC1 = "topic1";
   private static final String TOPIC2 = "topic2";
   private static final TopicPartition TP1 = new TopicPartition(TOPIC1, 0);
@@ -319,9 +322,35 @@ public class ConcurrencyAdjusterTest {
    */
   private static double recommendedReplicationThrottleInMB(double currentThrottleMB, double capacityMB, double leaderMB,
                                                            double replicationMB) {
-    long recommended = ExecutionUtils.recommendedReplicationThrottle((long) (currentThrottleMB * MB_IN_BYTES), capacityMB * MB_IN_KB,
+    long recommended = ExecutionUtils.recommendedReplicationThrottle((long) (currentThrottleMB * MB_IN_BYTES), 0L, capacityMB * MB_IN_KB,
                                                                      leaderMB * MB_IN_KB, replicationMB * MB_IN_KB);
     return (double) recommended / MB_IN_BYTES;
+  }
+
+  /**
+   * Simulate the replication throttle adjustments of a broker in one traffic direction, whose throttled replica movements are
+   * stalled: the write rate of the partitions being moved is at least the throttle, so the new replicas cannot catch up and the
+   * movements use the whole throttle. Each round is a metric-based check of the concurrency adjuster (i.e. once per
+   * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_INTERVAL_MS_CONFIG}).
+   *
+   * @param initialThrottleMB Initial throttle (MB/sec).
+   * @param neededMB Throttle needed by the in-progress movements (MB/sec), or {@code 0} if unknown.
+   * @param capacityMB Network capacity (MB/sec).
+   * @param otherReplicationMB Replication traffic (MB/sec) not attributed to the throttled movements.
+   * @param leaderMBByRound Leader (i.e. client) traffic (MB/sec) in each round.
+   * @return The throttle (MB/sec) after each round.
+   */
+  private static List<Double> simulateStalledMovementThrottleInMB(double initialThrottleMB, double neededMB, double capacityMB,
+                                                                  double otherReplicationMB, double... leaderMBByRound) {
+    List<Double> throttleMBByRound = new ArrayList<>(leaderMBByRound.length);
+    long throttle = (long) (initialThrottleMB * MB_IN_BYTES);
+    for (double leaderMB : leaderMBByRound) {
+      double replicationKBps = otherReplicationMB * MB_IN_KB + throttle / ExecutionUtils.BYTES_IN_KB;
+      throttle = ExecutionUtils.recommendedReplicationThrottle(throttle, (long) (neededMB * MB_IN_BYTES), capacityMB * MB_IN_KB,
+                                                               leaderMB * MB_IN_KB, replicationKBps);
+      throttleMBByRound.add((double) throttle / MB_IN_BYTES);
+    }
+    return throttleMBByRound;
   }
 
   @Test
@@ -348,6 +377,112 @@ public class ConcurrencyAdjusterTest {
     assertEquals(200.0, recommendedReplicationThrottleInMB(200.0, 1000.0, 0.0, 200.0), delta);
     // Headroom: 0.8 * 100 - (10 + 70 - 70) = 70 MB/sec, which is equal to the current throttle. No change.
     assertEquals(70.0, recommendedReplicationThrottleInMB(70.0, 100.0, 10.0, 70.0), delta);
+  }
+
+  @Test
+  public void testReplicationThrottleAdjustmentForStalledMovement() {
+    // A broker with 100 MB/sec network capacity, 20 MB/sec client traffic and 10 MB/sec other replication traffic is the destination
+    // of movements whose partitions are written at 35 MB/sec, but its follower throttle is 5 MB/sec: the movements are stalled.
+    // Headroom: 0.8 * 100 - (20 + 10) = 50 MB/sec.
+    double writeRateMB = 35.0;
+    // The movements need 35 * (1 + 0.2) = 42 MB/sec.
+    double neededMB = writeRateMB * (1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN);
+
+    // Without the needed throttle, the throttle is increased by the additive increase per round, so it exceeds the write rate only
+    // after 4 rounds (i.e. 24 minutes with the default concurrency adjuster interval of 6 minutes), and stops at the headroom.
+    List<Double> throttleMBByRound = simulateStalledMovementThrottleInMB(5.0, 0.0, 100.0, 10.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0);
+    assertThrottlesInMB(List.of(15.0, 25.0, 35.0, 45.0, 50.0, 50.0), throttleMBByRound);
+    assertTrue(throttleMBByRound.get(2) <= writeRateMB && throttleMBByRound.get(3) > writeRateMB);
+
+    // With the needed throttle, the throttle is increased to the needed throttle at once, then by the additive increase up to the
+    // headroom, as long as the throttle limits the movements.
+    throttleMBByRound = simulateStalledMovementThrottleInMB(5.0, neededMB, 100.0, 10.0, 20.0, 20.0, 20.0);
+    assertEquals(neededMB, throttleMBByRound.get(0), 1e-3);
+    assertTrue(throttleMBByRound.get(0) > writeRateMB);
+    assertThrottlesInMB(List.of(50.0, 50.0), throttleMBByRound.subList(1, 3));
+
+    // Network wins: if the client traffic rises to 60 MB/sec, the throttle is decreased at once to the new headroom -- i.e.
+    // 0.8 * 100 - (60 + 10) = 10 MB/sec, even below the needed throttle.
+    throttleMBByRound = simulateStalledMovementThrottleInMB(5.0, neededMB, 100.0, 10.0, 20.0, 20.0, 60.0, 60.0);
+    assertThrottlesInMB(List.of(50.0, 10.0, 10.0), throttleMBByRound.subList(1, 4));
+
+    // Network wins: without headroom (0.8 * 100 - (70 + 10) = 0 MB/sec), the throttle is decreased to the minimum throttle despite
+    // the needed throttle, so the movements remain stalled.
+    throttleMBByRound = simulateStalledMovementThrottleInMB(5.0, neededMB, 100.0, 10.0, 70.0, 70.0, 70.0);
+    assertThrottlesInMB(List.of(1.0, 1.0, 1.0), throttleMBByRound);
+
+    // The needed throttle never exceeds the maximum throttle: movements written at 150 MB/sec need 180 MB/sec, but the throttle stops
+    // at 100 MB/sec despite 800 MB/sec headroom.
+    throttleMBByRound = simulateStalledMovementThrottleInMB(50.0, 150.0 * (1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN), 1000.0, 0.0,
+                                                            0.0, 0.0, 0.0);
+    assertThrottlesInMB(List.of(100.0, 100.0, 100.0), throttleMBByRound);
+
+    // The needed throttle raises a throttle that is below the minimum throttle.
+    throttleMBByRound = simulateStalledMovementThrottleInMB(0.5, 6.0, 100.0, 0.0, 10.0);
+    assertThrottlesInMB(List.of(6.0), throttleMBByRound);
+  }
+
+  @Test
+  public void testNeededReplicationThrottles() {
+    TopicPartition tp0 = new TopicPartition(TOPIC1, 0);
+    TopicPartition tp1 = new TopicPartition(TOPIC1, 1);
+    TopicPartition tp2 = new TopicPartition(TOPIC1, 2);
+    TopicPartition tp3 = new TopicPartition(TOPIC1, 3);
+    ReplicaPlacementInfo[] r = new ReplicaPlacementInfo[6];
+    for (int brokerId = 0; brokerId < r.length; brokerId++) {
+      r[brokerId] = new ReplicaPlacementInfo(brokerId);
+    }
+    // tp0 (10 MB/sec): broker 0 (leader) -> one new replica on broker 2.
+    ExecutionTask task0 = inProgressTask(0L, new ExecutionProposal(tp0, 0, r[0], List.of(r[0], r[1]), List.of(r[0], r[2])),
+                                         ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
+    // tp1 (5 MB/sec): broker 0 (leader) -> three new replicas on brokers 3, 4 and 5.
+    ExecutionTask task1 = inProgressTask(1L, new ExecutionProposal(tp1, 0, r[0], List.of(r[0], r[1], r[2]), List.of(r[3], r[4], r[5])),
+                                         ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
+    // tp2 (40 MB/sec): pending inter-broker replica movement, and in-progress leadership movement. Both are ignored.
+    ExecutionProposal tp2Proposal = new ExecutionProposal(tp2, 0, r[1], List.of(r[1], r[2]), List.of(r[2], r[3]));
+    ExecutionTask task2 = new ExecutionTask(2L, tp2Proposal, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, MOCK_TIME_MS);
+    ExecutionTask task3 = inProgressTask(3L, tp2Proposal, ExecutionTask.TaskType.LEADER_ACTION);
+    // tp3: write rate is unknown. Ignored.
+    ExecutionTask task4 = inProgressTask(4L, new ExecutionProposal(tp3, 0, r[1], List.of(r[1]), List.of(r[4])),
+                                         ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
+
+    short leaderBytesInId = KafkaMetricDef.commonMetricDefId(KafkaMetricDef.LEADER_BYTES_IN);
+    short replicationBytesInId = KafkaMetricDef.commonMetricDefId(KafkaMetricDef.REPLICATION_BYTES_IN_RATE);
+    Map<PartitionEntity, ValuesAndExtrapolations> currentMetricsByPartition = Map.of(
+        new PartitionEntity(tp0), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 10 * MB_IN_KB)),
+        new PartitionEntity(tp1), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 5 * MB_IN_KB)),
+        new PartitionEntity(tp2), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 40 * MB_IN_KB)),
+        new PartitionEntity(tp3), buildValuesAndExtrapolations(Map.of(replicationBytesInId, 1.0)));
+    Map<TopicPartition, Double> writeRateKBpsByPartition = ExecutionUtils.partitionWriteRatesKBps(currentMetricsByPartition);
+    assertEquals(Map.of(tp0, 10 * MB_IN_KB, tp1, 5 * MB_IN_KB, tp2, 40 * MB_IN_KB), writeRateKBpsByPartition);
+
+    Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
+    Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
+    ExecutionUtils.neededReplicationThrottles(List.of(task0, task1, task2, task3, task4), writeRateKBpsByPartition,
+                                              neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+    double margin = 1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN;
+    // Broker 0 serves one new replica of tp0 and three new replicas of tp1: (10 + 3 * 5) * 1.2 = 30 MB/sec.
+    assertEquals(Set.of(0), neededLeaderThrottleByBroker.keySet());
+    assertEquals(25 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
+    // Brokers 2 (tp0) and 3, 4, 5 (tp1) fetch a new replica each.
+    assertEquals(Set.of(2, 3, 4, 5), neededFollowerThrottleByBroker.keySet());
+    assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(2), 1.0);
+    for (int brokerId = 3; brokerId <= 5; brokerId++) {
+      assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(brokerId), 1.0);
+    }
+  }
+
+  private static void assertThrottlesInMB(List<Double> expectedThrottleMBs, List<Double> actualThrottleMBs) {
+    assertEquals(expectedThrottleMBs.size(), actualThrottleMBs.size());
+    for (int i = 0; i < expectedThrottleMBs.size(); i++) {
+      assertEquals("Throttle after round " + (i + 1), expectedThrottleMBs.get(i), actualThrottleMBs.get(i), 1e-3);
+    }
+  }
+
+  private static ExecutionTask inProgressTask(long executionId, ExecutionProposal proposal, ExecutionTask.TaskType type) {
+    ExecutionTask task = new ExecutionTask(executionId, proposal, type, MOCK_TIME_MS);
+    task.inProgress(MOCK_TIME_MS);
+    return task;
   }
 
   @Test
@@ -411,6 +546,8 @@ public class ConcurrencyAdjusterTest {
                       Integer.toString(MOCK_MD_REPLICATION_THROTTLE));
     props.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_CONFIG,
                       Double.toString(MOCK_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION));
+    props.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG,
+                      Double.toString(MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN));
 
     return props;
   }
