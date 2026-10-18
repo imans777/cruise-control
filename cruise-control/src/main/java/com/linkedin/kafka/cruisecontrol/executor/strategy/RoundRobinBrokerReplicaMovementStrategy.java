@@ -20,6 +20,11 @@ import org.apache.kafka.common.Cluster;
  *   <li>Treats every broker hosting a replica of the partition, before or after the movement, as involved in the movement
  *   when choosing movements to start together. Hence, a broker that is not the leader or a destination of a movement
  *   (e.g. a follower whose replica is being removed) is not picked for another movement in the same round.</li>
+ *   <li>If the execution has a replication throttle, starts a movement only if the replication throttle of its source and
+ *   destination brokers can carry the write rates of the movements in progress on them plus the write rate of the partition,
+ *   increased by {@code replica.movement.throttle.write.rate.margin}, unless no movement is in progress on them. Hence, cooler
+ *   partitions fill the replication throttle of a broker first, and a partition with a write rate higher than the throttle
+ *   starts alone rather than wait forever. Otherwise, movements whose combined write rate exceeds the throttle never catch up.</li>
  * </ul>
  * This strategy does not change the order of tasks within a broker, which is determined by the other chained strategies.
  */
