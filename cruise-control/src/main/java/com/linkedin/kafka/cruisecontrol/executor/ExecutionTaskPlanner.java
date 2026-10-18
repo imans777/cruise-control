@@ -141,35 +141,29 @@ public class ExecutionTaskPlanner {
     maybeAddInterBrokerReplicaMovementTasks(proposals, strategyOptions, replicaMovementStrategy);
     maybeAddIntraBrokerReplicaMovementTasks(proposals);
     maybeAddLeaderChangeTasks(proposals, strategyOptions.cluster());
-    sanityCheckExecutionTasks();
     maybeDropReplicaSwapTasks();
   }
 
   /**
-   * Sanity check that if there is any intra-broker partition movement task generated, no inter-broker partition movement task
-   * is generated.
-   */
-  private void sanityCheckExecutionTasks() {
-    if (_remainingIntraBrokerReplicaMovements.size() > 0) {
-      for (ExecutionTask task : _remainingInterBrokerReplicaMovements) {
-        if (task.proposal().replicasToAdd().size() > 0) {
-          throw new IllegalStateException("Intra-broker partition movement should not mingle with inter-broker partition movement.");
-        }
-      }
-    }
-  }
-
-  /**
    * If there is any intra-broker partition movement task generated, any inter-broker replica swap operation is cancelled.
-   * The reason to do this is because disk rebalance goals may generate some inter-broker replica swap operations.
+   * The reason to do this is because disk rebalance goals may generate some inter-broker replica swap operations -- i.e.
+   * tasks that only change the order of the replicas of a partition.
    * These swap operations do not improve the disk load balance but bring a potential risk of hang in execution(if the cluster
    * has some dead disks and the generated swap operation involves offline replica).
+   * Inter-broker replica movement tasks that add or remove replicas, or that are needed to move the leadership of a partition
+   * to another broker (i.e. by making the new leader the first replica of the partition) are kept. This lets inter-broker and
+   * intra-broker replica movements run in a single execution (e.g. if both inter-broker and intra-broker goals are optimized).
    */
   private void maybeDropReplicaSwapTasks() {
-    if (_remainingIntraBrokerReplicaMovements.size() > 0) {
-      _interPartMoveTasksByBrokerId.clear();
-      _remainingInterBrokerReplicaMovements.clear();
+    if (_remainingIntraBrokerReplicaMovements.isEmpty()) {
+      return;
     }
+    List<ExecutionTask> replicaSwapTasks = _remainingInterBrokerReplicaMovements.stream().filter(task -> {
+      ExecutionProposal proposal = task.proposal();
+      return proposal.replicasToAdd().isEmpty() && proposal.replicasToRemove().isEmpty()
+             && proposal.oldLeader().brokerId().equals(proposal.newLeader().brokerId());
+    }).collect(Collectors.toList());
+    replicaSwapTasks.forEach(this::removeInterBrokerReplicaActionForExecution);
   }
 
   /**

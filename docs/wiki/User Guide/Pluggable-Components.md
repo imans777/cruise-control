@@ -18,6 +18,8 @@ The broker Capacity Config Resolver is the way for Cruise Control to get the bro
 ## Goals
 The goals in Kafka Cruise Control are pluggable with different priorities.
 
+Intra-broker goals (i.e. goals in `intra.broker.goals`, such as `IntraBrokerDiskCapacityGoal` and `IntraBrokerDiskUsageDistributionGoal`) balance the disks of each broker. Besides being used with `rebalance_disk=true`, they can be listed after all the inter-broker goals of a goal list to balance both the brokers and the disks of each broker in a single [rebalance](https://github.com/linkedin/cruise-control/wiki/REST-APIs#trigger-a-workload-balance).
+
 * **Rack-awareness**: A goal that ensures all the replicas of each partition are assigned in a rack aware manner.
 
  * **RackAwareDistributionGoal** - Contrary to `RackAwareGoal`, as long as replicas of each partition can achieve a perfectly

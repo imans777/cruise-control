@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import org.apache.kafka.common.TopicPartitionReplica;
 import org.easymock.EasyMock;
 import org.junit.Test;
@@ -468,9 +469,87 @@ public class ExecutionTaskPlannerTest {
     planner.addExecutionProposals(proposals, strategyOptions, null);
     assertEquals(1, planner.remainingLeadershipMovements().size());
     assertEquals(2, planner.remainingIntraBrokerReplicaMovements().size());
+    // The inter-broker replica movement task that makes the new leader the first replica is needed for the leadership movement.
+    assertEquals(1, planner.remainingInterBrokerReplicaMovements().size());
     planner.clear();
     assertEquals(0, planner.remainingLeadershipMovements().size());
     assertEquals(0, planner.remainingIntraBrokerReplicaMovements().size());
+    EasyMock.verify(mockAdminClient);
+  }
+
+  @Test
+  public void testInterBrokerAndIntraBrokerReplicaMovementTasks() throws Exception {
+    ReplicaPlacementInfo r0d0 = new ReplicaPlacementInfo(0, "d0");
+    ReplicaPlacementInfo r0d1 = new ReplicaPlacementInfo(0, "d1");
+    ReplicaPlacementInfo r1d0 = new ReplicaPlacementInfo(1, "d0");
+    ReplicaPlacementInfo r2d0 = new ReplicaPlacementInfo(2, "d0");
+    ReplicaPlacementInfo r2d1 = new ReplicaPlacementInfo(2, "d1");
+    ReplicaPlacementInfo r3d0 = new ReplicaPlacementInfo(3, "d0");
+    ReplicaPlacementInfo r3d1 = new ReplicaPlacementInfo(3, "d1");
+    // Moves the replica on broker 1 to broker 2, and the replica on broker 0 to another disk.
+    ExecutionProposal interAndIntraBrokerMovement =
+        new ExecutionProposal(new TopicPartition(TOPIC2, 0), 10, r0d0, List.of(r0d0, r1d0), List.of(r0d1, r2d1));
+    // Moves the replica on broker 2 to broker 3.
+    ExecutionProposal interBrokerMovement =
+        new ExecutionProposal(new TopicPartition(TOPIC2, 1), 10, r1d0, List.of(r1d0, r2d0), List.of(r1d0, r3d1));
+    // Moves the replica on broker 2 to another disk.
+    ExecutionProposal intraBrokerMovement =
+        new ExecutionProposal(new TopicPartition(TOPIC2, 2), 10, r2d0, List.of(r2d0, r3d0), List.of(r2d1, r3d0));
+    // Moves the replica on broker 0 to another disk, and makes the current leader (i.e. broker 3) the first replica.
+    ExecutionProposal intraBrokerMovementAndReplicaSwap =
+        new ExecutionProposal(new TopicPartition(TOPIC2, 3), 10, r3d0, List.of(r0d0, r3d0), List.of(r3d0, r0d1));
+    // Moves the replica on broker 2 to another disk, and the leadership from broker 1 to broker 2.
+    ExecutionProposal intraBrokerAndLeaderMovement =
+        new ExecutionProposal(new TopicPartition(TOPIC2, 4), 10, r1d0, List.of(r1d0, r2d0), List.of(r2d1, r1d0));
+    List<ExecutionProposal> proposals = List.of(interAndIntraBrokerMovement, interBrokerMovement, intraBrokerMovement,
+                                                intraBrokerMovementAndReplicaSwap, intraBrokerAndLeaderMovement);
+
+    // Mock the current logdirs of the replicas to move between disks.
+    Constructor<DescribeReplicaLogDirsResult> describeReplicaLogDirsResultConstructor =
+        DescribeReplicaLogDirsResult.class.getDeclaredConstructor(Map.class);
+    describeReplicaLogDirsResultConstructor.setAccessible(true);
+    Constructor<ReplicaLogDirInfo> replicaLogDirInfoConstructor =
+        ReplicaLogDirInfo.class.getDeclaredConstructor(String.class, long.class, String.class, long.class);
+    replicaLogDirInfoConstructor.setAccessible(true);
+    Map<TopicPartitionReplica, KafkaFuture<ReplicaLogDirInfo>> logdirInfoByReplica = new HashMap<>();
+    for (ExecutionProposal proposal : proposals) {
+      for (int brokerId : proposal.replicasToMoveBetweenDisksByBroker().keySet()) {
+        logdirInfoByReplica.put(new TopicPartitionReplica(proposal.topic(), proposal.partitionId(), brokerId),
+                                completedFuture(replicaLogDirInfoConstructor.newInstance("d0", 0L, null, -1L)));
+      }
+    }
+    AdminClient mockAdminClient = EasyMock.mock(AdminClient.class);
+    EasyMock.expect(mockAdminClient.describeReplicaLogDirs(anyObject()))
+            .andReturn(describeReplicaLogDirsResultConstructor.newInstance(logdirInfoByReplica))
+            .once();
+    EasyMock.replay(mockAdminClient);
+
+    Set<PartitionInfo> partitions = new HashSet<>();
+    for (ExecutionProposal proposal : proposals) {
+      Node[] replicas = generateExpectedReplicas(proposal);
+      Node leader = new Node(proposal.oldLeader().brokerId(), "null", -1);
+      partitions.add(new PartitionInfo(proposal.topic(), proposal.partitionId(), leader, replicas, replicas));
+    }
+    Cluster cluster = new Cluster(null, _expectedNodes, partitions, Collections.emptySet(), Collections.emptySet());
+
+    ExecutionTaskPlanner planner =
+        new ExecutionTaskPlanner(mockAdminClient, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
+    planner.addExecutionProposals(proposals, new StrategyOptions.Builder(cluster).build(), null);
+
+    // Only the replica swap -- i.e. reordering the replicas without moving replicas between brokers or moving the leadership --
+    // is dropped from inter-broker replica movements.
+    assertEquals(Set.of(interAndIntraBrokerMovement, interBrokerMovement, intraBrokerAndLeaderMovement),
+                 planner.remainingInterBrokerReplicaMovements().stream().map(ExecutionTask::proposal).collect(Collectors.toSet()));
+    assertEquals(Set.of(interAndIntraBrokerMovement, intraBrokerMovement, intraBrokerMovementAndReplicaSwap, intraBrokerAndLeaderMovement),
+                 planner.remainingIntraBrokerReplicaMovements().stream().map(ExecutionTask::proposal).collect(Collectors.toSet()));
+    assertEquals(Set.of(intraBrokerAndLeaderMovement),
+                 planner.remainingLeadershipMovements().stream().map(ExecutionTask::proposal).collect(Collectors.toSet()));
+
+    Map<Integer, Integer> readyBrokers = new HashMap<>(Map.of(0, 5, 1, 5, 2, 5, 3, 5));
+    List<ExecutionTask> interBrokerTasks =
+        planner.getInterBrokerReplicaMovementTasks(readyBrokers, Collections.emptySet(), _defaultPartitionsMaxCap);
+    assertEquals(Set.of(interAndIntraBrokerMovement, interBrokerMovement, intraBrokerAndLeaderMovement),
+                 interBrokerTasks.stream().map(ExecutionTask::proposal).collect(Collectors.toSet()));
     EasyMock.verify(mockAdminClient);
   }
 
