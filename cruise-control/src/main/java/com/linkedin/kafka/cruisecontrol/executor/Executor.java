@@ -22,7 +22,6 @@ import com.codahale.metrics.Gauge;
 import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.Timer;
 import com.google.common.util.concurrent.AtomicDouble;
-import com.linkedin.cruisecontrol.monitor.sampling.aggregator.MetricValues;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.ValuesAndExtrapolations;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils;
 import com.linkedin.kafka.cruisecontrol.common.MetadataAdminClient;
@@ -50,7 +49,6 @@ import com.linkedin.kafka.cruisecontrol.servlet.UserTaskManager;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -167,6 +165,7 @@ public class Executor {
   private final long _minExecutionProgressCheckIntervalMs;
   private final long _slowTaskAlertingBackoffTimeMs;
   private final double _replicaMovementThrottleWriteRateMargin;
+  private final long _metricSamplingIntervalMs;
   private final KafkaCruiseControlConfig _config;
   private final AtomicDouble _partitionMovementCountPerSec;
   private final AtomicDouble _partitionMovementMbPerSec;
@@ -256,6 +255,7 @@ public class Executor {
     _minExecutionProgressCheckIntervalMs = config.getLong(ExecutorConfig.MIN_EXECUTION_PROGRESS_CHECK_INTERVAL_MS_CONFIG);
     _slowTaskAlertingBackoffTimeMs = config.getLong(ExecutorConfig.SLOW_TASK_ALERTING_BACKOFF_TIME_MS_CONFIG);
     _replicaMovementThrottleWriteRateMargin = config.getDouble(ExecutorConfig.REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG);
+    _metricSamplingIntervalMs = config.getLong(MonitorConfig.METRIC_SAMPLING_INTERVAL_MS_CONFIG);
     _concurrencyAdjusterEnabled = new ConcurrentHashMap<>(ConcurrencyType.cachedValues().size());
     _concurrencyAdjusterEnabled.put(ConcurrencyType.INTER_BROKER_REPLICA,
                                     config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_INTER_BROKER_REPLICA_ENABLED_CONFIG));
@@ -1794,6 +1794,7 @@ public class Executor {
     private final Set<Integer> _recentlyDemotedBrokers;
     private final Set<Integer> _recentlyRemovedBrokers;
     private final Long _replicationThrottle;
+    private final PartitionWriteRateCache _partitionWriteRateCache;
     private Throwable _executionException;
     private final boolean _isTriggeredByUserRequest;
     private long _lastSlowTaskReportingTimeMs;
@@ -1810,6 +1811,8 @@ public class Executor {
                               Long replicationThrottle,
                               boolean isTriggeredByUserRequest) {
       _loadMonitor = loadMonitor;
+      _partitionWriteRateCache = new PartitionWriteRateCache(_time, _metricSamplingIntervalMs,
+                                                             () -> _loadMonitor.currentPartitionMetricValues());
       _demotedBrokers = demotedBrokers;
       _removedBrokers = removedBrokers;
       _executionException = null;
@@ -2127,6 +2130,7 @@ public class Executor {
     }
 
     private void interBrokerMoveReplicas() throws InterruptedException, ExecutionException, TimeoutException {
+      _partitionWriteRateCache.reset();
       Set<Integer> currentDeadBrokersWithReplicas = _loadMonitor.deadBrokersWithReplicas(MAX_METADATA_WAIT_MS);
       ReplicationThrottleHelper throttleHelper;
       if (_replicationThrottle == null && _replicationThrottleAdjusterEnabled) {
@@ -2275,7 +2279,8 @@ public class Executor {
 
     /**
      * Get the replication throttle budget of brokers based on the inter-broker replica movements in progress and the current
-     * write rate of partitions, which is used if the replica movement strategy contains RoundRobinBrokerReplicaMovementStrategy.
+     * write rate of partitions, which is used if the replica movement strategy contains
+     * ThrottleAwareRoundRobinBrokerReplicaMovementStrategy.
      *
      * @return The replication throttle budget of brokers, or {@code null} if the execution has no replication throttle or does
      * not pick brokers in a round-robin manner.
@@ -2284,18 +2289,21 @@ public class Executor {
       if (_replicationThrottle == null || !_executionTaskManager.isRoundRobinBrokers()) {
         return null;
       }
-      short leaderBytesInId = KafkaMetricDef.commonMetricDefId(KafkaMetricDef.LEADER_BYTES_IN);
-      Map<TopicPartition, Double> writeRateByPartition = new HashMap<>();
-      for (Map.Entry<PartitionEntity, ValuesAndExtrapolations> entry : _loadMonitor.currentPartitionMetricValues().entrySet()) {
-        MetricValues leaderBytesIn = entry.getValue().metricValues().valuesFor(leaderBytesInId);
-        if (leaderBytesIn != null) {
-          // The metric value is in KB/s.
-          writeRateByPartition.put(entry.getKey().tp(), leaderBytesIn.latest() * 1024.0);
-        }
-      }
+      Cluster cluster = _metadataClient.cluster();
       return new ReplicationThrottleBudget(_executionTaskManager.inExecutionTasks(Collections.singleton(INTER_BROKER_REPLICA_ACTION)),
-                                           writeRateByPartition, brokerId -> _replicationThrottle, brokerId -> _replicationThrottle,
+                                           _partitionWriteRateCache.writeRatesInBytesPerSec(), task -> currentLeader(cluster, task),
+                                           brokerId -> _replicationThrottle, brokerId -> _replicationThrottle,
                                            _replicaMovementThrottleWriteRateMargin);
+    }
+
+    /**
+     * @param cluster The cluster metadata.
+     * @param task Inter-broker replica movement task.
+     * @return The current leader of the partition of the given task, or {@code null} if unknown.
+     */
+    private Integer currentLeader(Cluster cluster, ExecutionTask task) {
+      Node leader = cluster.leaderFor(task.proposal().topicPartition());
+      return leader != null ? leader.id() : null;
     }
 
     /**
