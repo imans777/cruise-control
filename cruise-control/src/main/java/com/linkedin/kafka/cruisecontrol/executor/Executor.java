@@ -148,6 +148,7 @@ public class Executor {
   private final ConcurrentMap<ConcurrencyType, Boolean> _concurrencyAdjusterEnabled;
   private volatile boolean _concurrencyAdjusterMinIsrCheckEnabled;
   private volatile boolean _replicationThrottleAdjusterEnabled;
+  private final boolean _replicationThrottleMinIsrCheckEnabled;
   // The replication throttle helper of the ongoing inter-broker replica movements (if any).
   private volatile ReplicationThrottleHelper _replicationThrottleHelper;
   private final TopicMinIsrCache _topicMinIsrCache;
@@ -252,6 +253,8 @@ public class Executor {
     _concurrencyAdjusterEnabled.put(ConcurrencyType.INTRA_BROKER_REPLICA, false);
     _concurrencyAdjusterMinIsrCheckEnabled = config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG);
     _replicationThrottleAdjusterEnabled = config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_CONFIG);
+    _replicationThrottleMinIsrCheckEnabled =
+        config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG);
     _replicationThrottleHelper = null;
     _concurrencyAdjusterExecutor = Executors.newSingleThreadScheduledExecutor(
         new KafkaCruiseControlThreadFactory(ConcurrencyAdjuster.class.getSimpleName()));
@@ -488,6 +491,8 @@ public class Executor {
     private volatile boolean _started;
     // Broker capacities used for replication throttle adjustment, cached for the ongoing execution.
     private ClusterModel _clusterCapacity;
+    // The last known write rate (KB/sec) of partitions used for replication throttle adjustment, kept for the ongoing execution.
+    private final Map<TopicPartition, Double> _lastKnownWriteRateKBpsByPartition = new HashMap<>();
 
     public ConcurrencyAdjuster(int numMinIsrCheck) {
       _numMinIsrCheck = numMinIsrCheck;
@@ -529,6 +534,7 @@ public class Executor {
     public synchronized void clearAdjustment() {
       _started = false;
       _clusterCapacity = null;
+      _lastKnownWriteRateKBpsByPartition.clear();
       _executionConcurrencyManager.reset();
     }
 
@@ -685,6 +691,25 @@ public class Executor {
     }
 
     /**
+     * Get the brokers whose replication throttles should be decreased because they host a replica of an (At/Under)MinISR partition
+     * without offline replicas. This check is independent of {@link ExecutorConfig#CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG},
+     * and only affects the brokers hosting such partitions -- i.e. it never stops the execution.
+     *
+     * @return The brokers whose replication throttles should be decreased, or an empty set if
+     * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG} is disabled.
+     */
+    private Set<Integer> brokersWithMinIsrPartitionsForThrottle() {
+      if (!_replicationThrottleMinIsrCheckEnabled) {
+        return Collections.emptySet();
+      }
+      Cluster cluster = _loadMonitor.kafkaCluster();
+      Set<String> topicsToCheck = new HashSet<>(cluster.topics());
+      topicsToCheck.removeAll(_topicMinIsrCache.minIsrWithTimeByTopic().keySet());
+      maybeRetrieveAndCacheTopicMinIsr(topicsToCheck);
+      return brokersHostingMinIsrPartitions(cluster, _topicMinIsrCache.minIsrWithTimeByTopic());
+    }
+
+    /**
      * Get the cluster capacity, which is cached for the ongoing execution and refreshed if it misses any of the given brokers.
      *
      * @param brokerIds Ids of brokers whose capacity is needed.
@@ -705,8 +730,11 @@ public class Executor {
      * Adjust the leader and follower replication throttles of the brokers that are throttled by the ongoing inter-broker replica
      * movements. For each such broker:
      * <ul>
-     *   <li>Decrease its throttles multiplicatively if (1) (At/Under)MinISR-based check recommends decreasing concurrency on the
-     *   broker or stopping the execution, or (2) its metrics are unavailable or violate any concurrency adjuster limit.</li>
+     *   <li>Decrease its throttles multiplicatively if (1) it hosts a replica of an (At/Under)MinISR partition without offline
+     *   replicas -- see {@link #brokersWithMinIsrPartitionsForThrottle()}, or (2) its metrics violate any concurrency adjuster
+     *   limit.</li>
+     *   <li>Leave its throttles unchanged if its metrics in the current metric window are unavailable -- e.g. right after the
+     *   metric window rolls.</li>
      *   <li>Otherwise, move its follower (leader) throttle towards its inbound (outbound) network headroom, and raise it at once to
      *   the throttle needed by the write rate of the partitions being moved to (from) the broker if the headroom allows -- see
      *   {@link ExecutionUtils#recommendedReplicationThrottle(long, long, double, double, double)}.</li>
@@ -726,9 +754,7 @@ public class Executor {
         return;
       }
 
-      ConcurrencyAdjustingRecommendation minIsrRecommendation = minIsrBasedConcurrency();
-      Set<Integer> brokersToDecreaseThrottle = minIsrRecommendation.shouldStopExecution()
-                                               ? throttledBrokers : minIsrRecommendation.getBrokersToDecreaseConcurrency();
+      Set<Integer> brokersToDecreaseThrottle = brokersWithMinIsrPartitionsForThrottle();
       Map<Integer, ValuesAndExtrapolations> currentMetricsByBrokerId = new HashMap<>();
       Map<String, StringBuilder> overLimitDetailsByMetricName = new HashMap<>();
       Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
@@ -736,8 +762,10 @@ public class Executor {
       ClusterModel clusterCapacity = null;
       if (canRunMetricsBasedCheck) {
         clusterCapacity = clusterCapacity(throttledBrokers);
-        Map<TopicPartition, Double> writeRateKBpsByPartition = partitionWriteRatesKBps(_loadMonitor.currentPartitionMetricValues());
-        neededReplicationThrottles(inExecutionTasks(), writeRateKBpsByPartition, neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+        Map<TopicPartition, Double> writeRateKBpsByPartition = partitionWriteRatesKBps(_loadMonitor.currentPartitionMetricValues(),
+                                                                                       _lastKnownWriteRateKBpsByPartition);
+        neededReplicationThrottles(inExecutionTasks(), writeRateKBpsByPartition, _metadataClient.cluster(), neededLeaderThrottleByBroker,
+                                   neededFollowerThrottleByBroker);
         for (Map.Entry<BrokerEntity, ValuesAndExtrapolations> entry : _loadMonitor.currentBrokerMetricValues().entrySet()) {
           currentMetricsByBrokerId.put(entry.getKey().brokerId(), entry.getValue());
         }
@@ -759,10 +787,13 @@ public class Executor {
           reason = "(At/Under)MinISR partitions";
         } else if (!canRunMetricsBasedCheck) {
           continue;
+        } else if (!hasValidCurrentWindowValues(currentMetrics)) {
+          LOG.debug("Skip replication throttle adjustment for broker {} due to unavailable metrics in the current metric window.", brokerId);
+          continue;
         } else if (!withinConcurrencyAdjusterLimit(brokerId, currentMetrics, overLimitDetailsByMetricName)) {
           newLeaderThrottle = decreasedReplicationThrottle(leaderThrottle);
           newFollowerThrottle = decreasedReplicationThrottle(followerThrottle);
-          reason = "broker metrics over the concurrency adjuster limit or unavailable";
+          reason = "broker metrics over the concurrency adjuster limit";
         } else {
           Broker broker = clusterCapacity == null ? null : clusterCapacity.broker(brokerId);
           Double leaderBytesIn = latestBrokerMetricValue(currentMetrics, KafkaMetricDef.LEADER_BYTES_IN);
