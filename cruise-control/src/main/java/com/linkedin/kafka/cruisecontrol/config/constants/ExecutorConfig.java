@@ -11,7 +11,7 @@ import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeLargeReplica
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeMinIsrWithOfflineReplicasStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeOneAboveMinIsrWithOfflineReplicasStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeSmallReplicaMovementStrategy;
-import com.linkedin.kafka.cruisecontrol.executor.strategy.RoundRobinBrokerReplicaMovementStrategy;
+import com.linkedin.kafka.cruisecontrol.executor.strategy.ThrottleAwareRoundRobinBrokerReplicaMovementStrategy;
 import java.util.StringJoiner;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.common.config.ConfigDef;
@@ -99,10 +99,11 @@ public final class ExecutorConfig {
    */
   public static final String REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG = "replica.movement.throttle.write.rate.margin";
   public static final double DEFAULT_REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN = 0.2;
-  public static final String REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_DOC = "The fraction by which the write rate of a "
-      + "partition is increased when checking whether the replication throttle of the source and destination brokers can carry "
-      + "it in addition to the write rates of the inter-broker replica movements in progress on them. Used by "
-      + RoundRobinBrokerReplicaMovementStrategy.class.getSimpleName() + " if the execution has a replication throttle.";
+  public static final String REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_DOC = "The fraction by which the write rates are "
+      + "increased when checking whether the replication throttle of the source and destination brokers can carry the write rate "
+      + "of a partition in addition to the write rates of the inter-broker replica movements in progress on them, i.e. a movement "
+      + "starts if (1 + margin) * (write rates in progress + write rate of the partition) <= throttle. Used by "
+      + ThrottleAwareRoundRobinBrokerReplicaMovementStrategy.class.getSimpleName() + " if the execution has a replication throttle.";
 
   /**
    * <code>replica.movement.strategies</code>
@@ -114,7 +115,7 @@ public final class ExecutorConfig {
       .add(PrioritizeSmallReplicaMovementStrategy.class.getName())
       .add(PrioritizeMinIsrWithOfflineReplicasStrategy.class.getName())
       .add(PrioritizeOneAboveMinIsrWithOfflineReplicasStrategy.class.getName())
-      .add(RoundRobinBrokerReplicaMovementStrategy.class.getName())
+      .add(ThrottleAwareRoundRobinBrokerReplicaMovementStrategy.class.getName())
       .add(BaseReplicaMovementStrategy.class.getName()).toString();
   public static final String REPLICA_MOVEMENT_STRATEGIES_DOC = "A list of supported strategies used to determine execution"
       + " order for generated partition movement tasks.";
