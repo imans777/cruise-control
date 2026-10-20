@@ -495,6 +495,10 @@ public class AnomalyDetectorManagerTest {
       assertTrue(executorService.awaitTermination(MOCK_ANOMALY_DETECTOR_SHUTDOWN_MS, TimeUnit.MILLISECONDS));
       AnomalyDetectorState anomalyDetectorState = anomalyDetectorManager.anomalyDetectorState();
       assertEquals((long) anomalyDetectorState.metrics().get(NUM_SELF_HEALING_STARTED), 1L);
+      // Self-healing started is counted only for the type of the fixed anomaly.
+      for (KafkaAnomalyType type : KafkaAnomalyType.cachedValues()) {
+        assertEquals(type == anomalyType ? 1L : 0L, anomalyDetectorState.numSelfHealingStarted(type));
+      }
       assertEquals(anomalyDetectorState.recentAnomaliesByType().get(KafkaAnomalyType.BROKER_FAILURE).size(), 0);
       assertEquals(anomalyDetectorState.recentAnomaliesByType().get(KafkaAnomalyType.GOAL_VIOLATION).size(),
                    anomalyType == KafkaAnomalyType.GOAL_VIOLATION ? 1 : 0);
