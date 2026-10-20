@@ -5,6 +5,7 @@
 package com.linkedin.kafka.cruisecontrol.executor;
 
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.AggregatedMetricValues;
+import com.linkedin.cruisecontrol.monitor.sampling.aggregator.Extrapolation;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.MetricValues;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.ValuesAndExtrapolations;
 import com.linkedin.kafka.cruisecontrol.common.TestConstants;
@@ -117,6 +118,17 @@ public class ConcurrencyAdjusterTest {
   }
 
   private static ValuesAndExtrapolations buildValuesAndExtrapolations(Map<Short, Double> metricValueById) {
+    return buildValuesAndExtrapolations(metricValueById, null);
+  }
+
+  /**
+   * Build the values and extrapolations of the current metric window with the given metric values.
+   *
+   * @param metricValueById Metric value by metric id.
+   * @param extrapolation The extrapolation of the current metric window, or {@code null} for no extrapolation.
+   * @return The values and extrapolations of the current metric window.
+   */
+  private static ValuesAndExtrapolations buildValuesAndExtrapolations(Map<Short, Double> metricValueById, Extrapolation extrapolation) {
     Map<Short, MetricValues> valuesByMetricId = new HashMap<>();
     for (Map.Entry<Short, Double> entry : metricValueById.entrySet()) {
       MetricValues currentMetricValues = new MetricValues(1);
@@ -125,7 +137,8 @@ public class ConcurrencyAdjusterTest {
       valuesByMetricId.put(entry.getKey(), currentMetricValues);
     }
     AggregatedMetricValues aggregatedMetricValues = new AggregatedMetricValues(valuesByMetricId);
-    ValuesAndExtrapolations currentValuesAndExtrapolations = new ValuesAndExtrapolations(aggregatedMetricValues, null);
+    Map<Integer, Extrapolation> extrapolations = extrapolation == null ? Collections.emptyMap() : Map.of(0, extrapolation);
+    ValuesAndExtrapolations currentValuesAndExtrapolations = new ValuesAndExtrapolations(aggregatedMetricValues, extrapolations);
     List<Long> windows = new ArrayList<>(1);
     windows.add(1L);
     currentValuesAndExtrapolations.setWindows(windows);
@@ -428,14 +441,17 @@ public class ConcurrencyAdjusterTest {
     TopicPartition tp1 = new TopicPartition(TOPIC1, 1);
     TopicPartition tp2 = new TopicPartition(TOPIC1, 2);
     TopicPartition tp3 = new TopicPartition(TOPIC1, 3);
+    TopicPartition tp4 = new TopicPartition(TOPIC1, 4);
     ReplicaPlacementInfo[] r = new ReplicaPlacementInfo[6];
+    Node[] nodes = new Node[6];
     for (int brokerId = 0; brokerId < r.length; brokerId++) {
       r[brokerId] = new ReplicaPlacementInfo(brokerId);
+      nodes[brokerId] = new Node(brokerId, "host" + brokerId, 100);
     }
     // tp0 (10 MB/sec): broker 0 (leader) -> one new replica on broker 2.
     ExecutionTask task0 = inProgressTask(0L, new ExecutionProposal(tp0, 0, r[0], List.of(r[0], r[1]), List.of(r[0], r[2])),
                                          ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
-    // tp1 (5 MB/sec): broker 0 (leader) -> three new replicas on brokers 3, 4 and 5.
+    // tp1 (5 MB/sec): broker 0 (old leader) -> three new replicas on brokers 3, 4 and 5. Its leadership has moved to broker 1.
     ExecutionTask task1 = inProgressTask(1L, new ExecutionProposal(tp1, 0, r[0], List.of(r[0], r[1], r[2]), List.of(r[3], r[4], r[5])),
                                          ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
     // tp2 (40 MB/sec): pending inter-broker replica movement, and in-progress leadership movement. Both are ignored.
@@ -445,6 +461,14 @@ public class ConcurrencyAdjusterTest {
     // tp3: write rate is unknown. Ignored.
     ExecutionTask task4 = inProgressTask(4L, new ExecutionProposal(tp3, 0, r[1], List.of(r[1]), List.of(r[4])),
                                          ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
+    // tp4 (2 MB/sec): broker 2 (old leader) -> one new replica on broker 5. Its current leader is unknown.
+    ExecutionTask task5 = inProgressTask(5L, new ExecutionProposal(tp4, 0, r[2], List.of(r[2]), List.of(r[2], r[5])),
+                                         ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
+    Cluster cluster = new Cluster("id", Arrays.asList(nodes),
+                                  Set.of(new PartitionInfo(TOPIC1, 0, nodes[0], new Node[]{nodes[0], nodes[1]}, new Node[]{nodes[0], nodes[1]}),
+                                         new PartitionInfo(TOPIC1, 1, nodes[1], new Node[]{nodes[0], nodes[1], nodes[2]},
+                                                           new Node[]{nodes[0], nodes[1], nodes[2]})),
+                                  Collections.emptySet(), Collections.emptySet());
 
     short leaderBytesInId = KafkaMetricDef.commonMetricDefId(KafkaMetricDef.LEADER_BYTES_IN);
     short replicationBytesInId = KafkaMetricDef.commonMetricDefId(KafkaMetricDef.REPLICATION_BYTES_IN_RATE);
@@ -452,24 +476,96 @@ public class ConcurrencyAdjusterTest {
         new PartitionEntity(tp0), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 10 * MB_IN_KB)),
         new PartitionEntity(tp1), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 5 * MB_IN_KB)),
         new PartitionEntity(tp2), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 40 * MB_IN_KB)),
-        new PartitionEntity(tp3), buildValuesAndExtrapolations(Map.of(replicationBytesInId, 1.0)));
-    Map<TopicPartition, Double> writeRateKBpsByPartition = ExecutionUtils.partitionWriteRatesKBps(currentMetricsByPartition);
-    assertEquals(Map.of(tp0, 10 * MB_IN_KB, tp1, 5 * MB_IN_KB, tp2, 40 * MB_IN_KB), writeRateKBpsByPartition);
+        new PartitionEntity(tp3), buildValuesAndExtrapolations(Map.of(replicationBytesInId, 1.0)),
+        new PartitionEntity(tp4), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 2 * MB_IN_KB)));
+    Map<TopicPartition, Double> writeRateKBpsByPartition = ExecutionUtils.partitionWriteRatesKBps(currentMetricsByPartition, new HashMap<>());
+    assertEquals(Map.of(tp0, 10 * MB_IN_KB, tp1, 5 * MB_IN_KB, tp2, 40 * MB_IN_KB, tp4, 2 * MB_IN_KB), writeRateKBpsByPartition);
 
     Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
     Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
-    ExecutionUtils.neededReplicationThrottles(List.of(task0, task1, task2, task3, task4), writeRateKBpsByPartition,
+    ExecutionUtils.neededReplicationThrottles(List.of(task0, task1, task2, task3, task4, task5), writeRateKBpsByPartition, cluster,
                                               neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
     double margin = 1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN;
-    // Broker 0 serves one new replica of tp0 and three new replicas of tp1: (10 + 3 * 5) * 1.2 = 30 MB/sec.
-    assertEquals(Set.of(0), neededLeaderThrottleByBroker.keySet());
-    assertEquals(25 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
-    // Brokers 2 (tp0) and 3, 4, 5 (tp1) fetch a new replica each.
+    // Leader throttle: broker 0 (current leader of tp0) serves one new replica of tp0, broker 1 (current leader of tp1) serves three
+    // new replicas of tp1, and broker 2 (old leader of tp4, whose current leader is unknown) serves one new replica of tp4.
+    assertEquals(Set.of(0, 1, 2), neededLeaderThrottleByBroker.keySet());
+    assertEquals(10 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
+    assertEquals(3 * 5 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(1), 1.0);
+    assertEquals(2 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(2), 1.0);
+    // Follower throttle: brokers 2 (tp0), 3, 4 (tp1) and 5 (tp1 and tp4) fetch new replicas.
     assertEquals(Set.of(2, 3, 4, 5), neededFollowerThrottleByBroker.keySet());
     assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(2), 1.0);
-    for (int brokerId = 3; brokerId <= 5; brokerId++) {
-      assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(brokerId), 1.0);
+    assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(3), 1.0);
+    assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(4), 1.0);
+    assertEquals((5 + 2) * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(5), 1.0);
+  }
+
+  @Test
+  public void testPartitionWriteRatesWithLastKnownFallback() {
+    TopicPartition tp0 = new TopicPartition(TOPIC1, 0);
+    TopicPartition tp1 = new TopicPartition(TOPIC1, 1);
+    TopicPartition tp2 = new TopicPartition(TOPIC1, 2);
+    TopicPartition tp3 = new TopicPartition(TOPIC1, 3);
+    short leaderBytesInId = KafkaMetricDef.commonMetricDefId(KafkaMetricDef.LEADER_BYTES_IN);
+    Map<TopicPartition, Double> lastKnownWriteRateKBpsByPartition = new HashMap<>(Map.of(tp1, 5.0, tp3, 7.0));
+
+    // tp0 has a valid write rate, which is recorded as its last known write rate. tp1 and tp2 have no sample in the current metric
+    // window yet (e.g. right after the metric window rolled): tp1 falls back to its last known write rate, tp2 has none. tp3 has no
+    // current metrics, so its last known write rate is kept.
+    Map<PartitionEntity, ValuesAndExtrapolations> currentMetricsByPartition = Map.of(
+        new PartitionEntity(tp0), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 10.0), Extrapolation.AVG_AVAILABLE),
+        new PartitionEntity(tp1), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 0.0), Extrapolation.NO_VALID_EXTRAPOLATION),
+        new PartitionEntity(tp2), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 0.0), Extrapolation.NO_VALID_EXTRAPOLATION));
+    assertEquals(Map.of(tp0, 10.0, tp1, 5.0, tp3, 7.0),
+                 ExecutionUtils.partitionWriteRatesKBps(currentMetricsByPartition, lastKnownWriteRateKBpsByPartition));
+    assertEquals(Map.of(tp0, 10.0, tp1, 5.0, tp3, 7.0), lastKnownWriteRateKBpsByPartition);
+
+    // tp0 has no sample in the next metric window yet, so it falls back to its last known write rate. tp1 has a valid write rate again.
+    currentMetricsByPartition = Map.of(
+        new PartitionEntity(tp0), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 0.0), Extrapolation.NO_VALID_EXTRAPOLATION),
+        new PartitionEntity(tp1), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 6.0)));
+    assertEquals(Map.of(tp0, 10.0, tp1, 6.0, tp3, 7.0),
+                 ExecutionUtils.partitionWriteRatesKBps(currentMetricsByPartition, lastKnownWriteRateKBpsByPartition));
+  }
+
+  @Test
+  public void testHasValidCurrentWindowValues() {
+    short leaderBytesInId = KafkaMetricDef.brokerMetricDef().metricInfo(KafkaMetricDef.LEADER_BYTES_IN.name()).id();
+    assertFalse(ExecutionUtils.hasValidCurrentWindowValues(null));
+    assertFalse(ExecutionUtils.hasValidCurrentWindowValues(buildValuesAndExtrapolations(Map.of(leaderBytesInId, 0.0),
+                                                                                        Extrapolation.NO_VALID_EXTRAPOLATION)));
+    assertTrue(ExecutionUtils.hasValidCurrentWindowValues(buildValuesAndExtrapolations(Map.of(leaderBytesInId, 1.0),
+                                                                                       Extrapolation.AVG_AVAILABLE)));
+    assertTrue(ExecutionUtils.hasValidCurrentWindowValues(buildValuesAndExtrapolations(Map.of(leaderBytesInId, 1.0))));
+  }
+
+  @Test
+  public void testBrokersHostingMinIsrPartitions() {
+    Node[] nodes = new Node[5];
+    for (int brokerId = 0; brokerId < nodes.length; brokerId++) {
+      nodes[brokerId] = new Node(brokerId, "host" + brokerId, 100);
     }
+    // TP1 on brokers 0 and 1 has one in-sync replica, TP2 on brokers 2 and 3 has two in-sync replicas, and TP3 on brokers 3 and 4 has
+    // one in-sync replica and an offline replica.
+    TopicPartition tp3 = new TopicPartition(TOPIC2, 1);
+    Cluster cluster = new Cluster("id", Arrays.asList(nodes),
+                                  Set.of(new PartitionInfo(TOPIC1, TP1.partition(), nodes[0], new Node[]{nodes[0], nodes[1]},
+                                                           new Node[]{nodes[0]}),
+                                         new PartitionInfo(TOPIC2, TP2.partition(), nodes[2], new Node[]{nodes[2], nodes[3]},
+                                                           new Node[]{nodes[2], nodes[3]}),
+                                         new PartitionInfo(TOPIC2, tp3.partition(), nodes[3], new Node[]{nodes[3], nodes[4]},
+                                                           new Node[]{nodes[3]}, new Node[]{nodes[4]})),
+                                  Collections.emptySet(), Collections.emptySet());
+
+    // TP1 is AtMinISR: only its brokers are affected.
+    assertEquals(Set.of(0, 1), ExecutionUtils.brokersHostingMinIsrPartitions(
+        cluster, Map.of(TOPIC1, new MinIsrWithTime((short) 1, MOCK_TIME_MS), TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS))));
+    // TP1 is UnderMinISR and TP2 is AtMinISR: only their brokers are affected. TP3 has an offline replica, so it is excluded.
+    assertEquals(Set.of(0, 1, 2, 3), ExecutionUtils.brokersHostingMinIsrPartitions(
+        cluster, Map.of(TOPIC1, new MinIsrWithTime((short) 2, MOCK_TIME_MS), TOPIC2, new MinIsrWithTime((short) 2, MOCK_TIME_MS))));
+    // Partitions of topics with unknown minISR are skipped.
+    assertTrue(ExecutionUtils.brokersHostingMinIsrPartitions(cluster, Map.of(TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS)))
+                             .isEmpty());
   }
 
   private static void assertThrottlesInMB(List<Double> expectedThrottleMBs, List<Double> actualThrottleMBs) {

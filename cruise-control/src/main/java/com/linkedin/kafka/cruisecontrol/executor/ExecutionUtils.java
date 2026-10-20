@@ -4,6 +4,7 @@
 
 package com.linkedin.kafka.cruisecontrol.executor;
 
+import com.linkedin.cruisecontrol.monitor.sampling.aggregator.Extrapolation;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.MetricValues;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.ValuesAndExtrapolations;
 import com.linkedin.kafka.cruisecontrol.common.TopicMinIsrCache.MinIsrWithTime;
@@ -179,21 +180,36 @@ public final class ExecutionUtils {
   }
 
   /**
-   * Get the write rate of the given partitions, i.e. the latest value of their {@link KafkaMetricDef#LEADER_BYTES_IN} metric.
+   * Check whether the given current metrics of an entity (i.e. metrics of the current metric window) have valid values. They do not if
+   * the entity has no metric sample in the current window yet -- e.g. right after the metric window rolls -- in which case all values
+   * are {@code 0}.
+   *
+   * @param currentMetrics Current metrics of an entity, or {@code null} if unavailable.
+   * @return {@code true} if the given current metrics have valid values, {@code false} otherwise.
+   */
+  static boolean hasValidCurrentWindowValues(@Nullable ValuesAndExtrapolations currentMetrics) {
+    return currentMetrics != null && currentMetrics.extrapolations().get(0) != Extrapolation.NO_VALID_EXTRAPOLATION;
+  }
+
+  /**
+   * Get the write rate of partitions, i.e. the latest value of their {@link KafkaMetricDef#LEADER_BYTES_IN} metric. If the current
+   * metrics of a partition have no valid values (see {@link #hasValidCurrentWindowValues}), its last known write rate is used.
    *
    * @param currentMetricsByPartition Current metrics of partitions.
-   * @return The write rate (KB/sec) by partition, for the partitions whose write rate is available.
+   * @param lastKnownWriteRateKBpsByPartition The last known write rate (KB/sec) by partition, which is updated with the valid write
+   *                                          rates of the given current metrics.
+   * @return The write rate (KB/sec) by partition, for the partitions whose write rate is valid or known.
    */
-  static Map<TopicPartition, Double> partitionWriteRatesKBps(Map<PartitionEntity, ValuesAndExtrapolations> currentMetricsByPartition) {
+  static Map<TopicPartition, Double> partitionWriteRatesKBps(Map<PartitionEntity, ValuesAndExtrapolations> currentMetricsByPartition,
+                                                             Map<TopicPartition, Double> lastKnownWriteRateKBpsByPartition) {
     short leaderBytesInId = KafkaMetricDef.commonMetricDefId(KafkaMetricDef.LEADER_BYTES_IN);
-    Map<TopicPartition, Double> writeRateKBpsByPartition = new HashMap<>();
     for (Map.Entry<PartitionEntity, ValuesAndExtrapolations> entry : currentMetricsByPartition.entrySet()) {
       MetricValues metricValues = entry.getValue().metricValues().valuesFor(leaderBytesInId);
-      if (metricValues != null) {
-        writeRateKBpsByPartition.put(entry.getKey().tp(), (double) metricValues.latest());
+      if (metricValues != null && hasValidCurrentWindowValues(entry.getValue())) {
+        lastKnownWriteRateKBpsByPartition.put(entry.getKey().tp(), (double) metricValues.latest());
       }
     }
-    return writeRateKBpsByPartition;
+    return new HashMap<>(lastKnownWriteRateKBpsByPartition);
   }
 
   /**
@@ -202,18 +218,21 @@ public final class ExecutionUtils {
    * write rate of the partitions being moved. A throttle below this rate stalls the movements, because the new replicas
    * cannot catch up with the leader. For a partition with write rate {@code w}:
    * <ul>
-   *   <li>Leader throttle: its old leader, which the new replicas fetch from, needs {@code w} for each replica to add.</li>
+   *   <li>Leader throttle: its current leader (or its old leader, if the current leader is unknown), which the new replicas fetch
+   *   from, needs {@code w} for each replica to add.</li>
    *   <li>Follower throttle: each broker to add a replica to needs {@code w}.</li>
    * </ul>
    * Tasks other than in-progress inter-broker replica movements, and partitions whose write rate is unknown, are ignored.
    *
    * @param tasks Execution tasks.
    * @param writeRateKBpsByPartition The write rate (KB/sec) by partition.
+   * @param cluster Kafka cluster, to get the current leader of partitions.
    * @param neededLeaderThrottleByBroker A map to populate with the leader throttle (bytes/sec) needed by each broker.
    * @param neededFollowerThrottleByBroker A map to populate with the follower throttle (bytes/sec) needed by each broker.
    */
   static void neededReplicationThrottles(Collection<ExecutionTask> tasks,
                                          Map<TopicPartition, Double> writeRateKBpsByPartition,
+                                         Cluster cluster,
                                          Map<Integer, Long> neededLeaderThrottleByBroker,
                                          Map<Integer, Long> neededFollowerThrottleByBroker) {
     Map<Integer, Double> leaderWriteRateKBpsByBroker = new HashMap<>();
@@ -227,7 +246,9 @@ public final class ExecutionUtils {
       if (writeRateKBps == null || proposal.replicasToAdd().isEmpty()) {
         continue;
       }
-      leaderWriteRateKBpsByBroker.merge(proposal.oldLeader().brokerId(), writeRateKBps * proposal.replicasToAdd().size(), Double::sum);
+      Node currentLeader = cluster.leaderFor(proposal.topicPartition());
+      int leader = currentLeader != null ? currentLeader.id() : proposal.oldLeader().brokerId();
+      leaderWriteRateKBpsByBroker.merge(leader, writeRateKBps * proposal.replicasToAdd().size(), Double::sum);
       proposal.replicasToAdd().forEach(r -> followerWriteRateKBpsByBroker.merge(r.brokerId(), writeRateKBps, Double::sum));
     }
     double bytesPerKBWithMargin = (1 + replicationThrottleWriteRateMargin) * BYTES_IN_KB;
@@ -237,6 +258,31 @@ public final class ExecutionUtils {
     for (Map.Entry<Integer, Double> entry : followerWriteRateKBpsByBroker.entrySet()) {
       neededFollowerThrottleByBroker.put(entry.getKey(), (long) (entry.getValue() * bytesPerKBWithMargin));
     }
+  }
+
+  /**
+   * Get the brokers hosting a replica of an (At/Under)MinISR partition without offline replicas, whose replication throttles the
+   * concurrency adjuster decreases if {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG}
+   * is enabled. Partitions with offline replicas are excluded, since moving their replicas is often the very purpose of the execution.
+   *
+   * @param cluster Kafka cluster.
+   * @param minIsrWithTimeByTopic Value and capture time of {@link org.apache.kafka.common.config.TopicConfig#MIN_IN_SYNC_REPLICAS_CONFIG} by topic.
+   * @return The brokers hosting a replica of an (At/Under)MinISR partition without offline replicas.
+   */
+  static Set<Integer> brokersHostingMinIsrPartitions(Cluster cluster, Map<String, MinIsrWithTime> minIsrWithTimeByTopic) {
+    Comparator<PartitionInfo> comparator = Comparator.comparing(PartitionInfo::topic).thenComparingInt(PartitionInfo::partition);
+    Set<PartitionInfo> underMinIsr = new TreeSet<>(comparator);
+    Set<PartitionInfo> atMinIsr = new TreeSet<>(comparator);
+    populateMinIsrState(cluster, minIsrWithTimeByTopic, underMinIsr, atMinIsr, false);
+    Set<Integer> brokers = new TreeSet<>();
+    for (Set<PartitionInfo> partitions : Arrays.asList(underMinIsr, atMinIsr)) {
+      for (PartitionInfo partitionInfo : partitions) {
+        for (Node replica : partitionInfo.replicas()) {
+          brokers.add(replica.id());
+        }
+      }
+    }
+    return brokers;
   }
 
   /**
