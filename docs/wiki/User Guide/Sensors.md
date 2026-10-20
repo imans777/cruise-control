@@ -104,12 +104,14 @@ inter-broker replica movements is `finished-MB / total-MB`, and its remaining ti
 | DESCRIPTION                                                                                                       | MBEAN NAME                                        				                                                 |
 |-------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | The number of self healing started                                                                                | kafka.cruisecontrol:name=AnomalyDetector.number-of-self-healing-started                                |
+| The number of self healing failed to start                                                                        | kafka.cruisecontrol:name=AnomalyDetector.number-of-self-healing-failed-to-start                        |
 | The ongoing anomaly duration in ms                                                                                | kafka.cruisecontrol:name=AnomalyDetector.ongoing-anomaly-duration-ms                                   |
 | Whether broker failure self-healing is enabled or not                                                             | kafka.cruisecontrol:name=AnomalyDetector.broker_failure-self-healing-enabled                           |
 | Whether goal violation self-healing is enabled or not                                                             | kafka.cruisecontrol:name=AnomalyDetector.goal_violation-self-healing-enabled                           |
 | Whether disk failure self-healing is enabled or not                                                               | kafka.cruisecontrol:name=AnomalyDetector.disk_failure-self-healing-enabled                             |
 | Whether metric anomaly self-healing is enabled or not                                                             | kafka.cruisecontrol:name=AnomalyDetector.metric_anomaly-self-healing-enabled                           |
 | Whether topic anomaly self-healing is enabled or not                                                              | kafka.cruisecontrol:name=AnomalyDetector.topic_anomaly-self-healing-enabled                            |
+| Whether maintenance event self-healing is enabled or not                                                          | kafka.cruisecontrol:name=AnomalyDetector.maintenance_event-self-healing-enabled                        |
 | Whether goal violation detector identified goals that require human intervention (e.g. cluster expansion)         | kafka.cruisecontrol:name=AnomalyDetector.GOAL_VIOLATION-has-unfixable-goals                            |
 | Balancedness score (100 = fully-balanced, 0 = fully-unbalanced, -1 = has dead-brokers / disks in cluster)         | kafka.cruisecontrol:name=AnomalyDetector.balancedness-score                                            |
 | Whether the cluster is under-provisioned or not                                                                   | kafka.cruisecontrol:name=AnomalyDetector.under-provisioned                                             |
@@ -121,6 +123,7 @@ inter-broker replica movements is `finished-MB / total-MB`, and its remaining ti
 | Metric anomaly rate                                                                                               | kafka.cruisecontrol:name=AnomalyDetector.metric-anomaly-rate                                           |
 | Disk failure rate                                                                                                 | kafka.cruisecontrol:name=AnomalyDetector.disk-failure-rate                                             |
 | Topic anomaly rate                                                                                                | kafka.cruisecontrol:name=AnomalyDetector.topic-anomaly-rate                                            |
+| Maintenance event rate                                                                                            | kafka.cruisecontrol:name=AnomalyDetector.maintenance-event-rate                                        |
 | The number of brokers that are metric anomaly suspects, pending more evidence to conclude either way              | kafka.cruisecontrol:name=AnomalyDetector.num-suspect-metric-anomalies                                  |
 | The number of brokers that have recently been identified with a metric anomaly                                    | kafka.cruisecontrol:name=AnomalyDetector.num-recent-metric-anomalies                                   |
 | The number of brokers that continue to be identified with a metric anomaly for a prolonged period                 | kafka.cruisecontrol:name=AnomalyDetector.num-persistent-metric-anomalies                               |
@@ -138,7 +141,29 @@ inter-broker replica movements is `finished-MB / total-MB`, and its remaining ti
 | The time from being detected to self-healing completed for metric anomalies                                       | kafka.cruisecontrol:name=AnomalyDetector.metric_anomaly-detect-to-fix-complete-timer                   |
 | The time from being detected to self-healing completed for goal violations                                        | kafka.cruisecontrol:name=AnomalyDetector.goal_violation-detect-to-fix-complete-timer                   |
 | The time from being detected to self-healing completed for topic anomalies                                        | kafka.cruisecontrol:name=AnomalyDetector.topic_anomaly-detect-to-fix-complete-timer                    |
+| The number of self-healing started for broker failures                                                            | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-started-for-broker_failure                |
+| The number of self-healing started for maintenance events                                                         | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-started-for-maintenance_event             |
+| The number of self-healing started for disk failures                                                              | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-started-for-disk_failure                  |
+| The number of self-healing started for metric anomalies                                                           | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-started-for-metric_anomaly                |
+| The number of self-healing started for goal violations                                                            | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-started-for-goal_violation                |
+| The number of self-healing started for topic anomalies                                                            | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-started-for-topic_anomaly                 |
+| The number of self-healing ended (successfully or with an error) for broker failures                              | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-ended-for-broker_failure                  |
+| The number of self-healing ended (successfully or with an error) for maintenance events                           | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-ended-for-maintenance_event               |
+| The number of self-healing ended (successfully or with an error) for disk failures                                | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-ended-for-disk_failure                    |
+| The number of self-healing ended (successfully or with an error) for metric anomalies                             | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-ended-for-metric_anomaly                  |
+| The number of self-healing ended (successfully or with an error) for goal violations                              | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-ended-for-goal_violation                  |
+| The number of self-healing ended (successfully or with an error) for topic anomalies                              | kafka.cruisecontrol:name=AnomalyDetector.num-of-self-healing-ended-for-topic_anomaly                   |
+| The duration of the ongoing self-healing for broker failures in ms (0 if there is none)                           | kafka.cruisecontrol:name=AnomalyDetector.ongoing-self-healing-duration-ms-for-broker_failure           |
+| The duration of the ongoing self-healing for maintenance events in ms (0 if there is none)                        | kafka.cruisecontrol:name=AnomalyDetector.ongoing-self-healing-duration-ms-for-maintenance_event        |
+| The duration of the ongoing self-healing for disk failures in ms (0 if there is none)                             | kafka.cruisecontrol:name=AnomalyDetector.ongoing-self-healing-duration-ms-for-disk_failure             |
+| The duration of the ongoing self-healing for metric anomalies in ms (0 if there is none)                          | kafka.cruisecontrol:name=AnomalyDetector.ongoing-self-healing-duration-ms-for-metric_anomaly           |
+| The duration of the ongoing self-healing for goal violations in ms (0 if there is none)                           | kafka.cruisecontrol:name=AnomalyDetector.ongoing-self-healing-duration-ms-for-goal_violation           |
+| The duration of the ongoing self-healing for topic anomalies in ms (0 if there is none)                           | kafka.cruisecontrol:name=AnomalyDetector.ongoing-self-healing-duration-ms-for-topic_anomaly            |
 | The rate at which automated rightsizing with actions are taken                                                    | kafka.cruisecontrol:name=AnomalyDetector.automated-rightsizing-rate                                    |
+
+A self-healing of an anomaly type is in progress while `num-of-self-healing-started-for-<type>` is greater than `num-of-self-healing-ended-for-<type>`,
+which is also when `ongoing-self-healing-duration-ms-for-<type>` is non-zero. The number of self-healing that completed successfully is the
+count of `<type>-detect-to-fix-complete-timer`; the remaining ended self-healing completed with an error (e.g. a stopped or failed execution).
 
 ### GoalOptimizer Sensors
 
