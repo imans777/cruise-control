@@ -10,8 +10,8 @@ import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ExecutionConcurrencyManager;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.BaseReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
-import com.linkedin.kafka.cruisecontrol.executor.strategy.RoundRobinBrokerReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
+import com.linkedin.kafka.cruisecontrol.executor.strategy.ThrottleAwareRoundRobinBrokerReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -65,14 +65,14 @@ import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.Replic
  * The task is tracked both under source broker and destination broker's plan.
  * Once a task is fulfilled, the task will be removed from both source broker and destination broker's execution plan.
  * <p>
- * If the replica movement strategy contains {@link RoundRobinBrokerReplicaMovementStrategy}, brokers are picked in a round-robin
- * manner (i.e. brokers with fewer scheduled inter-broker replica movements first), and all brokers hosting a replica of the
- * partition before or after the movement are considered to be involved in the corresponding inter-broker replica movement.
+ * If the replica movement strategy contains {@link ThrottleAwareRoundRobinBrokerReplicaMovementStrategy}, brokers are picked in a
+ * round-robin manner (i.e. brokers with fewer scheduled inter-broker replica movements first), and all brokers hosting a replica
+ * of the partition before or after the movement are considered to be involved in the corresponding inter-broker replica movement.
  * Moreover, if the execution has a replication throttle, a movement is started only if the replication throttle of its source
- * and destination brokers can carry the write rates of the movements in progress on them plus the write rate of this partition
- * (see {@link ReplicationThrottleBudget}), unless no movement is in progress on them. Hence, on a broker, cooler partitions fill
- * the replication throttle first, and a hot partition that does not fit waits until the movements in progress on the broker
- * drain, then starts alone.
+ * (i.e. the current leader of the partition) and destination brokers can carry the write rates of the movements in progress on
+ * them plus the write rate of this partition, increased by a margin (see {@link ReplicationThrottleBudget}), unless no movement
+ * is in progress on them. Hence, on a broker, cooler partitions fill the replication throttle first, and a hot partition that
+ * does not fit waits until the movements in progress on the broker drain, then starts alone.
  * <p>
  * This class is not thread safe.
  */
@@ -82,6 +82,7 @@ public class ExecutionTaskPlanner {
   private Comparator<Integer> _interPartMoveBrokerComparator;
   private boolean _roundRobinBrokers;
   private final Map<Integer, Integer> _numInterBrokerMovementsScheduledByBrokerId;
+  private final Set<TopicPartition> _partitionsExceedingReplicationThrottle;
   private final Map<Integer, SortedSet<ExecutionTask>> _intraPartMoveTasksByBrokerId;
   private final Set<ExecutionTask> _remainingInterBrokerReplicaMovements;
   private final Set<ExecutionTask> _remainingIntraBrokerReplicaMovements;
@@ -107,6 +108,7 @@ public class ExecutionTaskPlanner {
     _interPartMoveTasksByBrokerId = new HashMap<>();
     _roundRobinBrokers = false;
     _numInterBrokerMovementsScheduledByBrokerId = new HashMap<>();
+    _partitionsExceedingReplicationThrottle = new HashSet<>();
     _intraPartMoveTasksByBrokerId = new HashMap<>();
     _remainingInterBrokerReplicaMovements = new HashSet<>();
     _remainingIntraBrokerReplicaMovements = new HashSet<>();
@@ -220,8 +222,9 @@ public class ExecutionTaskPlanner {
                                                                 ? _defaultReplicaMovementTaskStrategy
                                                                 : replicaMovementStrategy.chainBaseReplicaMovementStrategyIfAbsent();
     _interPartMoveTasksByBrokerId = chosenReplicaMovementTaskStrategy.applyStrategy(_remainingInterBrokerReplicaMovements, strategyOptions);
-    _roundRobinBrokers = RoundRobinBrokerReplicaMovementStrategy.isEnabledIn(chosenReplicaMovementTaskStrategy);
+    _roundRobinBrokers = ThrottleAwareRoundRobinBrokerReplicaMovementStrategy.isEnabledIn(chosenReplicaMovementTaskStrategy);
     _numInterBrokerMovementsScheduledByBrokerId.clear();
+    _partitionsExceedingReplicationThrottle.clear();
     _interPartMoveBrokerComparator = brokerComparator(strategyOptions, chosenReplicaMovementTaskStrategy);
   }
 
@@ -477,6 +480,7 @@ public class ExecutionTaskPlanner {
             if (_roundRobinBrokers) {
               brokersInvolvedInTask.forEach(broker -> _numInterBrokerMovementsScheduledByBrokerId.merge(broker, 1, Integer::sum));
               if (budget != null) {
+                maybeWarnReplicationThrottleExceeded(task, budget);
                 budget.reserve(task);
               }
             }
@@ -533,6 +537,7 @@ public class ExecutionTaskPlanner {
     _intraPartMoveTasksByBrokerId.clear();
     _interPartMoveTasksByBrokerId.clear();
     _numInterBrokerMovementsScheduledByBrokerId.clear();
+    _partitionsExceedingReplicationThrottle.clear();
     _remainingLeadershipMovements.clear();
     _remainingInterBrokerReplicaMovements.clear();
     _remainingIntraBrokerReplicaMovements.clear();
@@ -555,6 +560,27 @@ public class ExecutionTaskPlanner {
       }
     }
     return true;
+  }
+
+  /**
+   * Warn once per partition if the replication throttle cannot carry the write rate of the partition of the given task even if
+   * the task is the only one in progress on its brokers, i.e. the movement cannot catch up unless the throttle is raised.
+   *
+   * @param task Inter-broker replica movement task to start.
+   * @param budget The replication throttle budget of brokers.
+   */
+  private void maybeWarnReplicationThrottleExceeded(ExecutionTask task, ReplicationThrottleBudget budget) {
+    TopicPartition tp = task.proposal().topicPartition();
+    if (_partitionsExceedingReplicationThrottle.contains(tp)) {
+      return;
+    }
+    String exceededThrottles = budget.exceededThrottles(task);
+    if (!exceededThrottles.isEmpty()) {
+      _partitionsExceedingReplicationThrottle.add(tp);
+      LOG.warn("Starting the movement of partition {}, whose write rate of {} B/s exceeds the {} (with margin). The movement "
+               + "cannot catch up unless the replication throttle is raised.", tp, String.format("%.0f", budget.writeRate(task)),
+               exceededThrottles);
+    }
   }
 
   /**
