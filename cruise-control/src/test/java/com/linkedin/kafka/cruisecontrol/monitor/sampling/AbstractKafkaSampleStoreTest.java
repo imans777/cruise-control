@@ -5,7 +5,7 @@
 package com.linkedin.kafka.cruisecontrol.monitor.sampling;
 
 import com.linkedin.kafka.cruisecontrol.config.constants.MonitorConfig;
-import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.DescribeClusterResult;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.Node;
@@ -39,7 +39,7 @@ public class AbstractKafkaSampleStoreTest {
     public void testSampleStoreTopicReplicationFactorWhenValueAlreadyExists() {
         short expected = 1;
         Map<String, ?> config = Collections.emptyMap();
-        AdminClient adminClient = EasyMock.mock(AdminClient.class);
+        Admin adminClient = EasyMock.mock(Admin.class);
         AbstractKafkaSampleStore kafkaSampleStore = EasyMock.partialMockBuilder(AbstractKafkaSampleStore.class).createMock();
         Whitebox.setInternalState(kafkaSampleStore, "_sampleStoreTopicReplicationFactor", expected);
         EasyMock.replay(adminClient, kafkaSampleStore);
@@ -53,7 +53,7 @@ public class AbstractKafkaSampleStoreTest {
     @Test
     public void testSampleStoreTopicReplicationFactorWhenValueNotExistsAndNodeCountIsOne() {
         Map<String, Object> config = createFilledConfigMap();
-        AdminClient adminClient = EasyMock.mock(AdminClient.class);
+        Admin adminClient = EasyMock.mock(Admin.class);
         prepareForNumberOfBrokersCall(adminClient, false);
         AbstractKafkaSampleStore kafkaSampleStore = EasyMock.partialMockBuilder(AbstractKafkaSampleStore.class).createMock();
         EasyMock.replay(adminClient, kafkaSampleStore);
@@ -67,7 +67,7 @@ public class AbstractKafkaSampleStoreTest {
     public void testSampleStoreTopicReplicationFactorWhenValueNotExistsAndNodeCountIsTwo() {
         short expected = 2;
         Map<String, Object> config = createFilledConfigMap();
-        AdminClient adminClient = EasyMock.mock(AdminClient.class);
+        Admin adminClient = EasyMock.mock(Admin.class);
         prepareForNumberOfBrokersCall(adminClient, true);
         AbstractKafkaSampleStore kafkaSampleStore = EasyMock.partialMockBuilder(AbstractKafkaSampleStore.class).createMock();
         EasyMock.replay(adminClient, kafkaSampleStore);
@@ -81,7 +81,7 @@ public class AbstractKafkaSampleStoreTest {
     @Test
     public void testSampleStoreTopicReplicationFactorWhenValueNotExistsAndDescribeOfClusterFails() {
         Map<String, Object> config = createFilledConfigMap();
-        AdminClient adminClient = EasyMock.mock(AdminClient.class);
+        Admin adminClient = EasyMock.mock(Admin.class);
         KafkaFutureImpl<Collection<Node>> nodesFuture = new KafkaFutureImpl<>();
         nodesFuture.completeExceptionally(new TimeoutException());
         // Describing the cluster is retried up to the max retry count.
@@ -100,7 +100,7 @@ public class AbstractKafkaSampleStoreTest {
         return config;
     }
 
-    private void prepareForNumberOfBrokersCall(AdminClient adminClient, boolean isNodeCountEnough) {
+    private void prepareForNumberOfBrokersCall(Admin adminClient, boolean isNodeCountEnough) {
         Node node = new Node(0, "host", 9092);
         Collection<Node> nodes = isNodeCountEnough ? Arrays.asList(node, node) : Collections.singletonList(node);
         expectDescribeClusterNodes(adminClient, KafkaFuture.completedFuture(nodes), null);
@@ -114,7 +114,7 @@ public class AbstractKafkaSampleStoreTest {
      * @param nodesFuture Future to return as the nodes of the cluster.
      * @param times Expected number of describe cluster calls, or {@code null} for any number of calls.
      */
-    private void expectDescribeClusterNodes(AdminClient adminClient, KafkaFuture<Collection<Node>> nodesFuture, Integer times) {
+    private void expectDescribeClusterNodes(Admin adminClient, KafkaFuture<Collection<Node>> nodesFuture, Integer times) {
         DescribeClusterResult describeClusterResult = EasyMock.mock(DescribeClusterResult.class);
         EasyMock.expect(describeClusterResult.nodes()).andReturn(nodesFuture).anyTimes();
         EasyMock.replay(describeClusterResult);
