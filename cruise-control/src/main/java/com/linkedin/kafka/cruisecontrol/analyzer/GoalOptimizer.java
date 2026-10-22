@@ -428,7 +428,10 @@ public class GoalOptimizer implements Runnable {
    *                                                     specifying initial replica distribution needed is to increase/decrease
    *                                                     specific topic partition's replication factor, in this case some
    *                                                     replicas are tentatively deleted/added in cluster model before
-   *                                                     passing it in to generate proposals.
+   *                                                     passing it in to generate proposals. Another case is to create a
+   *                                                     new topic, whose partitions are added to the cluster model but are
+   *                                                     missing in the initial replica distribution -- hence, they have no
+   *                                                     proposals.
    * @param optimizationOptions Optimization options.
    * @return Results of optimization containing the proposals and stats.
    */

@@ -4,6 +4,7 @@
 
 package com.linkedin.kafka.cruisecontrol.config.constants;
 
+import com.linkedin.kafka.cruisecontrol.servlet.parameters.CreateTopicParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.RemoveDisksParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.PauseResumeParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.StopProposalParameters;
@@ -195,6 +196,13 @@ public final class CruiseControlParametersConfig {
   public static final String DEFAULT_REMOVE_DISKS_PARAMETERS_CLASS = RemoveDisksParameters.class.getName();
   public static final String REMOVE_DISKS_PARAMETERS_CLASS_DOC = "The class for parameters of a disks removal request.";
 
+  /**
+   * <code>create.topic.parameters.class</code>
+   */
+  public static final String CREATE_TOPIC_PARAMETERS_CLASS_CONFIG = "create.topic.parameters.class";
+  public static final String DEFAULT_CREATE_TOPIC_PARAMETERS_CLASS = CreateTopicParameters.class.getName();
+  public static final String CREATE_TOPIC_PARAMETERS_CLASS_DOC = "The class for parameters of a topic creation request.";
+
   private CruiseControlParametersConfig() {
   }
 
@@ -319,6 +327,11 @@ public final class CruiseControlParametersConfig {
                             ConfigDef.Type.CLASS,
                             DEFAULT_REMOVE_DISKS_PARAMETERS_CLASS,
                             ConfigDef.Importance.MEDIUM,
-                            REMOVE_DISKS_PARAMETERS_CLASS_DOC);
+                            REMOVE_DISKS_PARAMETERS_CLASS_DOC)
+                    .define(CREATE_TOPIC_PARAMETERS_CLASS_CONFIG,
+                            ConfigDef.Type.CLASS,
+                            DEFAULT_CREATE_TOPIC_PARAMETERS_CLASS,
+                            ConfigDef.Importance.MEDIUM,
+                            CREATE_TOPIC_PARAMETERS_CLASS_DOC);
   }
 }

@@ -57,7 +57,9 @@ public final class AnalyzerUtils {
    * @param initialLeaderDistribution Initial distribution of the leaders.
    * @param optimizedClusterModel The optimized cluster model.
    * @param skipReplicationFactorChangeCheck Whether skip sanity check of topic partition's replication factor change before
-   *                                         and after optimization.
+   *                                         and after optimization. If skipped, the final distribution may also contain
+   *                                         partitions that are missing in the initial distribution -- i.e. partitions of
+   *                                         topics to be created, which have no proposal in the diff.
    * @return The diff represented by the set of balancing proposals to move from initial to final distribution.
    */
   public static Set<ExecutionProposal> getDiff(Map<TopicPartition, List<ReplicaPlacementInfo>> initialReplicaDistribution,
@@ -95,7 +97,8 @@ public final class AnalyzerUtils {
   /**
    * Sanity check to ensure that
    * <ul>
-   *   <li>Initial and final replica distribution have exactly the same partitions.</li>
+   *   <li>Initial and final replica distribution have exactly the same partitions -- or if the replication factor change
+   *   check is skipped, the final replica distribution contains all partitions of the initial replica distribution.</li>
    *   <li>(Optional) Replication factor of the initial and final replicas in distributions for each partition is the same.</li>
    * </ul>
    *
@@ -107,8 +110,11 @@ public final class AnalyzerUtils {
   private static void sanityCheckReplicaDistribution(Map<TopicPartition, List<ReplicaPlacementInfo>> initialReplicaDistribution,
                                                      Map<TopicPartition, List<ReplicaPlacementInfo>> finalReplicaDistribution,
                                                      boolean skipReplicationFactorChangeCheck) {
-    // Sanity check to make sure that given distributions contain the same replicas.
-    if (!initialReplicaDistribution.keySet().equals(finalReplicaDistribution.keySet())) {
+    // Sanity check to make sure that given distributions contain the same replicas. Partitions of topics to be created exist
+    // only in the final distribution, which is a replication factor change from 0.
+    Set<TopicPartition> initialPartitions = initialReplicaDistribution.keySet();
+    Set<TopicPartition> finalPartitions = finalReplicaDistribution.keySet();
+    if (skipReplicationFactorChangeCheck ? !finalPartitions.containsAll(initialPartitions) : !finalPartitions.equals(initialPartitions)) {
       throw new IllegalArgumentException("Attempt to diff distributions with different partitions.");
     }
     if (!skipReplicationFactorChangeCheck) {

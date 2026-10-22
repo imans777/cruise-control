@@ -42,6 +42,8 @@ import java.util.TreeSet;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import org.apache.kafka.common.errors.InvalidTopicException;
+import org.apache.kafka.common.internals.Topic;
 
 import static com.linkedin.cruisecontrol.CruiseControlUtils.currentUtcDate;
 import static com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint.ADD_BROKER;
@@ -131,6 +133,10 @@ public final class ParameterUtils {
   public static final String FAST_MODE_PARAM = "fast_mode";
   public static final String STOP_EXTERNAL_AGENT_PARAM = "stop_external_agent";
   public static final String DEVELOPER_MODE_PARAM = "developer_mode";
+  public static final String PARTITION_DISK_MB_PARAM = "partition_disk_mb";
+  public static final String PARTITION_NW_IN_KBPS_PARAM = "partition_nw_in_kbps";
+  public static final String PARTITION_NW_OUT_KBPS_PARAM = "partition_nw_out_kbps";
+  public static final String ALLOW_OTHER_TOPICS_MOVEMENTS_PARAM = "allow_other_topics_movements";
   private static final int MAX_REASON_LENGTH = 50;
   private static final String DELIMITER_BETWEEN_BROKER_ID_AND_LOGDIR = "-";
   public static final long DEFAULT_START_TIME_FOR_CLUSTER_MODEL = -1L;
@@ -162,6 +168,7 @@ public final class ParameterUtils {
   public static final String RIGHTSIZE_PARAMETER_OBJECT_CONFIG = "rightsize.parameter.object";
   public static final String PERMISSIONS_PARAMETER_OBJECT_CONFIG = "permissions.parameter.object";
   public static final String REMOVE_DISKS_PARAMETER_OBJECT_CONFIG = "remove.disks.parameter.object";
+  public static final String CREATE_TOPIC_PARAMETER_OBJECT_CONFIG = "create.topic.parameter.object";
 
   private ParameterUtils() {
   }
@@ -1185,6 +1192,53 @@ public final class ParameterUtils {
       return null;
     }
     return Short.parseShort(requestContext.getParameter(parameterString));
+  }
+
+  /**
+   * Get the name of the topic to create from {@link #TOPIC_PARAM}.
+   *
+   * @param requestContext HTTP request received by Cruise Control.
+   * @return The name of the topic to create, or {@code null} if the request does not contain {@link #TOPIC_PARAM}.
+   * @throws UserRequestException if the topic name is not a legal Kafka topic name.
+   */
+  static String topicToCreate(CruiseControlRequestContext requestContext) {
+    String parameterString = caseSensitiveParameterName(requestContext.getParameterMap(), TOPIC_PARAM);
+    if (parameterString == null) {
+      return null;
+    }
+    String topic = requestContext.getParameter(parameterString);
+    try {
+      Topic.validate(topic);
+    } catch (InvalidTopicException e) {
+      throw new UserRequestException(String.format("Invalid topic name to create (Requested: %s): %s", topic, e.getMessage()));
+    }
+    return topic;
+  }
+
+  /**
+   * Get the expected load of each partition of the topic to create from the given parameter.
+   *
+   * @param requestContext HTTP request received by Cruise Control.
+   * @param parameter One of {@link #PARTITION_DISK_MB_PARAM}, {@link #PARTITION_NW_IN_KBPS_PARAM}, or
+   * {@link #PARTITION_NW_OUT_KBPS_PARAM}.
+   * @return The expected load of each partition, or {@code 0.0} if the request does not contain the given parameter.
+   * @throws UserRequestException if the expected load is not a finite non-negative number.
+   */
+  static double partitionLoad(CruiseControlRequestContext requestContext, String parameter) {
+    String parameterString = caseSensitiveParameterName(requestContext.getParameterMap(), parameter);
+    if (parameterString == null) {
+      return 0.0;
+    }
+    double partitionLoad = Double.parseDouble(requestContext.getParameter(parameterString));
+    if (!(partitionLoad >= 0.0) || Double.isInfinite(partitionLoad)) {
+      throw new UserRequestException(String.format("The requested %s must be a non-negative number (Requested: %s).",
+                                                   parameter, requestContext.getParameter(parameterString)));
+    }
+    return partitionLoad;
+  }
+
+  static boolean allowOtherTopicsMovements(CruiseControlRequestContext requestContext) {
+    return getBooleanParam(requestContext, ALLOW_OTHER_TOPICS_MOVEMENTS_PARAM, false);
   }
 
   static boolean fetchCompletedTask(CruiseControlRequestContext requestContext) {

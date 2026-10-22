@@ -187,7 +187,7 @@ public final class ExecutorConfig {
   public static final String REQUEST_REASON_REQUIRED_CONFIG = "request.reason.required";
   public static final boolean DEFAULT_REQUEST_REASON_REQUIRED = false;
   public static final String REQUEST_REASON_REQUIRED_DOC = "Require specifying reason via " + REASON_PARAM + " parameter "
-      + "for non-dryrun rebalance/add_broker/remove_broker/demote_broker/fix_offline_replicas/topic_configuration request.";
+      + "for non-dryrun rebalance/add_broker/remove_broker/demote_broker/fix_offline_replicas/topic_configuration/create_topic request.";
 
   /**
    * <code>logdir.response.timeout.ms</code>
