@@ -13,6 +13,7 @@ import com.linkedin.kafka.cruisecontrol.executor.ExecutionProposal;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
 import com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.AddedOrRemovedBrokerParameters;
+import com.linkedin.kafka.cruisecontrol.servlet.parameters.CreateTopicParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.DemoteBrokerParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.KafkaOptimizationParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.RemoveDisksParameters;
@@ -88,6 +89,8 @@ public class OptimizationResult extends AbstractCruiseControlResponse {
                              _optimizerResult.topicsWithReplicationFactorChange());
       case REMOVE_DISKS:
         return String.format("%n%nCluster load after removing disks %s:%n", ((RemoveDisksParameters) parameters).brokerIdAndLogdirs());
+      case CREATE_TOPIC:
+        return String.format("%n%nCluster load after creating topic %s:%n", ((CreateTopicParameters) parameters).topic());
       default:
         LOG.error("Unrecognized endpoint.");
         return "Unrecognized endpoint.";
@@ -136,6 +139,11 @@ public class OptimizationResult extends AbstractCruiseControlResponse {
   }
 
   protected String getJsonString(boolean isVerbose) {
+    Gson gson = new GsonBuilder().serializeNulls().serializeSpecialFloatingPointValues().create();
+    return gson.toJson(getJsonStructure(isVerbose));
+  }
+
+  protected Map<String, Object> getJsonStructure(boolean isVerbose) {
     Map<String, Object> optimizationResult = new HashMap<>();
     if (isVerbose) {
       optimizationResult.put(PROPOSALS, _optimizerResult.goalProposals().stream()
@@ -151,9 +159,7 @@ public class OptimizationResult extends AbstractCruiseControlResponse {
     optimizationResult.put(GOAL_SUMMARY, goalSummary);
     optimizationResult.put(LOAD_AFTER_OPTIMIZATION, _optimizerResult.brokerStatsAfterOptimization().getJsonStructure());
     optimizationResult.put(VERSION, JSON_VERSION);
-    Gson gson = new GsonBuilder().serializeNulls().serializeSpecialFloatingPointValues().create();
-
-    return gson.toJson(optimizationResult);
+    return optimizationResult;
   }
 
   protected void writeProposalSummary(StringBuilder sb) {

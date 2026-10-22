@@ -60,6 +60,8 @@ paths:
     $ref: 'endpoints/userTasks.yaml#/UserTasksEndpoint'
   /remove_disks:
     $ref: 'endpoints/removeDisks.yaml#/RemoveDisksEndpoint'
+  /create_topic:
+    $ref: 'endpoints/createTopic.yaml#/CreateTopicEndpoint'
 components:
   securitySchemes:
     basicAuth:

@@ -543,6 +543,31 @@ public class LoadMonitor {
   }
 
   /**
+   * Check whether the cluster uses JBOD -- i.e. the disk capacity of every broker in the cluster is specified per logdir, and
+   * at least one broker has multiple logdirs. If the disk capacity of every broker is specified per logdir, the replica
+   * placement over disks can be populated in the cluster model.
+   *
+   * @param allowCapacityEstimation whether allow capacity estimation if the underlying live broker capacity is unavailable.
+   * @return {@code true} if the cluster uses JBOD, {@code false} otherwise.
+   * @throws TimeoutException If broker capacity resolver is unable to resolve broker capacity in time.
+   * @throws BrokerCapacityResolutionException If broker capacity resolver fails to resolve broker capacity.
+   */
+  public boolean isUsingJBOD(boolean allowCapacityEstimation) throws TimeoutException, BrokerCapacityResolutionException {
+    boolean hasBrokerWithMultipleLogDirs = false;
+    for (Node node : refreshClusterAndGeneration().cluster().nodes()) {
+      BrokerCapacityInfo brokerCapacity = _brokerCapacityConfigResolver.capacityForBroker(getRackHandleNull(node), node.host(), node.id(),
+                                                                                          BROKER_CAPACITY_FETCH_TIMEOUT_MS,
+                                                                                          allowCapacityEstimation);
+      Map<String, Double> diskCapacityByLogDir = brokerCapacity.diskCapacityByLogDir();
+      if (diskCapacityByLogDir == null) {
+        return false;
+      }
+      hasBrokerWithMultipleLogDirs |= diskCapacityByLogDir.size() > 1;
+    }
+    return hasBrokerWithMultipleLogDirs;
+  }
+
+  /**
    * Get cluster capacity, and skip populating cluster load. Enables quick retrieval of capacity without the load.
    * @return Cluster capacity without cluster load.
    */

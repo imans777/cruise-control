@@ -1,0 +1,53 @@
+CreateTopicResult:
+  type: object
+  required:
+    - loadAfterOptimization
+    - summary
+    - goalSummary
+    - topic
+    - replicaAssignment
+  properties:
+    proposals:
+      type: array
+      items:
+        $ref: './executionProposal.yaml#/ExecutionProposal'
+    loadBeforeOptimization:
+      $ref: './brokerStats.yaml#/BrokerStats'
+    summary:
+      $ref: './optimizationResult.yaml#/OptimizerResult'
+    goalSummary:
+      type: array
+      items:
+        $ref: './goalStatus.yaml#/GoalStatus'
+    loadAfterOptimization:
+      $ref: './brokerStats.yaml#/BrokerStats'
+    topic:
+      type: string
+    replicaAssignment:
+      type: array
+      items:
+        $ref: '#/PartitionAssignment'
+    version:
+      type: integer
+      format: int32
+
+PartitionAssignment:
+  type: object
+  required:
+    - partition
+    - replicas
+  properties:
+    partition:
+      type: integer
+      format: int32
+    replicas:
+      description: Brokers hosting the replicas of the partition, starting with the leader.
+      type: array
+      items:
+        type: integer
+        format: int32
+    logdirs:
+      description: Logdirs of the replicas in the order of replicas (null if Kafka picks the logdir of the replica). Present only if the cluster uses JBOD.
+      type: array
+      items:
+        type: string
