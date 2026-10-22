@@ -21,6 +21,7 @@
     * [Pause metrics load sampling](#pause-metrics-load-sampling)
     * [Resume metrics load sampling](#resume-metrics-load-sampling)
     * [Change Kafka topic configuration](#change-kafka-topic-configuration)
+    * [Create a Kafka topic based on its expected load](#create-a-kafka-topic-based-on-its-expected-load)
     * [Change Cruise Control configuration](#change-cruise-control-configuration)
     * [2-step Verification](#2-step-verification)
     * [Rightsize the cluster with the Provisioner](#rightsize-the-cluster-with-the-provisioner)
@@ -541,7 +542,7 @@ Before generating proposals, Cruise Control validates that:
 Replica movements are limited to disks within the same broker — there is no inter-broker replica movement. `stop_ongoing_execution` and `dryrun` cannot both be set to `true`.
 
 ### Stop the current proposal execution task
-The following POST request will let Cruise Control stop an ongoing `rebalance`, `add_broker`,  `remove_broker`, `fix_offline_replica`, `topic_configuration`, `demote_broker` or `remove_disks` operation:
+The following POST request will let Cruise Control stop an ongoing `rebalance`, `add_broker`,  `remove_broker`, `fix_offline_replica`, `topic_configuration`, `demote_broker`, `remove_disks` or `create_topic` operation:
 
     POST /kafkacruisecontrol/stop_proposal_execution
 
@@ -624,6 +625,59 @@ Supported parameters are:
 Changing topic's replication factor will not move any existing replicas. `goals` are used to determine which replica to be deleted(to decrease topic's replication factor) and which broker to assign new replica (to increase topic's replication factor).
 
 Note sometimes the topic regex can be too long to put at POST request head, in this case user can specify topic regex and target replication factor pairs in POST request body. For details, check [Change-topic-replication-factor-through-Cruise-Control wiki page](https://github.com/cruise-control-for-kafka/cruise-control/wiki/Change-topic-replication-factor-through-Cruise-Control).
+
+### Create a Kafka topic based on its expected load
+Kafka places the replicas of a new topic without considering the load of brokers and disks. On a loaded cluster, the traffic of the new topic may overload some brokers or JBOD disks before Cruise Control collects its metrics. The `create_topic` endpoint places the replicas of a new topic based on the expected load of its partitions and the current load of the cluster.
+
+    POST /kafkacruisecontrol/create_topic?topic=[topic]&partition_count=[partition_count]&replication_factor=[replication_factor]
+
+For example, to create a topic with 12 partitions and replication factor 3, in which each replica is expected to take 50 GB of disk, and each partition to receive 2 MB/s and serve 6 MB/s:
+
+    POST /kafkacruisecontrol/create_topic?topic=orders&partition_count=12&replication_factor=3&partition_disk_mb=51200&partition_nw_in_kbps=2048&partition_nw_out_kbps=6144&dryrun=false
+
+Supported parameters are:
+
+| PARAMETER                                  | TYPE     | DESCRIPTION                                                                                                                          | DEFAULT                | OPTIONAL  |
+|--------------------------------------------|----------|--------------------------------------------------------------------------------------------------------------------------------------|------------------------|-----------|
+| dryrun                                     | boolean  | whether dry-run the request or not                                                                                                   | true                   | yes       |
+| topic                                      | string   | name of the topic to create                                                                                                          | N/A                    | **no**    |
+| partition_count                            | integer  | number of partitions of the topic                                                                                                    | N/A                    | **no**    |
+| replication_factor                         | integer  | replication factor of the topic                                                                                                      | N/A                    | **no**    |
+| partition_disk_mb                          | double   | expected disk usage of each replica of the topic in MB                                                                               | 0                      | yes       |
+| partition_nw_in_kbps                       | double   | expected inbound network load (i.e. produce rate) of each partition of the topic in KB/s                                            | 0                      | yes       |
+| partition_nw_out_kbps                      | double   | expected outbound network load (i.e. consume rate) of each partition of the topic in KB/s                                           | 0                      | yes       |
+| allow_other_topics_movements               | boolean  | whether to allow replicas of other topics to be moved, so that the cluster satisfies the goals after creating the topic             | false                  | yes       |
+| data_from                                  | string   | whether generate proposal from available valid partitions or valid windows                                                           | `VALID_WINDOW`         | yes       |
+| goals                                      | list     | list of goals used to place the replicas of the topic (and to move other topics' replicas, if allowed)                              | default goals          | yes       |
+| allow_capacity_estimation                  | boolean  | whether to allow broker capacity to be estimated                                                                                     | true                   | yes       |
+| concurrent_partition_movements_per_broker  | integer  | upper bound of ongoing replica movements going into/out of each broker                                                               | null                   | yes       |
+| max_partition_movements_in_cluster         | integer  | upper bound of maximum replica movements going into/out of brokers across cluster                                                    | `default_config`       | yes       |
+| concurrent_leader_movements                | integer  | upper bound of ongoing leadership movements                                                                                          | null                   | yes       |
+| broker_concurrent_leader_movements         | integer  | upper bound of per broker ongoing leadership movements                                                                               | null                   | yes       |
+| skip_hard_goal_check                       | boolean  | whether allow hard goals be skipped in proposal generation                                                                           | false                  | yes       |
+| skip_rack_awareness_check                  | boolean  | whether to allow a replication factor larger than the number of racks                                                                | false                  | yes       |
+| excluded_topics                            | regex    | regular expression to specify topics excluded from replica movement (the topic to create is never excluded)                          | null                   | yes       |
+| exclude_recently_demoted_brokers           | boolean  | whether to allow leader replicas to be moved to recently demoted brokers                                                             | false                  | yes       |
+| exclude_recently_removed_brokers           | boolean  | whether allow replicas to be moved to recently removed broker                                                                        | false                  | yes       |
+| replica_movement_strategies                | string   | [replica movement strategy](https://github.com/linkedin/cruise-control/wiki/Pluggable-Components#replica-movement-strategy) to use   | null                   | yes       |
+| replication_throttle                       | long     | upper bound on the bandwidth used to move replicas (in bytes per second)                                                             | null                   | yes       |
+| execution_progress_check_interval_ms       | long     | execution progress check interval in milliseconds                                                                                    | `default_config`       | yes       |
+| stop_ongoing_execution                     | boolean  | whether to stop the ongoing execution (if any) and start executing the given request                                                 | false                  | yes       |
+| review_id                                  | integer  | review id for 2-step verification                                                                                                    | N/A                    | yes       |
+| json                                       | boolean  | return in JSON format or not                                                                                                         | false                  | yes       |
+| verbose                                    | boolean  | return detailed state information                                                                                                    | false                  | yes       |
+| reason                                     | string   | reason for the request                                                                                                               | "No reason provided"   | yes       |
+| get_response_schema                        | boolean  | return JSON schema in response header or not                                                                                         | false                  | yes       |
+| doAs                                       | string   | propagated user by the trusted proxy service                                                                                         | null                   | yes       |
+| fast_mode                                  | boolean  | true to compute proposals in fast mode, false otherwise                                                                              | true                   | yes       |
+
+Cruise Control adds the partitions of the topic with their expected load to the cluster model, and then optimizes their placement with the given `goals`. The leader of each partition gets the given load plus the replication traffic to its followers, while followers get the same disk usage and inbound network load as the leader. CPU usage of the new topic is not estimated.
+* If `allow_other_topics_movements=false` (default), only the replicas of the new topic are placed; replicas of all other topics stay where they are. If the cluster cannot host the new topic without violating hard goals (e.g. some brokers would exceed their disk capacity threshold), the request fails.
+* If `allow_other_topics_movements=true`, goals may also move the replicas of other topics, so that the cluster satisfies the goals after creating the topic, without needing a rebalance afterwards. These movements are listed as proposals in the response.
+
+If the cluster uses JBOD -- i.e. the disk capacity of every broker is specified per logdir and some brokers have multiple logdirs (see [capacity configuration](https://github.com/linkedin/cruise-control/wiki/Configurations#populating-the-capacity-config-file)) -- each replica of the new topic on a broker with multiple logdirs is placed on the alive disk with the lowest utilization after placement, without exceeding the disk capacity threshold. The disk placement is based on the current disk usage; replicas of other topics that are moved between brokers are placed on disks by Kafka.
+
+With `dryrun=false`, Cruise Control creates the topic with the computed replica assignment (and logdirs, if decided), and then executes the movements of other topics' replicas (if any) in the background. The response includes the replica assignment of the topic (`replicaAssignment`, starting with the leader of each partition). Topic configs (e.g. `retention.ms`) are taken from the broker defaults; they can be changed afterwards with Kafka tools.
 
 ### Change Cruise Control configuration
 Some Cruise Control configs can be changed dynamically via `admin` endpoint, which includes

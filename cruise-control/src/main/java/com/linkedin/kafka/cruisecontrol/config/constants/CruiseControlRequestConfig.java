@@ -5,6 +5,7 @@
 package com.linkedin.kafka.cruisecontrol.config.constants;
 
 import com.linkedin.kafka.cruisecontrol.servlet.handler.async.ClusterLoadRequest;
+import com.linkedin.kafka.cruisecontrol.servlet.handler.async.CreateTopicRequest;
 import com.linkedin.kafka.cruisecontrol.servlet.handler.async.PartitionLoadRequest;
 import com.linkedin.kafka.cruisecontrol.servlet.handler.async.ProposalsRequest;
 import com.linkedin.kafka.cruisecontrol.servlet.handler.async.CruiseControlStateRequest;
@@ -197,6 +198,13 @@ public final class CruiseControlRequestConfig {
   public static final String DEFAULT_REMOVE_DISKS_REQUEST_CLASS = RemoveDisksRequest.class.getName();
   public static final String REMOVE_DISKS_REQUEST_CLASS_DOC = "The class to handle a disks removal request.";
 
+  /**
+   * <code>create.topic.request.class</code>
+   */
+  public static final String CREATE_TOPIC_REQUEST_CLASS_CONFIG = "create.topic.request.class";
+  public static final String DEFAULT_CREATE_TOPIC_REQUEST_CLASS = CreateTopicRequest.class.getName();
+  public static final String CREATE_TOPIC_REQUEST_CLASS_DOC = "The class to handle a topic creation request.";
+
   private CruiseControlRequestConfig() {
   }
 
@@ -321,6 +329,11 @@ public final class CruiseControlRequestConfig {
                             ConfigDef.Type.CLASS,
                             DEFAULT_REMOVE_DISKS_REQUEST_CLASS,
                             ConfigDef.Importance.MEDIUM,
-                            REMOVE_DISKS_REQUEST_CLASS_DOC);
+                            REMOVE_DISKS_REQUEST_CLASS_DOC)
+                    .define(CREATE_TOPIC_REQUEST_CLASS_CONFIG,
+                            ConfigDef.Type.CLASS,
+                            DEFAULT_CREATE_TOPIC_REQUEST_CLASS,
+                            ConfigDef.Importance.MEDIUM,
+                            CREATE_TOPIC_REQUEST_CLASS_DOC);
   }
 }
