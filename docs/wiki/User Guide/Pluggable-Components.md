@@ -82,6 +82,7 @@ Sometimes this could result in prolonged execution time due to some long tail ta
 * **PrioritizeLargeReplicaMovementStrategy**: prioritize large sized replicas
 * **PostponeUrpReplicaMovementStrategy**: prioritize replicas for partition having no out-of-sync replica
 * **PrioritizeMinIsrWithOfflineReplicasStrategy**: prioritize tasks with (At/Under)MinISR partitions with offline replicas
+* **ThrottleAwareRoundRobinBrokerReplicaMovementStrategy**: spread replica movements across brokers in a round-robin manner (i.e. a broker gets another movement only after the other brokers had their turn), and consider all brokers hosting a replica of the partition (before or after the movement) as involved in the movement, and, if the execution has a replication throttle, start a movement only if the replication throttle of its source (i.e. the current leader of the partition) and destination brokers can carry the write rates of the movements in progress on them plus the write rate of the partition, i.e. `(1 + replica.movement.throttle.write.rate.margin) * (write rates in progress + write rate of the partition) <= throttle`, unless no movement is in progress on them, to avoid a single broker becoming the bottleneck of an execution
 
 The strategies can be chained to use and can be dynamically set using `replica_movement_strategies` in corresponding request(e.g. [rebalance request](https://github.com/cruise-control-for-kafka/cruise-control/wiki/REST-APIs#trigger-a-workload-balance)).
 
