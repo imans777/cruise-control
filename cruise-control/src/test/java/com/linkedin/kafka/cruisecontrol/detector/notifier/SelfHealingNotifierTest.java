@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.detector.notifier;
 
 import com.linkedin.cruisecontrol.detector.Anomaly;
@@ -31,6 +45,7 @@ import static com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorUtils.KAF
 import static com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorUtils.ANOMALY_DETECTION_TIME_MS_OBJECT_CONFIG;
 import static com.linkedin.kafka.cruisecontrol.detector.AbstractBrokerFailureDetector.BROKER_FAILURES_FIXABLE_CONFIG;
 import static com.linkedin.kafka.cruisecontrol.detector.AbstractBrokerFailureDetector.FAILED_BROKERS_OBJECT_CONFIG;
+import static com.linkedin.kafka.cruisecontrol.detector.DiskFailureDetector.DISK_FAILURES_FIXABLE_CONFIG;
 import static com.linkedin.kafka.cruisecontrol.detector.DiskFailureDetector.FAILED_DISKS_OBJECT_CONFIG;
 import static com.linkedin.kafka.cruisecontrol.detector.MetricAnomalyDetector.METRIC_ANOMALY_BROKER_ENTITIES_OBJECT_CONFIG;
 import static com.linkedin.kafka.cruisecontrol.detector.MetricAnomalyDetector.METRIC_ANOMALY_FIXABLE_OBJECT_CONFIG;
@@ -129,6 +144,51 @@ public class SelfHealingNotifierTest {
     assertFalse(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.TOPIC_ANOMALY));
 
     EasyMock.verify(mockKafkaCruiseControl);
+  }
+
+  @Test
+  public void testOnDiskFailure() {
+    final long failureTime = 200L;
+    final long startTime = 500L;
+    KafkaCruiseControl mockKafkaCruiseControl = EasyMock.mock(KafkaCruiseControl.class);
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    KafkaCruiseControlConfig kafkaCruiseControlConfig = new KafkaCruiseControlConfig(props);
+    EasyMock.expect(mockKafkaCruiseControl.config()).andReturn(kafkaCruiseControlConfig).atLeastOnce();
+    EasyMock.replay(mockKafkaCruiseControl);
+    Time mockTime = new MockTime(0, startTime, TimeUnit.NANOSECONDS.convert(startTime, TimeUnit.MILLISECONDS));
+    TestingBrokerFailureAutoFixNotifier anomalyNotifier = new TestingBrokerFailureAutoFixNotifier(mockTime);
+    anomalyNotifier.configure(Collections.singletonMap(SelfHealingNotifier.SELF_HEALING_DISK_FAILURE_ENABLED_CONFIG, "true"));
+
+    // (1) Fixable disk failures are fixed.
+    Map<Integer, Map<String, Long>> failedDisks = Collections.singletonMap(1, Collections.singletonMap(BAD_LOGDIR, failureTime));
+    AnomalyNotificationResult result = anomalyNotifier.onDiskFailure(diskFailures(kafkaCruiseControlConfig, mockKafkaCruiseControl,
+                                                                                  failedDisks, true));
+    assertEquals(AnomalyNotificationResult.Action.FIX, result.action());
+    assertTrue(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.DISK_FAILURE));
+    assertTrue(anomalyNotifier.isAutoFixTriggeredFor(KafkaAnomalyType.DISK_FAILURE));
+
+    // (2) Unfixable disk failures are alerted, but not fixed.
+    anomalyNotifier.resetAlert(KafkaAnomalyType.DISK_FAILURE);
+    failedDisks = Collections.singletonMap(2, Collections.singletonMap(BAD_LOGDIR, failureTime));
+    result = anomalyNotifier.onDiskFailure(diskFailures(kafkaCruiseControlConfig, mockKafkaCruiseControl, failedDisks, false));
+    assertEquals(AnomalyNotificationResult.Action.IGNORE, result.action());
+    assertTrue(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.DISK_FAILURE));
+    assertFalse(anomalyNotifier.isAutoFixTriggeredFor(KafkaAnomalyType.DISK_FAILURE));
+
+    EasyMock.verify(mockKafkaCruiseControl);
+  }
+
+  private static DiskFailures diskFailures(KafkaCruiseControlConfig kafkaCruiseControlConfig,
+                                           KafkaCruiseControl kafkaCruiseControl,
+                                           Map<Integer, Map<String, Long>> failedDisks,
+                                           boolean fixable) {
+    Map<String, Object> parameterConfigOverrides = Map.of(KAFKA_CRUISE_CONTROL_OBJECT_CONFIG, kafkaCruiseControl,
+                                                          FAILED_DISKS_OBJECT_CONFIG, failedDisks,
+                                                          DISK_FAILURES_FIXABLE_CONFIG, fixable,
+                                                          ANOMALY_DETECTION_TIME_MS_OBJECT_CONFIG, 100L);
+    return kafkaCruiseControlConfig.getConfiguredInstance(AnomalyDetectorConfig.DISK_FAILURES_CLASS_CONFIG,
+                                                          DiskFailures.class,
+                                                          parameterConfigOverrides);
   }
 
   @Test
