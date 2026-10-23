@@ -16,7 +16,10 @@
 
 package com.linkedin.kafka.cruisecontrol;
 
+import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collection;
@@ -32,12 +35,15 @@ import com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskCapacityGoal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.ReplicaCapacityGoal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.ReplicaDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
+import com.linkedin.kafka.cruisecontrol.config.constants.AnomalyDetectorConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.WebServerConfig;
 import com.linkedin.kafka.cruisecontrol.detector.AnomalyState;
 import com.linkedin.kafka.cruisecontrol.detector.TopicReplicationFactorAnomalyFinder;
 import net.minidev.json.JSONArray;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.server.config.ServerLogConfigs;
+import org.junit.After;
+import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -48,6 +54,7 @@ import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC0;
 import static com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint.KAFKA_CLUSTER_STATE;
 import static com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint.STATE;
 import static com.linkedin.kafka.cruisecontrol.KafkaCruiseControlIntegrationTestUtils.KAFKA_CRUISE_CONTROL_BASE_PATH;
+import static org.junit.Assert.assertEquals;
 
 @RunWith(Parameterized.class)
 public class DiskFailureIntegrationTest extends CruiseControlIntegrationTestHarness {
@@ -56,6 +63,8 @@ public class DiskFailureIntegrationTest extends CruiseControlIntegrationTestHarn
   private static final short TOPIC0_REPLICATION_FACTOR = (short) 2;
   private static final int BROKER_ID_TO_CAUSE_DISK_FAILURE = 2;
   private static final int PARTITION_COUNT = 3;
+  // More than two anomaly detection intervals (see KafkaCruiseControlIntegrationTestUtils#ccConfigOverrides()).
+  private static final Duration NO_MORE_DISK_FAILURES_CHECK_DURATION = Duration.ofSeconds(90);
   private static final String CRUISE_CONTROL_KAFKA_CLUSTER_STATE_ENDPOINT =
       KAFKA_CRUISE_CONTROL_BASE_PATH + KAFKA_CLUSTER_STATE + "?verbose=true&json=true";
   private static final String CRUISE_CONTROL_STATE_ENDPOINT =
@@ -65,6 +74,7 @@ public class DiskFailureIntegrationTest extends CruiseControlIntegrationTestHarn
   private static final Logger LOG = LoggerFactory.getLogger(DiskFailureIntegrationTest.class);
   private final Configuration _gsonJsonConfig = KafkaCruiseControlIntegrationTestUtils.createJsonMappingConfig();
   private final Boolean _vertxEnabled;
+  private File _failedDisksFile;
 
   public DiskFailureIntegrationTest(Boolean vertxEnabled) {
     this._vertxEnabled = vertxEnabled;
@@ -78,6 +88,34 @@ public class DiskFailureIntegrationTest extends CruiseControlIntegrationTestHarn
   public static Collection<Boolean> data() {
     Boolean[] data = {true, false};
     return Arrays.asList(data);
+  }
+
+  /**
+   * Create the file to persist failed disks, and start the cluster and Cruise Control.
+   */
+  @Override
+  @Before
+  public void setUp() {
+    try {
+      _failedDisksFile = File.createTempFile("DiskFailureIntegrationTest", ".txt");
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    super.setUp();
+  }
+
+  /**
+   * Stop Cruise Control and the cluster, and delete the file to persist failed disks.
+   */
+  @Override
+  @After
+  public void tearDown() {
+    super.tearDown();
+    try {
+      Files.deleteIfExists(_failedDisksFile.toPath());
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   @Override
@@ -101,6 +139,7 @@ public class DiskFailureIntegrationTest extends CruiseControlIntegrationTestHarn
         .add(ReplicaCapacityGoal.class.getName())
         .add(DiskCapacityGoal.class.getName()).toString());
     configs.put(WebServerConfig.VERTX_ENABLED_CONFIG, String.valueOf(_vertxEnabled));
+    configs.put(AnomalyDetectorConfig.FAILED_DISKS_FILE_PATH_CONFIG, _failedDisksFile.getPath());
     
     return configs;
   }
@@ -122,6 +161,20 @@ public class DiskFailureIntegrationTest extends CruiseControlIntegrationTestHarn
     waitForOfflineReplicaDetection();
     waitForDiskFailureFixStarted();
     waitForOfflineReplicasFixed();
+    verifyNoMoreDiskFailuresReported();
+  }
+
+  private void verifyNoMoreDiskFailuresReported() throws InterruptedException {
+    // The failed disk stays failed until it is removed from log.dirs, but it has no replicas left to move, so it is not
+    // reported (and fixed) again.
+    long endTimeMs = System.currentTimeMillis() + NO_MORE_DISK_FAILURES_CHECK_DURATION.toMillis();
+    while (System.currentTimeMillis() < endTimeMs) {
+      String responseMessage = KafkaCruiseControlIntegrationTestUtils
+          .callCruiseControl(_app.serverUrl(), CRUISE_CONTROL_STATE_ENDPOINT);
+      JSONArray diskFailuresArray = JsonPath.read(responseMessage, "$.AnomalyDetectorState.recentDiskFailures[*].anomalyId");
+      assertEquals("The failed disk without replicas was reported again", 1, diskFailuresArray.size());
+      Thread.sleep(Duration.ofSeconds(5).toMillis());
+    }
   }
 
   private void waitForOfflineReplicasFixed() {
