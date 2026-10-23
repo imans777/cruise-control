@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.detector;
 
 import com.codahale.metrics.Gauge;
@@ -30,6 +44,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
@@ -76,6 +91,8 @@ public class AnomalyDetectorManager {
   private final List<String> _selfHealingGoals;
   private final ExecutorService _anomalyLoggerExecutor;
   private volatile Anomaly _anomalyInProgress;
+  // The pending disk failure detection scheduled for disk failures that are not ready to fix yet, if any.
+  private ScheduledFuture<?> _delayedDiskFailureDetection;
   private final AtomicLong _numCheckedWithDelay;
   private final Object _shutdownLock;
   private final Map<AnomalyType, Timer> _selfHealingFixGenerationTimer;
@@ -122,6 +139,7 @@ public class AnomalyDetectorManager {
     _anomalyLoggerExecutor =
         Executors.newSingleThreadScheduledExecutor(new KafkaCruiseControlThreadFactory("AnomalyLogger"));
     _anomalyInProgress = null;
+    _delayedDiskFailureDetection = null;
     _numCheckedWithDelay = new AtomicLong();
     _shutdownLock = new Object();
     // Register sensors.
@@ -162,6 +180,7 @@ public class AnomalyDetectorManager {
     _selfHealingGoals = Collections.emptyList();
     _anomalyLoggerExecutor = Executors.newSingleThreadScheduledExecutor(new KafkaCruiseControlThreadFactory("AnomalyLogger"));
     _anomalyInProgress = null;
+    _delayedDiskFailureDetection = null;
     _numCheckedWithDelay = new AtomicLong();
     _shutdownLock = new Object();
     _selfHealingFixGenerationTimer = new HashMap<>();
@@ -410,7 +429,11 @@ public class AnomalyDetectorManager {
             break;
           case CHECK:
             LOG.info("Post processing anomaly {} for {}.", _anomalyInProgress, AnomalyState.Status.CHECK_WITH_DELAY);
-            postProcessAnomalyInProgress(notificationResult.delay());
+            if (anomalyType == KafkaAnomalyType.DISK_FAILURE) {
+              checkDiskFailuresWithDelay(notificationResult.delay());
+            } else {
+              postProcessAnomalyInProgress(notificationResult.delay());
+            }
             break;
           case IGNORE:
             _anomalyDetectorState.onAnomalyHandle(_anomalyInProgress, AnomalyState.Status.IGNORED);
@@ -486,6 +509,32 @@ public class AnomalyDetectorManager {
         }
       } else {
         _anomalyDetectorState.onAnomalyHandle(_anomalyInProgress, AnomalyState.Status.IGNORED);
+      }
+    }
+
+    /**
+     * Updates the state of the disk failures in progress and schedules a disk failure detection after the given delay, unless
+     * a pending one is due by then (which then checks the disk failures again, and schedules a later detection if needed).
+     * The scheduled detection does not wait for the cluster model generation to change, because the disk failures may become
+     * ready to fix without any change in the cluster.
+     *
+     * @param delayMs The delay for disk failure detection.
+     */
+    private void checkDiskFailuresWithDelay(long delayMs) {
+      synchronized (_shutdownLock) {
+        if (_shutdown) {
+          LOG.debug("Skip delayed checking anomaly {}, because anomaly detector is shutting down.", _anomalyInProgress);
+        } else {
+          // A pending detection with no delay left may already be running, and have reported the disk failures in progress.
+          long pendingDelayMs = _delayedDiskFailureDetection == null ? 0L : _delayedDiskFailureDetection.getDelay(TimeUnit.MILLISECONDS);
+          if (pendingDelayMs <= 0L || pendingDelayMs > delayMs) {
+            LOG.debug("Scheduling disk failure detection with delay of {} ms", delayMs);
+            _numCheckedWithDelay.incrementAndGet();
+            _delayedDiskFailureDetection = _detectorScheduler.schedule(() -> _diskFailureDetector.detectDiskFailures(true),
+                                                                       delayMs, TimeUnit.MILLISECONDS);
+          }
+          _anomalyDetectorState.onAnomalyHandle(_anomalyInProgress, AnomalyState.Status.CHECK_WITH_DELAY);
+        }
       }
     }
 
