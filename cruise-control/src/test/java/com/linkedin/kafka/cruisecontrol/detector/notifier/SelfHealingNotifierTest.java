@@ -167,6 +167,12 @@ public class SelfHealingNotifierTest {
     assertTrue(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.DISK_FAILURE));
     assertTrue(anomalyNotifier.isAutoFixTriggeredFor(KafkaAnomalyType.DISK_FAILURE));
 
+    // Detecting the same disk failures again (e.g. because the fix failed to start) is not alerted again.
+    anomalyNotifier.resetAlert(KafkaAnomalyType.DISK_FAILURE);
+    result = anomalyNotifier.onDiskFailure(diskFailures(kafkaCruiseControlConfig, mockKafkaCruiseControl, failedDisks, true));
+    assertEquals(AnomalyNotificationResult.Action.FIX, result.action());
+    assertFalse(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.DISK_FAILURE));
+
     // (2) Unfixable disk failures are alerted, but not fixed.
     anomalyNotifier.resetAlert(KafkaAnomalyType.DISK_FAILURE);
     failedDisks = Collections.singletonMap(2, Collections.singletonMap(BAD_LOGDIR, failureTime));
@@ -176,6 +182,78 @@ public class SelfHealingNotifierTest {
     assertFalse(anomalyNotifier.isAutoFixTriggeredFor(KafkaAnomalyType.DISK_FAILURE));
 
     EasyMock.verify(mockKafkaCruiseControl);
+  }
+
+  @Test
+  public void testOnDiskFailureWithSelfHealingThreshold() {
+    final long failureTime1 = 200L;
+    final long failureTime2 = 400L;
+    final long startTime = 500L;
+    final long selfHealingThresholdMs = 1000L;
+    KafkaCruiseControl mockKafkaCruiseControl = EasyMock.mock(KafkaCruiseControl.class);
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    KafkaCruiseControlConfig kafkaCruiseControlConfig = new KafkaCruiseControlConfig(props);
+    EasyMock.expect(mockKafkaCruiseControl.config()).andReturn(kafkaCruiseControlConfig).atLeastOnce();
+    EasyMock.replay(mockKafkaCruiseControl);
+    Time mockTime = new MockTime(0, startTime, TimeUnit.NANOSECONDS.convert(startTime, TimeUnit.MILLISECONDS));
+    TestingBrokerFailureAutoFixNotifier anomalyNotifier = new TestingBrokerFailureAutoFixNotifier(mockTime);
+    anomalyNotifier.configure(Map.of(SelfHealingNotifier.SELF_HEALING_DISK_FAILURE_ENABLED_CONFIG, "true",
+                                     SelfHealingNotifier.DISK_FAILURE_SELF_HEALING_THRESHOLD_MS_CONFIG,
+                                     String.valueOf(selfHealingThresholdMs)));
+
+    // (1) Before the threshold, the disk failures are alerted and checked again once the threshold of the earliest one passes.
+    Map<Integer, Map<String, Long>> failedDisks = Map.of(1, Collections.singletonMap(BAD_LOGDIR, failureTime1),
+                                                         2, Collections.singletonMap(BAD_LOGDIR, failureTime2));
+    AnomalyNotificationResult result = anomalyNotifier.onDiskFailure(diskFailures(kafkaCruiseControlConfig, mockKafkaCruiseControl,
+                                                                                  failedDisks, true));
+    assertEquals(AnomalyNotificationResult.Action.CHECK, result.action());
+    assertEquals(failureTime1 + selfHealingThresholdMs - mockTime.milliseconds(), result.delay());
+    assertTrue(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.DISK_FAILURE));
+    assertFalse(anomalyNotifier.isAutoFixTriggeredFor(KafkaAnomalyType.DISK_FAILURE));
+
+    // (2) Sleep to 1 ms before the threshold: still not fixed, and not alerted again.
+    mockTime.sleep(result.delay() - 1);
+    anomalyNotifier.resetAlert(KafkaAnomalyType.DISK_FAILURE);
+    result = anomalyNotifier.onDiskFailure(diskFailures(kafkaCruiseControlConfig, mockKafkaCruiseControl, failedDisks, true));
+    assertEquals(AnomalyNotificationResult.Action.CHECK, result.action());
+    assertEquals(1L, result.delay());
+    assertFalse(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.DISK_FAILURE));
+
+    // (3) Sleep 1 ms: the threshold of the earliest disk failure has passed, so the disk failures are fixed.
+    mockTime.sleep(1);
+    result = anomalyNotifier.onDiskFailure(diskFailures(kafkaCruiseControlConfig, mockKafkaCruiseControl, failedDisks, true));
+    assertEquals(AnomalyNotificationResult.Action.FIX, result.action());
+    assertTrue(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.DISK_FAILURE));
+    assertTrue(anomalyNotifier.isAutoFixTriggeredFor(KafkaAnomalyType.DISK_FAILURE));
+
+    // (4) Unfixable disk failures are not checked again, even before the threshold.
+    anomalyNotifier.resetAlert(KafkaAnomalyType.DISK_FAILURE);
+    failedDisks = Collections.singletonMap(3, Collections.singletonMap(BAD_LOGDIR, mockTime.milliseconds()));
+    result = anomalyNotifier.onDiskFailure(diskFailures(kafkaCruiseControlConfig, mockKafkaCruiseControl, failedDisks, false));
+    assertEquals(AnomalyNotificationResult.Action.IGNORE, result.action());
+    assertTrue(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.DISK_FAILURE));
+    assertFalse(anomalyNotifier.isAutoFixTriggeredFor(KafkaAnomalyType.DISK_FAILURE));
+
+    // (5) With self-healing disabled, disk failures are alerted once, and not checked again, even before the threshold.
+    anomalyNotifier.setSelfHealingFor(KafkaAnomalyType.DISK_FAILURE, false);
+    anomalyNotifier.resetAlert(KafkaAnomalyType.DISK_FAILURE);
+    failedDisks = Collections.singletonMap(4, Collections.singletonMap(BAD_LOGDIR, mockTime.milliseconds()));
+    result = anomalyNotifier.onDiskFailure(diskFailures(kafkaCruiseControlConfig, mockKafkaCruiseControl, failedDisks, true));
+    assertEquals(AnomalyNotificationResult.Action.IGNORE, result.action());
+    assertTrue(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.DISK_FAILURE));
+    assertFalse(anomalyNotifier.isAutoFixTriggeredFor(KafkaAnomalyType.DISK_FAILURE));
+    anomalyNotifier.resetAlert(KafkaAnomalyType.DISK_FAILURE);
+    result = anomalyNotifier.onDiskFailure(diskFailures(kafkaCruiseControlConfig, mockKafkaCruiseControl, failedDisks, true));
+    assertEquals(AnomalyNotificationResult.Action.IGNORE, result.action());
+    assertFalse(anomalyNotifier.isAlertCalledFor(KafkaAnomalyType.DISK_FAILURE));
+
+    EasyMock.verify(mockKafkaCruiseControl);
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void testNegativeDiskFailureSelfHealingThreshold() {
+    SelfHealingNotifier anomalyNotifier = new SelfHealingNotifier(new MockTime());
+    anomalyNotifier.configure(Collections.singletonMap(SelfHealingNotifier.DISK_FAILURE_SELF_HEALING_THRESHOLD_MS_CONFIG, "-1"));
   }
 
   private static DiskFailures diskFailures(KafkaCruiseControlConfig kafkaCruiseControlConfig,

@@ -19,10 +19,15 @@ import com.linkedin.kafka.cruisecontrol.KafkaCruiseControl;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUnitTestUtils;
 import com.linkedin.kafka.cruisecontrol.common.MetadataClient;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
+import com.linkedin.kafka.cruisecontrol.config.constants.AnomalyDetectorConfig;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutorState;
 import com.linkedin.kafka.cruisecontrol.monitor.LoadMonitor;
 import com.linkedin.kafka.cruisecontrol.monitor.ModelGeneration;
 import com.linkedin.kafka.cruisecontrol.monitor.task.LoadMonitorTaskRunner;
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -40,9 +45,12 @@ import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.errors.KafkaStorageException;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.internals.KafkaFutureImpl;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 import org.easymock.EasyMock;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -58,10 +66,12 @@ public class DiskFailureDetectorTest {
   private static final String TOPIC = "topic";
   private static final String HEALTHY_LOGDIR = "/data/healthy";
   private static final String FAILED_LOGDIR = "/data/failed";
+  private static final String OTHER_FAILED_LOGDIR = "/data/other-failed";
   private static final List<Node> NODES = Arrays.asList(new Node(0, "host0", 9092),
                                                         new Node(1, "host1", 9092),
                                                         new Node(2, "host2", 9092));
   private final Time _time = new MockTime(0L, 100L, 0L);
+  private File _failedDisksFile;
   private final Queue<Anomaly> _anomalies = new PriorityBlockingQueue<>(10, anomalyComparator());
   // Log dirs reported by describeLogDirs.
   private Map<Integer, KafkaFuture<Map<String, LogDirDescription>>> _logDirsByBroker;
@@ -70,21 +80,30 @@ public class DiskFailureDetectorTest {
   private int _clusterGeneration;
 
   /**
-   * Start with healthy disks on all brokers and no partitions.
+   * Start with healthy disks on all brokers, no partitions and no persisted failed disks.
    */
   @Before
-  public void setUp() {
+  public void setUp() throws IOException {
     _logDirsByBroker = new HashMap<>();
     for (Node node : NODES) {
-      _logDirsByBroker.put(node.id(), logDirs(false));
+      _logDirsByBroker.put(node.id(), logDirs());
     }
     _partitions = new ArrayList<>();
+    _failedDisksFile = File.createTempFile("DiskFailureDetectorTest", ".txt");
+  }
+
+  /**
+   * Delete the persisted failed disks.
+   */
+  @After
+  public void tearDown() throws IOException {
+    Files.deleteIfExists(_failedDisksFile.toPath());
   }
 
   @Test
   public void testReportFailedDiskWithOfflineReplicas() {
     DiskFailureDetector detector = createDiskFailureDetector();
-    _logDirsByBroker.put(0, logDirs(true));
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR));
     // Broker 0 has an offline replica of a partition with a leader.
     _partitions.add(partition(0, NODES.get(1), Arrays.asList(0, 1), Collections.singletonList(0)));
 
@@ -99,7 +118,7 @@ public class DiskFailureDetectorTest {
   @Test
   public void testSkipFailedDiskWithoutOfflineReplicas() {
     DiskFailureDetector detector = createDiskFailureDetector();
-    _logDirsByBroker.put(0, logDirs(true));
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR));
     // The replicas on the failed disk of broker 0 have already been moved away, so broker 0 has no offline replicas.
     _partitions.add(partition(0, NODES.get(1), Arrays.asList(1, 2), Collections.emptyList()));
 
@@ -113,7 +132,7 @@ public class DiskFailureDetectorTest {
   @Test
   public void testReportFailedDiskWithOfflineReplicasOfLeaderlessPartitionsAsUnfixable() throws Exception {
     DiskFailureDetector detector = createDiskFailureDetector();
-    _logDirsByBroker.put(0, logDirs(true));
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR));
     // The only replica of the partition was on the failed disk of broker 0, so the partition has no leader.
     _partitions.add(partition(0, null, Collections.singletonList(0), Collections.singletonList(0)));
 
@@ -127,8 +146,8 @@ public class DiskFailureDetectorTest {
   @Test
   public void testReportOnlyFailedDisksOfBrokersWithOfflineReplicas() {
     DiskFailureDetector detector = createDiskFailureDetector();
-    _logDirsByBroker.put(0, logDirs(true));
-    _logDirsByBroker.put(1, logDirs(true));
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR));
+    _logDirsByBroker.put(1, logDirs(FAILED_LOGDIR));
     // Broker 0 has an offline replica. Broker 1 has none, so its failed disk is empty.
     _partitions.add(partition(0, NODES.get(2), Arrays.asList(0, 2), Collections.singletonList(0)));
     _partitions.add(partition(1, NODES.get(2), Arrays.asList(1, 2), Collections.emptyList()));
@@ -138,6 +157,131 @@ public class DiskFailureDetectorTest {
     DiskFailures diskFailures = (DiskFailures) _anomalies.poll();
     assertTrue(diskFailures.fixable());
     assertEquals(Collections.singleton(0), diskFailures.failedDisks().keySet());
+  }
+
+  @Test
+  public void testKeepAndPersistFirstDetectionTime() throws IOException {
+    DiskFailureDetector detector = createDiskFailureDetector();
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR));
+    _partitions.add(partition(0, NODES.get(1), Arrays.asList(0, 1), Collections.singletonList(0)));
+    final long firstDetectionTimeMs = _time.milliseconds();
+
+    runDetector(detector);
+    assertFailedDisksReported(Collections.singletonMap(0, Collections.singletonMap(FAILED_LOGDIR, firstDetectionTimeMs)));
+    assertEquals(String.format("0:%s=%d", FAILED_LOGDIR, firstDetectionTimeMs), detector.loadPersistedFailedDisks());
+
+    // A later detection reports the time the disk failure was first detected.
+    _time.sleep(1000L);
+    runDetector(detector);
+    assertFailedDisksReported(Collections.singletonMap(0, Collections.singletonMap(FAILED_LOGDIR, firstDetectionTimeMs)));
+
+    // Once the disk is no longer failed (e.g. removed from log.dirs), it is forgotten.
+    _logDirsByBroker.put(0, logDirs());
+    _partitions.clear();
+    runDetector(detector);
+    assertTrue(_anomalies.isEmpty());
+    assertTrue(detector.failedDisks().isEmpty());
+    assertEquals("", detector.loadPersistedFailedDisks());
+  }
+
+  @Test
+  public void testLoadPersistedFailedDisksAfterRestart() {
+    DiskFailureDetector detector = createDiskFailureDetector();
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR));
+    _partitions.add(partition(0, NODES.get(1), Arrays.asList(0, 1), Collections.singletonList(0)));
+    final long firstDetectionTimeMs = _time.milliseconds();
+    runDetector(detector);
+    _anomalies.clear();
+
+    // A restarted detector keeps the time the disk failure was first detected.
+    _time.sleep(1000L);
+    DiskFailureDetector restartedDetector = createDiskFailureDetector();
+    assertEquals(Collections.singletonMap(0, Collections.singletonMap(FAILED_LOGDIR, firstDetectionTimeMs)), restartedDetector.failedDisks());
+    runDetector(restartedDetector);
+    assertFailedDisksReported(Collections.singletonMap(0, Collections.singletonMap(FAILED_LOGDIR, firstDetectionTimeMs)));
+  }
+
+  @Test
+  public void testLoadPersistedFailedDisksWithSpecialCharacters() throws IOException {
+    final String logdir = "/data/a:b=c";
+    Files.writeString(_failedDisksFile.toPath(), String.format("0:%s=123,1:%s=456", logdir, FAILED_LOGDIR), StandardCharsets.UTF_8);
+    DiskFailureDetector detector = createDiskFailureDetector();
+    assertEquals(Map.of(0, Collections.singletonMap(logdir, 123L), 1, Collections.singletonMap(FAILED_LOGDIR, 456L)),
+                 detector.failedDisks());
+  }
+
+  @Test
+  public void testIgnoreCorruptPersistedFailedDisks() throws IOException {
+    for (String corrupt : Arrays.asList("corrupt", String.format("0:%s=123,1:%s", FAILED_LOGDIR, FAILED_LOGDIR),
+                                        String.format("x:%s=123", FAILED_LOGDIR), String.format(":%s=123", FAILED_LOGDIR))) {
+      Files.writeString(_failedDisksFile.toPath(), corrupt, StandardCharsets.UTF_8);
+      assertTrue(corrupt, createDiskFailureDetector().failedDisks().isEmpty());
+    }
+  }
+
+  @Test
+  public void testFirstDetectionTimeStartsWhenBrokerHasOfflineReplicas() {
+    DiskFailureDetector detector = createDiskFailureDetector();
+    // An empty failed disk is not reported or kept.
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR));
+    runDetector(detector);
+    assertTrue(_anomalies.isEmpty());
+    assertTrue(detector.failedDisks().isEmpty());
+
+    // Once another disk of the broker fails with replicas on it, the failure time of both disks is the time of this detection,
+    // so that the new disk failure does not inherit the earlier failure time of the empty disk.
+    _time.sleep(1000L);
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR, OTHER_FAILED_LOGDIR));
+    _partitions.add(partition(0, NODES.get(1), Arrays.asList(0, 1), Collections.singletonList(0)));
+    runDetector(detector);
+    assertFailedDisksReported(Collections.singletonMap(0, Map.of(FAILED_LOGDIR, _time.milliseconds(),
+                                                                 OTHER_FAILED_LOGDIR, _time.milliseconds())));
+  }
+
+  @Test
+  public void testKeepFailedDisksOfBrokerWithUnknownLogdirs() {
+    DiskFailureDetector detector = createDiskFailureDetector();
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR));
+    _partitions.add(partition(0, NODES.get(1), Arrays.asList(0, 1), Collections.singletonList(0)));
+    final long firstDetectionTimeMs = _time.milliseconds();
+    runDetector(detector);
+    _anomalies.clear();
+
+    // The logdirs of broker 0 cannot be retrieved: its failed disks are not reported, but kept.
+    KafkaFutureImpl<Map<String, LogDirDescription>> failedFuture = new KafkaFutureImpl<>();
+    failedFuture.completeExceptionally(new TimeoutException("Timed out"));
+    _logDirsByBroker.put(0, failedFuture);
+    _time.sleep(1000L);
+    runDetector(detector);
+    assertTrue(_anomalies.isEmpty());
+    assertEquals(Collections.singletonMap(0, Collections.singletonMap(FAILED_LOGDIR, firstDetectionTimeMs)), detector.failedDisks());
+
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR));
+    runDetector(detector);
+    assertFailedDisksReported(Collections.singletonMap(0, Collections.singletonMap(FAILED_LOGDIR, firstDetectionTimeMs)));
+  }
+
+  @Test
+  public void testSkipModelGenerationCheck() {
+    DiskFailureDetector detector = createDiskFailureDetector();
+    _logDirsByBroker.put(0, logDirs(FAILED_LOGDIR));
+    _partitions.add(partition(0, NODES.get(1), Arrays.asList(0, 1), Collections.singletonList(0)));
+    runDetector(detector);
+    assertEquals(1, _anomalies.size());
+    _anomalies.clear();
+
+    // The cluster model generation has not changed, so a periodic detection is skipped, but a forced one is not.
+    detector.run();
+    assertTrue(_anomalies.isEmpty());
+    detector.detectDiskFailures(true);
+    assertEquals(1, _anomalies.size());
+  }
+
+  private void assertFailedDisksReported(Map<Integer, Map<String, Long>> expectedFailedDisks) {
+    assertEquals(1, _anomalies.size());
+    DiskFailures diskFailures = (DiskFailures) _anomalies.poll();
+    assertTrue(diskFailures.fixable());
+    assertEquals(expectedFailedDisks, diskFailures.failedDisks());
   }
 
   /**
@@ -161,17 +305,18 @@ public class DiskFailureDetectorTest {
     return new PartitionInfo(TOPIC, partition, leader, replicaNodes, inSyncReplicaNodes, offlineReplicaNodes);
   }
 
-  private static KafkaFuture<Map<String, LogDirDescription>> logDirs(boolean hasFailedLogdir) {
+  private static KafkaFuture<Map<String, LogDirDescription>> logDirs(String... failedLogdirs) {
     Map<String, LogDirDescription> logDirs = new HashMap<>();
     logDirs.put(HEALTHY_LOGDIR, new LogDirDescription(null, Collections.emptyMap()));
-    if (hasFailedLogdir) {
-      logDirs.put(FAILED_LOGDIR, new LogDirDescription(new KafkaStorageException("Disk failure"), Collections.emptyMap()));
+    for (String failedLogdir : failedLogdirs) {
+      logDirs.put(failedLogdir, new LogDirDescription(new KafkaStorageException("Disk failure"), Collections.emptyMap()));
     }
     return KafkaFuture.completedFuture(logDirs);
   }
 
   private DiskFailureDetector createDiskFailureDetector() {
     Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnomalyDetectorConfig.FAILED_DISKS_FILE_PATH_CONFIG, _failedDisksFile.getPath());
     KafkaCruiseControlConfig config = new KafkaCruiseControlConfig(props);
 
     DescribeLogDirsResult mockDescribeLogDirsResult = EasyMock.mock(DescribeLogDirsResult.class);
