@@ -97,11 +97,11 @@ public class KafkaCruiseControl {
     try (InputStream resourceStream = KafkaCruiseControl.class.getResourceAsStream("/cruise-control/cruise-control-version.properties")) {
       props.load(resourceStream);
     } catch (Exception e) {
-      LOG.warn("Error while loading cruise-control-version.properties :" + e.getMessage());
+      LOG.warn("Error while loading cruise-control-version.properties :{}", e.getMessage());
     }
     VERSION = props.getProperty("version", "unknown").trim();
     COMMIT_ID = props.getProperty("commitId", "unknown").trim();
-    LOG.info("COMMIT INFO: " + VERSION + "---" + COMMIT_ID);
+    LOG.info("COMMIT INFO: {} --- {}", VERSION, COMMIT_ID);
   }
 
   /**
@@ -219,11 +219,11 @@ public class KafkaCruiseControl {
    * Start up the Cruise Control.
    */
   public void startUp() {
-    LOG.info("Starting Kafka Cruise Control...");
+    LOG.info("Starting Cruise Control...");
     _loadMonitor.startUp();
     _anomalyDetectorManager.startDetection();
     _goalOptimizerExecutor.execute(_goalOptimizer);
-    LOG.info("Kafka Cruise Control started.");
+    LOG.info("Cruise Control started.");
   }
 
   /**
@@ -231,13 +231,13 @@ public class KafkaCruiseControl {
    */
   public void shutdown() {
     Thread t = new Thread(() -> {
-      LOG.info("Shutting down Kafka Cruise Control...");
+      LOG.info("Shutting down Cruise Control...");
       _loadMonitor.shutdown();
       _executor.shutdown();
       _anomalyDetectorManager.shutdown();
       _goalOptimizer.shutdown();
       closeAdminClientWithTimeout(_adminClient);
-      LOG.info("Kafka Cruise Control shutdown completed.");
+      LOG.info("Cruise Control shutdown completed.");
     });
     t.setDaemon(true);
     t.start();
