@@ -479,16 +479,19 @@ public final class ExecutorConfig {
   public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_CONFIG = "concurrency.adjuster.replication.throttle.enabled";
   public static final boolean DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED = false;
   public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_DOC = "Enable the concurrency adjuster to dynamically "
-      + "adjust the replication throttle (leader and follower throttled rates) of each broker during throttled inter-broker replica "
-      + "movements. While replicas are being moved to (from) a broker, its follower (leader) throttle is raised step by step towards "
-      + "its network headroom (see concurrency.adjuster.replication.throttle.target.network.utilization) and at once to the throttle "
-      + "needed by the write rate of the partitions being moved (see concurrency.adjuster.replication.throttle.write.rate.margin). It "
-      + "is reduced at once when the headroom shrinks, and divided if the broker violates any concurrency adjuster limit or hosts "
-      + "(At/Under)MinISR partitions with an out-of-sync replica (see "
-      + "concurrency.adjuster.replication.throttle.min.isr.check.enabled). The throttle of a broker without metrics in the current "
-      + "metrics window is left unchanged. It only applies to executions started with a replication throttle. It can be enabled or "
-      + "disabled at runtime with the replication_throttle_adjustment parameter of the admin endpoint; disabling it during an "
-      + "execution leaves the replication throttles at their last values until the execution ends.";
+      + "adjust the replication throttle (leader and follower throttled rates) of each broker during inter-broker replica movements. "
+      + "While replicas are being moved to (from) a broker, its follower (leader) throttle is raised step by step towards its network "
+      + "headroom (see concurrency.adjuster.replication.throttle.target.network.utilization) and at once to the throttle needed by "
+      + "the write rate of the partitions being moved (see concurrency.adjuster.replication.throttle.write.rate.margin), at each "
+      + "metric-based check. It is reduced at once when the headroom shrinks, checked at each adjuster run, and divided if the broker "
+      + "violates any concurrency adjuster limit or hosts (At/Under)MinISR partitions with an out-of-sync replica (see "
+      + "concurrency.adjuster.replication.throttle.min.isr.check.enabled). A change smaller than 5% of the current throttle is "
+      + "ignored, so traffic fluctuations do not cause config updates. A broker without metrics in the current metrics window uses "
+      + "its last valid metrics from within one broker metrics window; without either, its throttle is left unchanged. An execution "
+      + "started without a replication throttle (neither replication_throttle nor default.replication.throttle) starts each broker at "
+      + "its network headroom, bounded by the minimum and maximum replication throttles of the concurrency adjuster. It can be "
+      + "enabled or disabled at runtime with the replication_throttle_adjustment parameter of the admin endpoint; disabling it during "
+      + "an execution leaves the replication throttles at their last values until the execution ends.";
 
   /**
    * <code>concurrency.adjuster.min.replication.throttle</code>

@@ -325,6 +325,44 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
   }
 
   @Test
+  public void testUpdateThrottleRatesInBatch() throws Exception {
+    createTopics();
+
+    final long throttleRate = 100L;
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttleRate);
+    ExecutionProposal proposal = new ExecutionProposal(new TopicPartition(TOPIC0, 0),
+                                                       100,
+                                                       new ReplicaPlacementInfo(0),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+
+    // Rates set before any broker is throttled are only remembered -- e.g. the initial rates of an execution without a throttle.
+    throttleHelper.updateThrottleRates(Map.of(0, 150L, 3, 160L), Map.of(0, 250L, 3, 260L));
+    for (int i = 0; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, null);
+    }
+    throttleHelper.setThrottles(Collections.singletonList(proposal));
+    assertExpectedThrottledRatesForBroker(0, 150L, 250L);
+    assertExpectedThrottledRateForBroker(1, throttleRate);
+    assertExpectedThrottledRateForBroker(2, throttleRate);
+    assertExpectedThrottledRateForBroker(3, null);
+
+    // Several throttled brokers are updated in one batch; broker 3 is not throttled, so its rates are only remembered.
+    throttleHelper.updateThrottleRates(Map.of(1, 200L, 2, 210L, 3, 220L), Map.of(1, 300L, 2, 310L, 3, 320L));
+    assertExpectedThrottledRatesForBroker(0, 150L, 250L);
+    assertExpectedThrottledRatesForBroker(1, 200L, 300L);
+    assertExpectedThrottledRatesForBroker(2, 210L, 310L);
+    assertExpectedThrottledRateForBroker(3, null);
+    assertEquals(220L, throttleHelper.leaderThrottleRate(3).longValue());
+
+    throttleHelper.clearThrottles(Collections.singletonList(completedTaskForProposal(0, proposal)), Collections.emptyList());
+    for (int i = 0; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, null);
+    }
+    assertExpectedThrottledReplicas(TOPIC0, "");
+  }
+
+  @Test
   public void testAddingThrottlesWithPreExistingThrottles() throws Exception {
     createTopics();
 
