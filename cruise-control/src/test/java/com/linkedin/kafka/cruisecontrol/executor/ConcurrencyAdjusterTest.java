@@ -336,7 +336,7 @@ public class ConcurrencyAdjusterTest {
   private static double recommendedReplicationThrottleInMB(double currentThrottleMB, double capacityMB, double nonThrottledMB,
                                                            boolean hasInProgressMovements) {
     long recommended = ExecutionUtils.recommendedReplicationThrottle((long) (currentThrottleMB * MB_IN_BYTES), 0L, hasInProgressMovements,
-                                                                     capacityMB * MB_IN_KB, nonThrottledMB * MB_IN_KB);
+                                                                     capacityMB * MB_IN_KB, nonThrottledMB * MB_IN_KB, true);
     return (double) recommended / MB_IN_BYTES;
   }
 
@@ -358,7 +358,7 @@ public class ConcurrencyAdjusterTest {
     long throttle = (long) (initialThrottleMB * MB_IN_BYTES);
     for (double leaderMB : leaderMBByRound) {
       throttle = ExecutionUtils.recommendedReplicationThrottle(throttle, (long) (neededMB * MB_IN_BYTES), true, capacityMB * MB_IN_KB,
-                                                               (leaderMB + inSyncReplicationMB) * MB_IN_KB);
+                                                               (leaderMB + inSyncReplicationMB) * MB_IN_KB, true);
       throttleMBByRound.add((double) throttle / MB_IN_BYTES);
     }
     return throttleMBByRound;
@@ -388,6 +388,53 @@ public class ConcurrencyAdjusterTest {
     assertEquals(200.0, recommendedReplicationThrottleInMB(200.0, 1000.0, 0.0, true), delta);
     // Headroom: 0.8 * 100 - 10 = 70 MB/sec, which is equal to the current throttle. No change.
     assertEquals(70.0, recommendedReplicationThrottleInMB(70.0, 100.0, 10.0, true), delta);
+
+    // Between metric-based checks, only decreases apply: a throttle above the headroom is decreased at once, ...
+    long mb = MB_IN_BYTES;
+    assertEquals(5 * mb, ExecutionUtils.recommendedReplicationThrottle(30 * mb, 0L, true, 100 * MB_IN_KB, 75 * MB_IN_KB, false));
+    // ... but neither the additive increase nor the needed throttle raises a throttle below the headroom.
+    assertEquals(20 * mb, ExecutionUtils.recommendedReplicationThrottle(20 * mb, 40 * mb, true, 100 * MB_IN_KB, 10 * MB_IN_KB, false));
+
+    // A change smaller than 5% of the current throttle is ignored: the headroom fluctuates with the traffic.
+    // Headroom: 0.8 * 100 - 12 = 68 MB/sec, 2.9% below 70 MB/sec. No change.
+    assertEquals(70.0, recommendedReplicationThrottleInMB(70.0, 100.0, 12.0, true), delta);
+    // Headroom: 0.8 * 100 - 20 = 60 MB/sec, 14% below 70 MB/sec. Decrease.
+    assertEquals(60.0, recommendedReplicationThrottleInMB(70.0, 100.0, 20.0, true), delta);
+    // Headroom: 0.8 * 100 - 8 = 72 MB/sec, 2.9% above 70 MB/sec. No change.
+    assertEquals(70.0, recommendedReplicationThrottleInMB(70.0, 100.0, 8.0, true), delta);
+  }
+
+  @Test
+  public void testInitialReplicationThrottle() {
+    long mb = MB_IN_BYTES;
+    // The headroom: 0.8 * 100 - 30 = 50 MB/sec.
+    assertEquals(50 * mb, ExecutionUtils.initialReplicationThrottle(100 * MB_IN_KB, 30 * MB_IN_KB));
+    // Bounded by the minimum throttle when there is no headroom ...
+    assertEquals(MOCK_MIN_REPLICATION_THROTTLE, ExecutionUtils.initialReplicationThrottle(100 * MB_IN_KB, 90 * MB_IN_KB));
+    // ... and by the maximum throttle.
+    assertEquals(MOCK_MAX_REPLICATION_THROTTLE, ExecutionUtils.initialReplicationThrottle(1000 * MB_IN_KB, 0.0));
+    assertEquals(MOCK_MAX_REPLICATION_THROTTLE, ExecutionUtils.maxReplicationThrottle());
+  }
+
+  @Test
+  public void testBrokerMetricsWithLastKnownFallback() {
+    short leaderBytesInId = KafkaMetricDef.brokerMetricDef().metricInfo(KafkaMetricDef.LEADER_BYTES_IN.name()).id();
+    ValuesAndExtrapolations valid0 = buildValuesAndExtrapolations(Map.of(leaderBytesInId, 10.0), Extrapolation.AVG_AVAILABLE);
+    ValuesAndExtrapolations valid1 = buildValuesAndExtrapolations(Map.of(leaderBytesInId, 20.0), Extrapolation.AVG_AVAILABLE);
+    ValuesAndExtrapolations empty = buildValuesAndExtrapolations(Map.of(leaderBytesInId, 0.0), Extrapolation.NO_VALID_EXTRAPOLATION);
+    Map<Integer, ExecutionUtils.TimedMetrics> lastValid = new HashMap<>();
+    long windowMs = 300_000L;
+
+    // Brokers 0 and 1 have valid current metrics, broker 2 has none and no history: it is omitted.
+    assertEquals(Map.of(0, valid0, 1, valid1),
+                 ExecutionUtils.brokerMetricsWithLastKnownFallback(Map.of(0, valid0, 1, valid1, 2, empty), lastValid, 0L, windowMs));
+    // The window rolls: broker 0 has no sample yet and falls back to its last valid metrics, broker 1 has valid metrics again.
+    ValuesAndExtrapolations valid1b = buildValuesAndExtrapolations(Map.of(leaderBytesInId, 30.0), Extrapolation.AVG_AVAILABLE);
+    assertEquals(Map.of(0, valid0, 1, valid1b),
+                 ExecutionUtils.brokerMetricsWithLastKnownFallback(Map.of(0, empty, 1, valid1b), lastValid, 60_000L, windowMs));
+    // The last valid metrics of broker 0 are older than one window by now: it is omitted.
+    assertEquals(Map.of(1, valid1b),
+                 ExecutionUtils.brokerMetricsWithLastKnownFallback(Map.of(0, empty, 1, valid1b), lastValid, 300_001L, windowMs));
   }
 
   @Test
@@ -518,7 +565,7 @@ public class ConcurrencyAdjusterTest {
     Map<TopicPartition, Double> lastKnownWriteRateKBpsByPartition = new HashMap<>(Map.of(tp1, 5.0, tp3, 7.0));
 
     // tp0 has a valid write rate, which is recorded as its last known write rate. tp1 and tp2 have no sample in the current metric
-    // window yet (e.g. right after the metric window rolled): tp1 falls back to its last known write rate, tp2 has none. tp3 has no
+    // window yet (e.g. their brokers missed the latest sampling round): tp1 falls back to its last known write rate, tp2 has none. tp3 has no
     // current metrics, so its last known write rate is kept.
     Map<PartitionEntity, ValuesAndExtrapolations> currentMetricsByPartition = Map.of(
         new PartitionEntity(tp0), buildValuesAndExtrapolations(Map.of(leaderBytesInId, 10.0), Extrapolation.AVG_AVAILABLE),

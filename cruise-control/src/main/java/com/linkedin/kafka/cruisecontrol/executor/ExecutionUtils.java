@@ -103,6 +103,9 @@ public final class ExecutionUtils {
   private static long listPartitionReassignmentsTimeoutMs;
   private static int listPartitionReassignmentsMaxAttempts;
   static final double BYTES_IN_KB = 1024.0;
+  // The concurrency adjuster ignores a replication throttle change smaller than this fraction of the current throttle: the network
+  // headroom fluctuates with the traffic, and each change costs a config update and verification of the broker.
+  static final double REPLICATION_THROTTLE_CHANGE_TOLERANCE = 0.05;
   // Bounds and adjustment parameters of the replication throttle (bytes/sec) used by the concurrency adjuster.
   private static long minReplicationThrottle;
   private static long maxReplicationThrottle;
@@ -182,8 +185,8 @@ public final class ExecutionUtils {
 
   /**
    * Check whether the given current metrics of an entity (i.e. metrics of the current metric window) have valid values. They do not if
-   * the entity has no metric sample in the current window yet -- e.g. right after the metric window rolls -- in which case all values
-   * are {@code 0}.
+   * the entity has no metric sample in the current window -- e.g. it missed the sampling round that started the window (a new
+   * window starts with a sample) -- in which case all values are {@code 0}.
    *
    * @param currentMetrics Current metrics of an entity, or {@code null} if unavailable.
    * @return {@code true} if the given current metrics have valid values, {@code false} otherwise.
@@ -360,7 +363,7 @@ public final class ExecutionUtils {
    * <ul>
    *   <li>If the target is below the current throttle, the throttle is decreased to the target at once (bounded by the minimum
    *   throttle), even below the throttle needed by the in-progress replica movements -- i.e. the network headroom wins.</li>
-   *   <li>Otherwise, the throttle is raised to the higher of
+   *   <li>Otherwise, if {@code canIncrease} is {@code true}, the throttle is raised to the higher of
    *   <ul>
    *     <li>the current throttle plus the additive increase, if the broker has in-progress throttled replica movements in this
    *     direction -- i.e. only if the throttle may be limiting replica movements, and</li>
@@ -368,6 +371,8 @@ public final class ExecutionUtils {
    *   </ul>
    *   but never above the target or the maximum throttle. It is never decreased in this case.</li>
    * </ul>
+   * The concurrency adjuster checks for a decrease at each run, and allows an increase only at metric-based checks. A change smaller
+   * than {@link #REPLICATION_THROTTLE_CHANGE_TOLERANCE} of the current throttle is ignored.
    *
    * @param currentThrottle The current throttle (bytes/sec) of the broker in the relevant direction.
    * @param neededThrottle The throttle (bytes/sec) needed by the in-progress replica movements of the broker in the relevant
@@ -377,27 +382,115 @@ public final class ExecutionUtils {
    * @param networkCapacityKBps The network capacity (KB/sec) of the broker in the relevant direction.
    * @param nonThrottledTrafficKBps The traffic (KB/sec) of the broker in the relevant direction that the throttle does not limit,
    *                                i.e. the leader traffic and the replication traffic of in-sync followers.
+   * @param canIncrease {@code true} if the throttle may be increased, {@code false} if it may only be decreased.
    * @return The recommended throttle (bytes/sec) of the broker in the relevant direction.
    */
   static long recommendedReplicationThrottle(long currentThrottle,
                                              long neededThrottle,
                                              boolean hasInProgressMovements,
                                              double networkCapacityKBps,
-                                             double nonThrottledTrafficKBps) {
-    double targetThrottleKBps = replicationThrottleTargetNetworkUtilization * networkCapacityKBps - nonThrottledTrafficKBps;
-    long targetThrottle = (long) Math.max(0.0, targetThrottleKBps * BYTES_IN_KB);
+                                             double nonThrottledTrafficKBps,
+                                             boolean canIncrease) {
+    long targetThrottle = targetReplicationThrottle(networkCapacityKBps, nonThrottledTrafficKBps);
+    long recommendedThrottle = currentThrottle;
     if (targetThrottle < currentThrottle) {
       // Decrease at once (MIN: minReplicationThrottle).
-      return Math.min(currentThrottle, Math.max(minReplicationThrottle, targetThrottle));
+      recommendedThrottle = Math.min(currentThrottle, Math.max(minReplicationThrottle, targetThrottle));
+    } else if (canIncrease) {
+      long maxThrottle = Math.min(targetThrottle, maxReplicationThrottle);
+      if (hasInProgressMovements) {
+        // Additive-increase (MAX: target throttle and maxReplicationThrottle).
+        recommendedThrottle = Math.max(recommendedThrottle, Math.min(maxThrottle, currentThrottle + additiveIncreaseReplicationThrottle));
+      }
+      // Increase at once to the throttle needed by the in-progress movements (MAX: target throttle and maxReplicationThrottle).
+      recommendedThrottle = Math.max(recommendedThrottle, Math.min(neededThrottle, maxThrottle));
     }
-    long maxThrottle = Math.min(targetThrottle, maxReplicationThrottle);
-    long recommendedThrottle = currentThrottle;
-    if (hasInProgressMovements) {
-      // Additive-increase (MAX: target throttle and maxReplicationThrottle).
-      recommendedThrottle = Math.max(recommendedThrottle, Math.min(maxThrottle, currentThrottle + additiveIncreaseReplicationThrottle));
+    return Math.abs(recommendedThrottle - currentThrottle) < REPLICATION_THROTTLE_CHANGE_TOLERANCE * currentThrottle
+           ? currentThrottle : recommendedThrottle;
+  }
+
+  /**
+   * @param networkCapacityKBps The network capacity (KB/sec) of a broker in one traffic direction.
+   * @param nonThrottledTrafficKBps The traffic (KB/sec) of the broker in that direction that the throttle does not limit.
+   * @return The throttle (bytes/sec) that would bring the network utilization of the broker in that direction to the target network
+   * utilization, or {@code 0} if the broker is already above it.
+   */
+  static long targetReplicationThrottle(double networkCapacityKBps, double nonThrottledTrafficKBps) {
+    double targetThrottleKBps = replicationThrottleTargetNetworkUtilization * networkCapacityKBps - nonThrottledTrafficKBps;
+    return (long) Math.max(0.0, targetThrottleKBps * BYTES_IN_KB);
+  }
+
+  /**
+   * Get the replication throttle to start a broker at, in one traffic direction, for an execution that was started without a
+   * replication throttle while replication throttle adjustment is enabled: its network headroom (see
+   * {@link #targetReplicationThrottle}), bounded by the minimum and maximum throttles of the concurrency adjuster.
+   *
+   * @param networkCapacityKBps The network capacity (KB/sec) of the broker in that direction.
+   * @param nonThrottledTrafficKBps The traffic (KB/sec) of the broker in that direction that the throttle does not limit.
+   * @return The initial replication throttle (bytes/sec) of the broker in that direction.
+   */
+  static long initialReplicationThrottle(double networkCapacityKBps, double nonThrottledTrafficKBps) {
+    return Math.min(maxReplicationThrottle, Math.max(minReplicationThrottle, targetReplicationThrottle(networkCapacityKBps,
+                                                                                                        nonThrottledTrafficKBps)));
+  }
+
+  /**
+   * @return The maximum replication throttle (bytes/sec) that the concurrency adjuster can set on a broker.
+   */
+  static long maxReplicationThrottle() {
+    return maxReplicationThrottle;
+  }
+
+  /**
+   * Get the metrics of brokers to adjust the replication throttle with: the metrics of the current metric window if they have
+   * valid values, or otherwise the last valid metrics of the broker if they were seen within the given maximum age -- e.g. if the
+   * broker missed the sampling round that started the current window. Brokers with neither are omitted.
+   *
+   * @param currentMetricsByBrokerId Current metrics by broker id.
+   * @param lastValidMetricsByBrokerId The last valid metrics by broker id, with the time they were seen; updated with the valid
+   *                                   current metrics.
+   * @param nowMs The current time (ms).
+   * @param maxAgeMs The maximum age (ms) of the last valid metrics to fall back to.
+   * @return The metrics to use by broker id.
+   */
+  static Map<Integer, ValuesAndExtrapolations> brokerMetricsWithLastKnownFallback(
+      Map<Integer, ValuesAndExtrapolations> currentMetricsByBrokerId,
+      Map<Integer, TimedMetrics> lastValidMetricsByBrokerId,
+      long nowMs,
+      long maxAgeMs) {
+    for (Map.Entry<Integer, ValuesAndExtrapolations> entry : currentMetricsByBrokerId.entrySet()) {
+      if (hasValidCurrentWindowValues(entry.getValue())) {
+        lastValidMetricsByBrokerId.put(entry.getKey(), new TimedMetrics(entry.getValue(), nowMs));
+      }
     }
-    // Increase at once to the throttle needed by the in-progress movements (MAX: target throttle and maxReplicationThrottle).
-    return Math.max(recommendedThrottle, Math.min(neededThrottle, maxThrottle));
+    Map<Integer, ValuesAndExtrapolations> metricsByBrokerId = new HashMap<>();
+    for (Map.Entry<Integer, TimedMetrics> entry : lastValidMetricsByBrokerId.entrySet()) {
+      if (nowMs - entry.getValue().timeMs() <= maxAgeMs) {
+        metricsByBrokerId.put(entry.getKey(), entry.getValue().metrics());
+      }
+    }
+    return metricsByBrokerId;
+  }
+
+  /**
+   * Metrics of an entity with the time they were seen.
+   */
+  static final class TimedMetrics {
+    private final ValuesAndExtrapolations _metrics;
+    private final long _timeMs;
+
+    TimedMetrics(ValuesAndExtrapolations metrics, long timeMs) {
+      _metrics = metrics;
+      _timeMs = timeMs;
+    }
+
+    ValuesAndExtrapolations metrics() {
+      return _metrics;
+    }
+
+    long timeMs() {
+      return _timeMs;
+    }
   }
 
   /**
