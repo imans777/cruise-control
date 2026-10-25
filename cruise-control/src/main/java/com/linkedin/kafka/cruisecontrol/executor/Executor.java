@@ -71,8 +71,10 @@ import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AlterPartitionReassignmentsResult;
 import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.clients.admin.ElectLeadersResult;
+import org.apache.kafka.clients.admin.LogDirDescription;
 import org.apache.kafka.clients.admin.PartitionReassignment;
 import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigResource;
@@ -506,6 +508,12 @@ public class Executor {
     private final Map<TopicPartition, Double> _lastKnownWriteRateKBpsByPartition = new HashMap<>();
     // The last valid broker metrics used for replication throttle adjustment, kept for the ongoing execution.
     private final Map<Integer, TimedMetrics> _lastValidBrokerMetricsById = new HashMap<>();
+    // The progress of the in-progress inter-broker replica movements, used to escalate their needed throttle when they stall at it.
+    private final Map<TopicPartition, MovementProgress> _movementProgressByPartition = new HashMap<>();
+    // The number of consecutive metric-based checks at which the metrics of each broker were over a concurrency adjuster limit.
+    private final Map<Integer, Integer> _consecutiveOverLimitChecksByBroker = new HashMap<>();
+    // Brokers (and directions) already warned about for needing more than the maximum replication throttle.
+    private final Set<String> _needAboveMaxWarnings = new HashSet<>();
 
     public ConcurrencyAdjuster(int numMinIsrCheck) {
       _numMinIsrCheck = numMinIsrCheck;
@@ -549,6 +557,9 @@ public class Executor {
       _clusterCapacity = null;
       _lastKnownWriteRateKBpsByPartition.clear();
       _lastValidBrokerMetricsById.clear();
+      _movementProgressByPartition.clear();
+      _consecutiveOverLimitChecksByBroker.clear();
+      _needAboveMaxWarnings.clear();
       _executionConcurrencyManager.reset();
     }
 
@@ -805,20 +816,160 @@ public class Executor {
     }
 
     /**
+     * @return The escalated throttle (bytes/sec) needed for each new replica, by partition of the escalated movements.
+     */
+    private Map<TopicPartition, Long> escalatedNeeds() {
+      Map<TopicPartition, Long> escalatedNeedByPartition = new HashMap<>();
+      _movementProgressByPartition.forEach((tp, progress) -> {
+        if (progress.escalatedNeed() > 0) {
+          escalatedNeedByPartition.put(tp, progress.escalatedNeed());
+        }
+      });
+      return escalatedNeedByPartition;
+    }
+
+    /**
+     * Track the progress of the in-progress inter-broker replica movements that are at their needed throttle -- on their leader or
+     * on the broker of a new replica -- and escalate the needed throttle of those that made no progress (see {@link MovementProgress}).
+     * The progress of a movement is the lag of its furthest-behind new replica behind the leader, from the log dir sizes of the
+     * brokers involved; a movement whose throttles are above its needed throttle is not checked, so it is never escalated.
+     *
+     * @param tasks Execution tasks.
+     * @param cluster Kafka cluster.
+     * @param writeRateKBpsByPartition The write rate (KB/sec) by partition.
+     * @param throttleHelper The replication throttle helper of the ongoing inter-broker replica movements.
+     * @param neededLeaderThrottleByBroker The leader throttle (bytes/sec) needed by each broker.
+     * @param neededFollowerThrottleByBroker The follower throttle (bytes/sec) needed by each broker.
+     * @return {@code true} if the needed throttle of any movement was escalated, {@code false} otherwise.
+     */
+    private boolean escalateStalledMovements(Collection<ExecutionTask> tasks,
+                                             Cluster cluster,
+                                             Map<TopicPartition, Double> writeRateKBpsByPartition,
+                                             ReplicationThrottleHelper throttleHelper,
+                                             Map<Integer, Long> neededLeaderThrottleByBroker,
+                                             Map<Integer, Long> neededFollowerThrottleByBroker) {
+      Map<TopicPartition, ExecutionProposal> movementsAtNeed = new HashMap<>();
+      Set<TopicPartition> inProgress = new HashSet<>();
+      Set<Integer> brokersToDescribe = new HashSet<>();
+      Map<TopicPartition, List<Integer>> newReplicasOutOfSyncByPartition = new HashMap<>();
+      for (ExecutionTask task : tasks) {
+        if (task.type() != ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION || task.state() != ExecutionTaskState.IN_PROGRESS) {
+          continue;
+        }
+        ExecutionProposal proposal = task.proposal();
+        List<Integer> newReplicasOutOfSync = newReplicasOutOfSync(proposal, cluster);
+        if (newReplicasOutOfSync.isEmpty()) {
+          continue;
+        }
+        inProgress.add(proposal.topicPartition());
+        int leader = movementLeader(proposal, cluster);
+        boolean atNeed = atNeededThrottle(throttleHelper.leaderThrottleRate(leader), neededLeaderThrottleByBroker.getOrDefault(leader, 0L))
+                         || newReplicasOutOfSync.stream().anyMatch(brokerId -> atNeededThrottle(
+                             throttleHelper.followerThrottleRate(brokerId), neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L)));
+        if (atNeed) {
+          movementsAtNeed.put(proposal.topicPartition(), proposal);
+          newReplicasOutOfSyncByPartition.put(proposal.topicPartition(), newReplicasOutOfSync);
+          brokersToDescribe.add(leader);
+          brokersToDescribe.addAll(newReplicasOutOfSync);
+        } else {
+          MovementProgress progress = _movementProgressByPartition.get(proposal.topicPartition());
+          if (progress != null) {
+            progress.notAtNeededThrottle();
+          }
+        }
+      }
+      _movementProgressByPartition.keySet().retainAll(inProgress);
+      if (movementsAtNeed.isEmpty()) {
+        return false;
+      }
+
+      Map<Integer, Map<TopicPartition, Long>> replicaSizeByBroker = replicaSizes(brokersToDescribe);
+      boolean escalated = false;
+      for (Map.Entry<TopicPartition, ExecutionProposal> entry : movementsAtNeed.entrySet()) {
+        TopicPartition tp = entry.getKey();
+        ExecutionProposal proposal = entry.getValue();
+        Long leaderSize = replicaSizeByBroker.getOrDefault(movementLeader(proposal, cluster), Collections.emptyMap()).get(tp);
+        if (leaderSize == null) {
+          continue;
+        }
+        long smallestNewReplicaSize = newReplicasOutOfSyncByPartition.get(tp).stream()
+            .mapToLong(brokerId -> replicaSizeByBroker.getOrDefault(brokerId, Collections.emptyMap()).getOrDefault(tp, 0L))
+            .min().orElse(0L);
+        MovementProgress progress = _movementProgressByPartition.computeIfAbsent(tp, k -> new MovementProgress());
+        long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBpsByPartition.getOrDefault(tp, 0.0)),
+                                         progress.escalatedNeed());
+        if (progress.recordLag(leaderSize - smallestNewReplicaSize, true, neededPerReplica)) {
+          LOG.info("The movement of {} made no progress for {} adjuster runs at its needed replication throttle (lag {} bytes); its "
+                   + "needed throttle is raised from {} to {} bytes/sec per new replica.", tp, REPLICATION_THROTTLE_RUNS_WITHOUT_PROGRESS_TO_ESCALATE,
+                   leaderSize - smallestNewReplicaSize, neededPerReplica, progress.escalatedNeed());
+          escalated = true;
+        }
+      }
+      return escalated;
+    }
+
+    /**
+     * @param brokerIds Ids of brokers.
+     * @return The size (bytes) of the current (i.e. non-future) replicas on each of the given brokers that could be described.
+     */
+    private Map<Integer, Map<TopicPartition, Long>> replicaSizes(Set<Integer> brokerIds) {
+      Map<Integer, Map<TopicPartition, Long>> replicaSizeByBroker = new HashMap<>();
+      Map<Integer, KafkaFuture<Map<String, LogDirDescription>>> descriptionsByBroker =
+          _adminClient.describeLogDirs(brokerIds).descriptions();
+      for (Map.Entry<Integer, KafkaFuture<Map<String, LogDirDescription>>> entry : descriptionsByBroker.entrySet()) {
+        Map<String, LogDirDescription> logDirs;
+        try {
+          logDirs = entry.getValue().get(ReplicationThrottleHelper.CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+          LOG.debug("Failed to describe the log dirs of broker {} to check the progress of replica movements.", entry.getKey(), e);
+          continue;
+        }
+        Map<TopicPartition, Long> sizeByPartition = new HashMap<>();
+        logDirs.values().forEach(logDir -> logDir.replicaInfos().forEach((tp, replicaInfo) -> {
+          if (!replicaInfo.isFuture()) {
+            sizeByPartition.merge(tp, replicaInfo.size(), Long::sum);
+          }
+        }));
+        replicaSizeByBroker.put(entry.getKey(), sizeByPartition);
+      }
+      return replicaSizeByBroker;
+    }
+
+    /**
+     * Warn once per execution about each broker and direction whose in-progress movements need more than the maximum replication
+     * throttle: their throttle cannot reach their needed throttle, so they may not complete.
+     *
+     * @param neededThrottleByBroker The throttle (bytes/sec) needed by each broker in one direction.
+     * @param direction The direction ("leader" or "follower").
+     */
+    private void warnIfNeededAboveMax(Map<Integer, Long> neededThrottleByBroker, String direction) {
+      neededThrottleByBroker.forEach((brokerId, needed) -> {
+        if (needed > maxReplicationThrottle() && _needAboveMaxWarnings.add(brokerId + "-" + direction)) {
+          LOG.warn("The in-progress replica movements of broker {} need a {} replication throttle of {} bytes/sec, above {} ({} "
+                   + "bytes/sec): they may not complete.", brokerId, direction, needed,
+                   ExecutorConfig.CONCURRENCY_ADJUSTER_MAX_REPLICATION_THROTTLE_CONFIG, maxReplicationThrottle());
+        }
+      });
+    }
+
+    /**
      * Adjust the leader and follower replication throttles of the brokers that are throttled by the ongoing inter-broker replica
      * movements. For each such broker:
      * <ul>
      *   <li>Decrease its throttles multiplicatively if (1) it hosts a replica of an (At/Under)MinISR partition with an out-of-sync
      *   replica and without offline replicas -- see {@link #brokersWithMinIsrPartitionsForThrottle()}, checked at each run, or
-     *   (2) its metrics violate any concurrency adjuster limit, checked at metric-based checks.</li>
+     *   (2) its metrics violate any concurrency adjuster limit at two consecutive metric-based checks.</li>
      *   <li>Leave its throttles unchanged if its metrics are unavailable -- i.e. neither the current metric window nor the last
-     *   valid metrics within one broker metric window have valid values.</li>
+     *   valid metrics within one broker metric window have valid values -- unless they are below the needed throttle.</li>
      *   <li>Otherwise, decrease its follower (leader) throttle at once to its inbound (outbound) network headroom if it is above it,
      *   at each run. At metric-based checks, also raise it towards the headroom while replicas are being moved to (from) the broker,
      *   and at once to the throttle needed by the write rate of the partitions being moved to (from) the broker if the headroom
      *   allows -- see {@link ExecutionUtils#recommendedReplicationThrottle(long, long, boolean, double, double, boolean)}.</li>
      * </ul>
-     * The new throttles of all brokers are applied in a single batch, unless replication throttle adjustment is disabled meanwhile.
+     * In all cases, a throttle is never decreased below, and is raised to, the throttle needed by the in-progress movements of the
+     * broker in that direction, which is escalated for movements that make no progress at it -- see
+     * {@link #escalateStalledMovements}. The new throttles of all brokers are applied in a single batch, unless replication throttle
+     * adjustment is disabled meanwhile.
      *
      * @param canRunMetricsBasedCheck {@code true} if metric-based adjustment can be performed, {@code false} otherwise.
      */
@@ -841,8 +992,18 @@ public class Executor {
       Cluster cluster = _metadataClient.cluster();
       Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
       Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
-      neededReplicationThrottles(inExecutionTasks(), writeRateKBpsByPartition, cluster, neededLeaderThrottleByBroker,
+      Set<ExecutionTask> tasks = inExecutionTasks();
+      neededReplicationThrottles(tasks, writeRateKBpsByPartition, cluster, escalatedNeeds(), neededLeaderThrottleByBroker,
                                  neededFollowerThrottleByBroker);
+      if (escalateStalledMovements(tasks, cluster, writeRateKBpsByPartition, throttleHelper, neededLeaderThrottleByBroker,
+                                   neededFollowerThrottleByBroker)) {
+        neededLeaderThrottleByBroker.clear();
+        neededFollowerThrottleByBroker.clear();
+        neededReplicationThrottles(tasks, writeRateKBpsByPartition, cluster, escalatedNeeds(), neededLeaderThrottleByBroker,
+                                   neededFollowerThrottleByBroker);
+      }
+      warnIfNeededAboveMax(neededLeaderThrottleByBroker, "leader");
+      warnIfNeededAboveMax(neededFollowerThrottleByBroker, "follower");
       Map<Integer, Double> inSyncFollowerInKBpsByBroker = new HashMap<>();
       Map<Integer, Double> inSyncLeaderOutKBpsByBroker = new HashMap<>();
       inSyncReplicationTrafficKBps(cluster, writeRateKBpsByPartition, inSyncFollowerInKBpsByBroker, inSyncLeaderOutKBpsByBroker);
@@ -863,17 +1024,35 @@ public class Executor {
         long newFollowerThrottle;
         String reason;
         ValuesAndExtrapolations metrics = metricsByBrokerId.get(brokerId);
+        long neededLeaderThrottle = neededLeaderThrottleByBroker.getOrDefault(brokerId, 0L);
+        long neededFollowerThrottle = neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L);
+        boolean overLimit = false;
+        if (canRunMetricsBasedCheck && metrics != null) {
+          overLimit = !withinConcurrencyAdjusterLimit(brokerId, metrics, overLimitDetailsByMetricName);
+          if (overLimit) {
+            _consecutiveOverLimitChecksByBroker.merge(brokerId, 1, Integer::sum);
+          } else {
+            _consecutiveOverLimitChecksByBroker.remove(brokerId);
+          }
+        }
         if (brokersToDecreaseThrottle.contains(brokerId)) {
-          newLeaderThrottle = decreasedReplicationThrottle(leaderThrottle);
-          newFollowerThrottle = decreasedReplicationThrottle(followerThrottle);
+          newLeaderThrottle = decreasedReplicationThrottle(leaderThrottle, neededLeaderThrottle);
+          newFollowerThrottle = decreasedReplicationThrottle(followerThrottle, neededFollowerThrottle);
           reason = "(At/Under)MinISR partitions";
         } else if (metrics == null) {
-          LOG.debug("Skip replication throttle adjustment for broker {} due to unavailable metrics.", brokerId);
-          continue;
-        } else if (canRunMetricsBasedCheck && !withinConcurrencyAdjusterLimit(brokerId, metrics, overLimitDetailsByMetricName)) {
-          newLeaderThrottle = decreasedReplicationThrottle(leaderThrottle);
-          newFollowerThrottle = decreasedReplicationThrottle(followerThrottle);
-          reason = "broker metrics over the concurrency adjuster limit";
+          // Without metrics, only enforce the throttle needed by the in-progress movements.
+          newLeaderThrottle = withNeededThrottleFloor(leaderThrottle, leaderThrottle, neededLeaderThrottle);
+          newFollowerThrottle = withNeededThrottleFloor(followerThrottle, followerThrottle, neededFollowerThrottle);
+          if (newLeaderThrottle == leaderThrottle && newFollowerThrottle == followerThrottle) {
+            LOG.debug("Skip replication throttle adjustment for broker {} due to unavailable metrics.", brokerId);
+            continue;
+          }
+          reason = "the throttle needed by in-progress movements (no metrics)";
+        } else if (overLimit && _consecutiveOverLimitChecksByBroker.getOrDefault(brokerId, 0) >= 2) {
+          // Over a concurrency adjuster limit at two consecutive metric-based checks, i.e. not a single latency spike.
+          newLeaderThrottle = decreasedReplicationThrottle(leaderThrottle, neededLeaderThrottle);
+          newFollowerThrottle = decreasedReplicationThrottle(followerThrottle, neededFollowerThrottle);
+          reason = "broker metrics over the concurrency adjuster limit at consecutive checks";
         } else {
           Broker broker = clusterCapacity == null ? null : clusterCapacity.broker(brokerId);
           Double leaderBytesIn = latestBrokerMetricValue(metrics, KafkaMetricDef.LEADER_BYTES_IN);
@@ -885,16 +1064,14 @@ public class Executor {
           // The broker-level replication metrics are not used: they are always 0 -- see ExecutionUtils#inSyncReplicationTrafficKBps.
           double nonThrottledInKBps = leaderBytesIn + inSyncFollowerInKBpsByBroker.getOrDefault(brokerId, 0.0);
           double nonThrottledOutKBps = leaderBytesOut + inSyncLeaderOutKBpsByBroker.getOrDefault(brokerId, 0.0);
-          long neededLeaderThrottle = neededLeaderThrottleByBroker.getOrDefault(brokerId, 0L);
-          long neededFollowerThrottle = neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L);
+          // A first check over a concurrency adjuster limit allows no increase, but does not decrease yet.
+          boolean canIncrease = canRunMetricsBasedCheck && !overLimit;
           newLeaderThrottle = recommendedReplicationThrottle(leaderThrottle, neededLeaderThrottle,
                                                              neededLeaderThrottleByBroker.containsKey(brokerId),
-                                                             broker.capacityFor(Resource.NW_OUT), nonThrottledOutKBps,
-                                                             canRunMetricsBasedCheck);
+                                                             broker.capacityFor(Resource.NW_OUT), nonThrottledOutKBps, canIncrease);
           newFollowerThrottle = recommendedReplicationThrottle(followerThrottle, neededFollowerThrottle,
                                                                neededFollowerThrottleByBroker.containsKey(brokerId),
-                                                               broker.capacityFor(Resource.NW_IN), nonThrottledInKBps,
-                                                               canRunMetricsBasedCheck);
+                                                               broker.capacityFor(Resource.NW_IN), nonThrottledInKBps, canIncrease);
           LOG.debug("Replication throttle adjustment for broker {} ({}): capacity in/out {}/{} KB/sec, non-throttled traffic in/out "
                     + "{}/{} KB/sec, needed leader/follower throttle {}/{} bytes/sec, movements from/to the broker {}/{}, leader "
                     + "throttle {} -> {}, follower throttle {} -> {} bytes/sec.", brokerId,
@@ -903,10 +1080,9 @@ public class Executor {
                     neededFollowerThrottle, neededLeaderThrottleByBroker.containsKey(brokerId),
                     neededFollowerThrottleByBroker.containsKey(brokerId), leaderThrottle, newLeaderThrottle, followerThrottle,
                     newFollowerThrottle);
-          reason = canRunMetricsBasedCheck
-                   ? String.format("network headroom and the throttle needed by the write rate of moving partitions (leader: %d, "
-                                   + "follower: %d bytes/sec)", neededLeaderThrottle, neededFollowerThrottle)
-                   : "network headroom";
+          reason = String.format("network headroom%s and the throttle needed by in-progress movements (leader: %d, follower: %d "
+                                 + "bytes/sec)", overLimit ? " (first check over a concurrency adjuster limit)" : "",
+                                 neededLeaderThrottle, neededFollowerThrottle);
         }
 
         if (newLeaderThrottle != leaderThrottle || newFollowerThrottle != followerThrottle) {
