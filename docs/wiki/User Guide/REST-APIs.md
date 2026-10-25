@@ -653,6 +653,7 @@ Supported parameters are:
 | disable_concurrency_adjuster_for              | list      | disable concurrency adjuster for given concurrency types                  | N/A                   | yes       |
 | enable_concurrency_adjuster_for               | list      | enable concurrency adjuster for given concurrency types                   | N/A                   | yes       |
 | min_isr_based_concurrency_adjustment          | boolean   | enable (true) or disable (false) MinISR-based concurrency adjustment      | N/A                   | yes       |
+| replication_throttle_adjustment               | boolean   | enable (true) or disable (false) replication throttle adjustment          | N/A                   | yes       |
 | reason                                        | string    | reason for the request                                                    | "No reason provided"  | yes       | 
 
 To Enable/disable self-healing, send POST request like:

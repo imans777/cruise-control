@@ -486,7 +486,9 @@ public final class ExecutorConfig {
       + "is reduced at once when the headroom shrinks, and divided if the broker violates any concurrency adjuster limit or hosts "
       + "(At/Under)MinISR partitions with an out-of-sync replica (see "
       + "concurrency.adjuster.replication.throttle.min.isr.check.enabled). The throttle of a broker without metrics in the current "
-      + "metrics window is left unchanged. It only applies to executions started with a replication throttle.";
+      + "metrics window is left unchanged. It only applies to executions started with a replication throttle. It can be enabled or "
+      + "disabled at runtime with the replication_throttle_adjustment parameter of the admin endpoint; disabling it during an "
+      + "execution leaves the replication throttles at their last values until the execution ends.";
 
   /**
    * <code>concurrency.adjuster.min.replication.throttle</code>
