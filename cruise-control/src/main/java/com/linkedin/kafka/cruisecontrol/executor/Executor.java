@@ -694,8 +694,10 @@ public class Executor {
 
     /**
      * Get the brokers whose replication throttles should be decreased because they host a replica of an (At/Under)MinISR partition
-     * without offline replicas. This check is independent of {@link ExecutorConfig#CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG},
-     * and only affects the brokers hosting such partitions -- i.e. it never stops the execution.
+     * with an out-of-sync replica and without offline replicas -- see
+     * {@link ExecutionUtils#brokersHostingMinIsrPartitions(Cluster, Map, Collection)}. This check is independent of
+     * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG}, and only affects the brokers hosting such
+     * partitions -- i.e. it never stops the execution.
      *
      * @return The brokers whose replication throttles should be decreased, or an empty set if
      * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG} is disabled.
@@ -708,7 +710,7 @@ public class Executor {
       Set<String> topicsToCheck = new HashSet<>(cluster.topics());
       topicsToCheck.removeAll(_topicMinIsrCache.minIsrWithTimeByTopic().keySet());
       maybeRetrieveAndCacheTopicMinIsr(topicsToCheck);
-      return brokersHostingMinIsrPartitions(cluster, _topicMinIsrCache.minIsrWithTimeByTopic());
+      return brokersHostingMinIsrPartitions(cluster, _topicMinIsrCache.minIsrWithTimeByTopic(), inExecutionTasks());
     }
 
     /**
@@ -732,14 +734,15 @@ public class Executor {
      * Adjust the leader and follower replication throttles of the brokers that are throttled by the ongoing inter-broker replica
      * movements. For each such broker:
      * <ul>
-     *   <li>Decrease its throttles multiplicatively if (1) it hosts a replica of an (At/Under)MinISR partition without offline
-     *   replicas -- see {@link #brokersWithMinIsrPartitionsForThrottle()}, or (2) its metrics violate any concurrency adjuster
-     *   limit.</li>
+     *   <li>Decrease its throttles multiplicatively if (1) it hosts a replica of an (At/Under)MinISR partition with an out-of-sync
+     *   replica and without offline replicas -- see {@link #brokersWithMinIsrPartitionsForThrottle()}, or (2) its metrics violate
+     *   any concurrency adjuster limit.</li>
      *   <li>Leave its throttles unchanged if its metrics in the current metric window are unavailable -- e.g. right after the
      *   metric window rolls.</li>
-     *   <li>Otherwise, move its follower (leader) throttle towards its inbound (outbound) network headroom, and raise it at once to
-     *   the throttle needed by the write rate of the partitions being moved to (from) the broker if the headroom allows -- see
-     *   {@link ExecutionUtils#recommendedReplicationThrottle(long, long, double, double, double)}.</li>
+     *   <li>Otherwise, move its follower (leader) throttle towards its inbound (outbound) network headroom -- raising it only while
+     *   replicas are being moved to (from) the broker -- and raise it at once to the throttle needed by the write rate of the
+     *   partitions being moved to (from) the broker if the headroom allows -- see
+     *   {@link ExecutionUtils#recommendedReplicationThrottle(long, long, boolean, double, double)}.</li>
      * </ul>
      * Metric-based adjustment is performed only if {@code canRunMetricsBasedCheck} is {@code true}.
      *
@@ -761,13 +764,17 @@ public class Executor {
       Map<String, StringBuilder> overLimitDetailsByMetricName = new HashMap<>();
       Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
       Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
+      Map<Integer, Double> inSyncFollowerInKBpsByBroker = new HashMap<>();
+      Map<Integer, Double> inSyncLeaderOutKBpsByBroker = new HashMap<>();
       ClusterModel clusterCapacity = null;
       if (canRunMetricsBasedCheck) {
         clusterCapacity = clusterCapacity(throttledBrokers);
         Map<TopicPartition, Double> writeRateKBpsByPartition = partitionWriteRatesKBps(_loadMonitor.currentPartitionMetricValues(),
                                                                                        _lastKnownWriteRateKBpsByPartition);
-        neededReplicationThrottles(inExecutionTasks(), writeRateKBpsByPartition, _metadataClient.cluster(), neededLeaderThrottleByBroker,
+        Cluster cluster = _metadataClient.cluster();
+        neededReplicationThrottles(inExecutionTasks(), writeRateKBpsByPartition, cluster, neededLeaderThrottleByBroker,
                                    neededFollowerThrottleByBroker);
+        inSyncReplicationTrafficKBps(cluster, writeRateKBpsByPartition, inSyncFollowerInKBpsByBroker, inSyncLeaderOutKBpsByBroker);
         for (Map.Entry<BrokerEntity, ValuesAndExtrapolations> entry : _loadMonitor.currentBrokerMetricValues().entrySet()) {
           currentMetricsByBrokerId.put(entry.getKey().brokerId(), entry.getValue());
         }
@@ -800,18 +807,28 @@ public class Executor {
           Broker broker = clusterCapacity == null ? null : clusterCapacity.broker(brokerId);
           Double leaderBytesIn = latestBrokerMetricValue(currentMetrics, KafkaMetricDef.LEADER_BYTES_IN);
           Double leaderBytesOut = latestBrokerMetricValue(currentMetrics, KafkaMetricDef.LEADER_BYTES_OUT);
-          Double replicationBytesIn = latestBrokerMetricValue(currentMetrics, KafkaMetricDef.REPLICATION_BYTES_IN_RATE);
-          Double replicationBytesOut = latestBrokerMetricValue(currentMetrics, KafkaMetricDef.REPLICATION_BYTES_OUT_RATE);
-          if (broker == null || leaderBytesIn == null || leaderBytesOut == null || replicationBytesIn == null || replicationBytesOut == null) {
+          if (broker == null || leaderBytesIn == null || leaderBytesOut == null) {
             LOG.debug("Skip replication throttle adjustment for broker {} due to unavailable capacity or network metrics.", brokerId);
             continue;
           }
+          // The broker-level replication metrics are not used: they are always 0 -- see ExecutionUtils#inSyncReplicationTrafficKBps.
+          double nonThrottledInKBps = leaderBytesIn + inSyncFollowerInKBpsByBroker.getOrDefault(brokerId, 0.0);
+          double nonThrottledOutKBps = leaderBytesOut + inSyncLeaderOutKBpsByBroker.getOrDefault(brokerId, 0.0);
           long neededLeaderThrottle = neededLeaderThrottleByBroker.getOrDefault(brokerId, 0L);
           long neededFollowerThrottle = neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L);
-          newLeaderThrottle = recommendedReplicationThrottle(leaderThrottle, neededLeaderThrottle, broker.capacityFor(Resource.NW_OUT),
-                                                             leaderBytesOut, replicationBytesOut);
-          newFollowerThrottle = recommendedReplicationThrottle(followerThrottle, neededFollowerThrottle, broker.capacityFor(Resource.NW_IN),
-                                                               leaderBytesIn, replicationBytesIn);
+          newLeaderThrottle = recommendedReplicationThrottle(leaderThrottle, neededLeaderThrottle,
+                                                             neededLeaderThrottleByBroker.containsKey(brokerId),
+                                                             broker.capacityFor(Resource.NW_OUT), nonThrottledOutKBps);
+          newFollowerThrottle = recommendedReplicationThrottle(followerThrottle, neededFollowerThrottle,
+                                                               neededFollowerThrottleByBroker.containsKey(brokerId),
+                                                               broker.capacityFor(Resource.NW_IN), nonThrottledInKBps);
+          LOG.debug("Replication throttle adjustment for broker {}: capacity in/out {}/{} KB/sec, non-throttled traffic in/out {}/{} "
+                    + "KB/sec, needed leader/follower throttle {}/{} bytes/sec, movements from/to the broker {}/{}, leader throttle "
+                    + "{} -> {}, follower throttle {} -> {} bytes/sec.", brokerId, broker.capacityFor(Resource.NW_IN),
+                    broker.capacityFor(Resource.NW_OUT), nonThrottledInKBps, nonThrottledOutKBps, neededLeaderThrottle,
+                    neededFollowerThrottle, neededLeaderThrottleByBroker.containsKey(brokerId),
+                    neededFollowerThrottleByBroker.containsKey(brokerId), leaderThrottle, newLeaderThrottle, followerThrottle,
+                    newFollowerThrottle);
           reason = String.format("network headroom and the throttle needed by the write rate of moving partitions (leader: %d, "
                                  + "follower: %d bytes/sec)", neededLeaderThrottle, neededFollowerThrottle);
         }
@@ -820,6 +837,10 @@ public class Executor {
           throttleHelper.updateThrottleRates(brokerId, newLeaderThrottle, newFollowerThrottle);
           LOG.info("Concurrency adjuster changed the replication throttle of broker {} based on {} (leader: {} -> {}, follower: {} -> {} "
                    + "bytes/sec).", brokerId, reason, leaderThrottle, newLeaderThrottle, followerThrottle, newFollowerThrottle);
+        } else {
+          // E.g. a decrease of a throttle that is already at (or below) the minimum throttle.
+          LOG.debug("Concurrency adjuster left the replication throttle of broker {} unchanged based on {} (leader: {}, follower: {} "
+                    + "bytes/sec).", brokerId, reason, leaderThrottle, followerThrottle);
         }
       }
 
