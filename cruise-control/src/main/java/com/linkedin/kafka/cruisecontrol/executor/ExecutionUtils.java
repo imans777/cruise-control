@@ -295,6 +295,23 @@ public final class ExecutionUtils {
   }
 
   /**
+   * @param writeRateKBpsByPartition The write rate (KB/sec) by partition.
+   * @param escalatedNeedByPartition The escalated throttle (bytes/sec) needed for each new replica, by partition of the escalated
+   *                                 movements -- see {@link MovementProgress}.
+   * @return The throttle (bytes/sec) that a new replica of each partition needs: the one derived from its write rate (see
+   * {@link #neededReplicationThrottle(double)}), or its escalated need if higher. A partition without a known write rate is
+   * included only if its movement was escalated.
+   */
+  static Map<TopicPartition, Double> neededReplicationThrottleByPartition(Map<TopicPartition, Double> writeRateKBpsByPartition,
+                                                                          Map<TopicPartition, Long> escalatedNeedByPartition) {
+    Map<TopicPartition, Double> neededThrottleByPartition = new HashMap<>();
+    writeRateKBpsByPartition.forEach((tp, writeRateKBps) -> neededThrottleByPartition.put(
+        tp, (double) Math.max(neededReplicationThrottle(writeRateKBps), escalatedNeedByPartition.getOrDefault(tp, 0L))));
+    escalatedNeedByPartition.forEach((tp, need) -> neededThrottleByPartition.putIfAbsent(tp, (double) need));
+    return neededThrottleByPartition;
+  }
+
+  /**
    * @param writeRateKBps The write rate (KB/sec) of a partition.
    * @return The throttle (bytes/sec) needed for a new replica of the partition to catch up: (1 +
    * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG}) times its write rate.
