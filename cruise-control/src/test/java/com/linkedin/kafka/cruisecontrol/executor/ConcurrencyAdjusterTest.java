@@ -329,38 +329,36 @@ public class ConcurrencyAdjusterTest {
    *
    * @param currentThrottleMB Current throttle (MB/sec).
    * @param capacityMB Network capacity (MB/sec).
-   * @param leaderMB Leader traffic (MB/sec).
-   * @param replicationMB Replication traffic (MB/sec).
+   * @param nonThrottledMB Traffic that the throttle does not limit, i.e. leader and in-sync replication traffic (MB/sec).
+   * @param hasInProgressMovements {@code true} if the broker has in-progress throttled movements, {@code false} otherwise.
    * @return The recommended replication throttle (MB/sec).
    */
-  private static double recommendedReplicationThrottleInMB(double currentThrottleMB, double capacityMB, double leaderMB,
-                                                           double replicationMB) {
-    long recommended = ExecutionUtils.recommendedReplicationThrottle((long) (currentThrottleMB * MB_IN_BYTES), 0L, capacityMB * MB_IN_KB,
-                                                                     leaderMB * MB_IN_KB, replicationMB * MB_IN_KB);
+  private static double recommendedReplicationThrottleInMB(double currentThrottleMB, double capacityMB, double nonThrottledMB,
+                                                           boolean hasInProgressMovements) {
+    long recommended = ExecutionUtils.recommendedReplicationThrottle((long) (currentThrottleMB * MB_IN_BYTES), 0L, hasInProgressMovements,
+                                                                     capacityMB * MB_IN_KB, nonThrottledMB * MB_IN_KB);
     return (double) recommended / MB_IN_BYTES;
   }
 
   /**
    * Simulate the replication throttle adjustments of a broker in one traffic direction, whose throttled replica movements are
-   * stalled: the write rate of the partitions being moved is at least the throttle, so the new replicas cannot catch up and the
-   * movements use the whole throttle. Each round is a metric-based check of the concurrency adjuster (i.e. once per
-   * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_INTERVAL_MS_CONFIG}).
+   * stalled: the new replicas cannot catch up, so the movements stay in progress. Each round is a metric-based check of the
+   * concurrency adjuster (i.e. once per {@link ExecutorConfig#CONCURRENCY_ADJUSTER_INTERVAL_MS_CONFIG}).
    *
    * @param initialThrottleMB Initial throttle (MB/sec).
    * @param neededMB Throttle needed by the in-progress movements (MB/sec), or {@code 0} if unknown.
    * @param capacityMB Network capacity (MB/sec).
-   * @param otherReplicationMB Replication traffic (MB/sec) not attributed to the throttled movements.
+   * @param inSyncReplicationMB Replication traffic of in-sync followers (MB/sec), which the throttle does not limit.
    * @param leaderMBByRound Leader (i.e. client) traffic (MB/sec) in each round.
    * @return The throttle (MB/sec) after each round.
    */
   private static List<Double> simulateStalledMovementThrottleInMB(double initialThrottleMB, double neededMB, double capacityMB,
-                                                                  double otherReplicationMB, double... leaderMBByRound) {
+                                                                  double inSyncReplicationMB, double... leaderMBByRound) {
     List<Double> throttleMBByRound = new ArrayList<>(leaderMBByRound.length);
     long throttle = (long) (initialThrottleMB * MB_IN_BYTES);
     for (double leaderMB : leaderMBByRound) {
-      double replicationKBps = otherReplicationMB * MB_IN_KB + throttle / ExecutionUtils.BYTES_IN_KB;
-      throttle = ExecutionUtils.recommendedReplicationThrottle(throttle, (long) (neededMB * MB_IN_BYTES), capacityMB * MB_IN_KB,
-                                                               leaderMB * MB_IN_KB, replicationKBps);
+      throttle = ExecutionUtils.recommendedReplicationThrottle(throttle, (long) (neededMB * MB_IN_BYTES), true, capacityMB * MB_IN_KB,
+                                                               (leaderMB + inSyncReplicationMB) * MB_IN_KB);
       throttleMBByRound.add((double) throttle / MB_IN_BYTES);
     }
     return throttleMBByRound;
@@ -369,27 +367,27 @@ public class ConcurrencyAdjusterTest {
   @Test
   public void testRecommendedReplicationThrottle() {
     double delta = 1.0 / MB_IN_BYTES;
-    // Headroom: 0.8 * 100 - (10 + 25 - 20) = 65 MB/sec > 20 MB/sec. Increase is bounded by the additive increase.
-    assertEquals(30.0, recommendedReplicationThrottleInMB(20.0, 100.0, 10.0, 25.0), delta);
-    // Headroom: 0.8 * 100 - (10 + 65 - 60) = 65 MB/sec > 60 MB/sec. Increase is bounded by the headroom.
-    assertEquals(65.0, recommendedReplicationThrottleInMB(60.0, 100.0, 10.0, 65.0), delta);
-    // Headroom: 0.8 * 1000 - (0 + 95 - 95) = 800 MB/sec > 95 MB/sec. Increase is bounded by the maximum throttle.
-    assertEquals(100.0, recommendedReplicationThrottleInMB(95.0, 1000.0, 0.0, 95.0), delta);
-    // Headroom: 0.8 * 100 - (70 + 35 - 30) = 5 MB/sec < 30 MB/sec. Decrease to the headroom at once.
-    assertEquals(5.0, recommendedReplicationThrottleInMB(30.0, 100.0, 70.0, 35.0), delta);
-    // Headroom: 0.8 * 100 - (90 + 30 - 30) < 0 MB/sec. Decrease is bounded by the minimum throttle.
-    assertEquals(1.0, recommendedReplicationThrottleInMB(30.0, 100.0, 90.0, 30.0), delta);
-    // Headroom: 0.8 * 100 - (10 + 12 - 12) = 70 MB/sec > 20 MB/sec, but the replication traffic (12 MB/sec) is below the throttle
-    // (20 MB/sec) -- i.e. the throttle is not limiting the movements. No increase.
-    assertEquals(20.0, recommendedReplicationThrottleInMB(20.0, 100.0, 10.0, 12.0), delta);
-    // Headroom: 0.8 * 100 - (80 + 20 - 0.5) < 0 MB/sec, but the current throttle (0.5 MB/sec) is already below the minimum
-    // throttle. No change.
-    assertEquals(0.5, recommendedReplicationThrottleInMB(0.5, 100.0, 80.0, 20.0), delta);
-    // Headroom: 0.8 * 1000 - (0 + 200 - 200) = 800 MB/sec, but the current throttle (200 MB/sec) is already above the maximum throttle.
-    // No change.
-    assertEquals(200.0, recommendedReplicationThrottleInMB(200.0, 1000.0, 0.0, 200.0), delta);
-    // Headroom: 0.8 * 100 - (10 + 70 - 70) = 70 MB/sec, which is equal to the current throttle. No change.
-    assertEquals(70.0, recommendedReplicationThrottleInMB(70.0, 100.0, 10.0, 70.0), delta);
+    // Headroom: 0.8 * 100 - 15 = 65 MB/sec > 20 MB/sec. Increase is bounded by the additive increase.
+    assertEquals(30.0, recommendedReplicationThrottleInMB(20.0, 100.0, 15.0, true), delta);
+    // Headroom: 0.8 * 100 - 15 = 65 MB/sec > 60 MB/sec. Increase is bounded by the headroom.
+    assertEquals(65.0, recommendedReplicationThrottleInMB(60.0, 100.0, 15.0, true), delta);
+    // Headroom: 0.8 * 1000 - 0 = 800 MB/sec > 95 MB/sec. Increase is bounded by the maximum throttle.
+    assertEquals(100.0, recommendedReplicationThrottleInMB(95.0, 1000.0, 0.0, true), delta);
+    // Headroom: 0.8 * 100 - 75 = 5 MB/sec < 30 MB/sec. Decrease to the headroom at once.
+    assertEquals(5.0, recommendedReplicationThrottleInMB(30.0, 100.0, 75.0, true), delta);
+    // Headroom: 0.8 * 100 - 90 < 0 MB/sec. Decrease is bounded by the minimum throttle.
+    assertEquals(1.0, recommendedReplicationThrottleInMB(30.0, 100.0, 90.0, true), delta);
+    // Headroom: 0.8 * 100 - 10 = 70 MB/sec > 20 MB/sec, but the broker has no in-progress throttled movements in this direction --
+    // i.e. the throttle is not limiting any movement. No increase.
+    assertEquals(20.0, recommendedReplicationThrottleInMB(20.0, 100.0, 10.0, false), delta);
+    // ... but a decrease to the headroom still applies.
+    assertEquals(5.0, recommendedReplicationThrottleInMB(30.0, 100.0, 75.0, false), delta);
+    // Headroom: 0.8 * 100 - 100 < 0 MB/sec, but the current throttle (0.5 MB/sec) is already below the minimum throttle. No change.
+    assertEquals(0.5, recommendedReplicationThrottleInMB(0.5, 100.0, 100.0, true), delta);
+    // Headroom: 0.8 * 1000 - 0 = 800 MB/sec, but the current throttle (200 MB/sec) is already above the maximum throttle. No change.
+    assertEquals(200.0, recommendedReplicationThrottleInMB(200.0, 1000.0, 0.0, true), delta);
+    // Headroom: 0.8 * 100 - 10 = 70 MB/sec, which is equal to the current throttle. No change.
+    assertEquals(70.0, recommendedReplicationThrottleInMB(70.0, 100.0, 10.0, true), delta);
   }
 
   @Test
@@ -401,14 +399,15 @@ public class ConcurrencyAdjusterTest {
     // The movements need 35 * (1 + 0.2) = 42 MB/sec.
     double neededMB = writeRateMB * (1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN);
 
-    // Without the needed throttle, the throttle is increased by the additive increase per round, so it exceeds the write rate only
-    // after 4 rounds (i.e. 24 minutes with the default concurrency adjuster interval of 6 minutes), and stops at the headroom.
+    // Without the needed throttle, the throttle is increased by the additive increase per round while the movements are in progress,
+    // so it exceeds the write rate only after 4 rounds (i.e. 24 minutes with the default concurrency adjuster interval of 6
+    // minutes), and stops at the headroom.
     List<Double> throttleMBByRound = simulateStalledMovementThrottleInMB(5.0, 0.0, 100.0, 10.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0);
     assertThrottlesInMB(List.of(15.0, 25.0, 35.0, 45.0, 50.0, 50.0), throttleMBByRound);
     assertTrue(throttleMBByRound.get(2) <= writeRateMB && throttleMBByRound.get(3) > writeRateMB);
 
     // With the needed throttle, the throttle is increased to the needed throttle at once, then by the additive increase up to the
-    // headroom, as long as the throttle limits the movements.
+    // headroom, as long as the movements are in progress.
     throttleMBByRound = simulateStalledMovementThrottleInMB(5.0, neededMB, 100.0, 10.0, 20.0, 20.0, 20.0);
     assertEquals(neededMB, throttleMBByRound.get(0), 1e-3);
     assertTrue(throttleMBByRound.get(0) > writeRateMB);
@@ -430,9 +429,16 @@ public class ConcurrencyAdjusterTest {
                                                             0.0, 0.0, 0.0);
     assertThrottlesInMB(List.of(100.0, 100.0, 100.0), throttleMBByRound);
 
-    // The needed throttle raises a throttle that is below the minimum throttle.
+    // A throttle below the minimum throttle is raised like any other: to the higher of the needed throttle and the additive increase.
     throttleMBByRound = simulateStalledMovementThrottleInMB(0.5, 6.0, 100.0, 0.0, 10.0);
-    assertThrottlesInMB(List.of(6.0), throttleMBByRound);
+    assertThrottlesInMB(List.of(10.5), throttleMBByRound);
+    throttleMBByRound = simulateStalledMovementThrottleInMB(0.5, 20.0, 100.0, 0.0, 10.0);
+    assertThrottlesInMB(List.of(20.0), throttleMBByRound);
+
+    // A needed throttle just above the current throttle never raises it by less than the additive increase: 5 -> 15 MB/sec, not
+    // 5 -> 6 MB/sec, so a movement needing more than its write rate (e.g. a partition at its retention limit) is not held back.
+    throttleMBByRound = simulateStalledMovementThrottleInMB(5.0, 6.0, 100.0, 10.0, 20.0, 20.0);
+    assertThrottlesInMB(List.of(15.0, 25.0), throttleMBByRound);
   }
 
   @Test
@@ -442,8 +448,8 @@ public class ConcurrencyAdjusterTest {
     TopicPartition tp2 = new TopicPartition(TOPIC1, 2);
     TopicPartition tp3 = new TopicPartition(TOPIC1, 3);
     TopicPartition tp4 = new TopicPartition(TOPIC1, 4);
-    ReplicaPlacementInfo[] r = new ReplicaPlacementInfo[6];
-    Node[] nodes = new Node[6];
+    ReplicaPlacementInfo[] r = new ReplicaPlacementInfo[7];
+    Node[] nodes = new Node[7];
     for (int brokerId = 0; brokerId < r.length; brokerId++) {
       r[brokerId] = new ReplicaPlacementInfo(brokerId);
       nodes[brokerId] = new Node(brokerId, "host" + brokerId, 100);
@@ -458,8 +464,9 @@ public class ConcurrencyAdjusterTest {
     ExecutionProposal tp2Proposal = new ExecutionProposal(tp2, 0, r[1], List.of(r[1], r[2]), List.of(r[2], r[3]));
     ExecutionTask task2 = new ExecutionTask(2L, tp2Proposal, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, MOCK_TIME_MS);
     ExecutionTask task3 = inProgressTask(3L, tp2Proposal, ExecutionTask.TaskType.LEADER_ACTION);
-    // tp3: write rate is unknown. Ignored.
-    ExecutionTask task4 = inProgressTask(4L, new ExecutionProposal(tp3, 0, r[1], List.of(r[1]), List.of(r[4])),
+    // tp3: broker 1 (old leader) -> one new replica on broker 6, write rate unknown. Counted as 0, so that brokers 1 and 6 still have
+    // in-progress movements.
+    ExecutionTask task4 = inProgressTask(4L, new ExecutionProposal(tp3, 0, r[1], List.of(r[1]), List.of(r[6])),
                                          ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
     // tp4 (2 MB/sec): broker 2 (old leader) -> one new replica on broker 5. Its current leader is unknown.
     ExecutionTask task5 = inProgressTask(5L, new ExecutionProposal(tp4, 0, r[2], List.of(r[2]), List.of(r[2], r[5])),
@@ -492,8 +499,9 @@ public class ConcurrencyAdjusterTest {
     assertEquals(10 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
     assertEquals(3 * 5 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(1), 1.0);
     assertEquals(2 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(2), 1.0);
-    // Follower throttle: brokers 2 (tp0), 3, 4 (tp1) and 5 (tp1 and tp4) fetch new replicas.
-    assertEquals(Set.of(2, 3, 4, 5), neededFollowerThrottleByBroker.keySet());
+    // Follower throttle: brokers 2 (tp0), 3, 4 (tp1), 5 (tp1 and tp4) and 6 (tp3, unknown write rate) fetch new replicas.
+    assertEquals(Set.of(2, 3, 4, 5, 6), neededFollowerThrottleByBroker.keySet());
+    assertEquals(0L, neededFollowerThrottleByBroker.get(6).longValue());
     assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(2), 1.0);
     assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(3), 1.0);
     assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(4), 1.0);
@@ -557,15 +565,65 @@ public class ConcurrencyAdjusterTest {
                                                            new Node[]{nodes[3]}, new Node[]{nodes[4]})),
                                   Collections.emptySet(), Collections.emptySet());
 
-    // TP1 is AtMinISR: only its brokers are affected.
+    // TP1 is AtMinISR with an out-of-sync replica: only its brokers are affected.
     assertEquals(Set.of(0, 1), ExecutionUtils.brokersHostingMinIsrPartitions(
-        cluster, Map.of(TOPIC1, new MinIsrWithTime((short) 1, MOCK_TIME_MS), TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS))));
-    // TP1 is UnderMinISR and TP2 is AtMinISR: only their brokers are affected. TP3 has an offline replica, so it is excluded.
-    assertEquals(Set.of(0, 1, 2, 3), ExecutionUtils.brokersHostingMinIsrPartitions(
-        cluster, Map.of(TOPIC1, new MinIsrWithTime((short) 2, MOCK_TIME_MS), TOPIC2, new MinIsrWithTime((short) 2, MOCK_TIME_MS))));
+        cluster, Map.of(TOPIC1, new MinIsrWithTime((short) 1, MOCK_TIME_MS), TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS)),
+        Collections.emptyList()));
+    // TP1 is UnderMinISR with an out-of-sync replica: its brokers are affected. TP2 is AtMinISR by its configuration (replication
+    // factor = minISR, all replicas in sync), and TP3 has an offline replica: both are excluded.
+    assertEquals(Set.of(0, 1), ExecutionUtils.brokersHostingMinIsrPartitions(
+        cluster, Map.of(TOPIC1, new MinIsrWithTime((short) 2, MOCK_TIME_MS), TOPIC2, new MinIsrWithTime((short) 2, MOCK_TIME_MS)),
+        Collections.emptyList()));
     // Partitions of topics with unknown minISR are skipped.
-    assertTrue(ExecutionUtils.brokersHostingMinIsrPartitions(cluster, Map.of(TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS)))
-                             .isEmpty());
+    assertTrue(ExecutionUtils.brokersHostingMinIsrPartitions(cluster, Map.of(TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS)),
+                                                             Collections.emptyList()).isEmpty());
+
+    // A partition with a single replica (TP1) is AtMinISR by its configuration: excluded. TP2 on brokers 0, 1 and 2 is AtMinISR
+    // (minISR 2), and its replica on broker 2 is out of sync.
+    cluster = new Cluster("id", Arrays.asList(nodes),
+                          Set.of(new PartitionInfo(TOPIC1, TP1.partition(), nodes[4], new Node[]{nodes[4]}, new Node[]{nodes[4]}),
+                                 new PartitionInfo(TOPIC2, TP2.partition(), nodes[0], new Node[]{nodes[0], nodes[1], nodes[2]},
+                                                   new Node[]{nodes[0], nodes[1]})),
+                          Collections.emptySet(), Collections.emptySet());
+    Map<String, MinIsrWithTime> minIsrByTopic = Map.of(TOPIC1, new MinIsrWithTime((short) 1, MOCK_TIME_MS),
+                                                       TOPIC2, new MinIsrWithTime((short) 2, MOCK_TIME_MS));
+    assertEquals(Set.of(0, 1, 2), ExecutionUtils.brokersHostingMinIsrPartitions(cluster, minIsrByTopic, Collections.emptyList()));
+    // The out-of-sync replica of TP2 is the new replica of an in-progress movement: excluded.
+    ReplicaPlacementInfo[] r = new ReplicaPlacementInfo[]{new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1),
+                                                          new ReplicaPlacementInfo(2)};
+    ExecutionProposal proposal = new ExecutionProposal(TP2, 0, r[0], List.of(r[0], r[1]), List.of(r[0], r[1], r[2]));
+    assertTrue(ExecutionUtils.brokersHostingMinIsrPartitions(
+        cluster, minIsrByTopic, List.of(inProgressTask(0L, proposal, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION))).isEmpty());
+    // ... but not if its movement is not in progress yet.
+    assertEquals(Set.of(0, 1, 2), ExecutionUtils.brokersHostingMinIsrPartitions(
+        cluster, minIsrByTopic, List.of(new ExecutionTask(0L, proposal, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, MOCK_TIME_MS))));
+  }
+
+  @Test
+  public void testInSyncReplicationTrafficKBps() {
+    Node[] nodes = new Node[4];
+    for (int brokerId = 0; brokerId < nodes.length; brokerId++) {
+      nodes[brokerId] = new Node(brokerId, "host" + brokerId, 100);
+    }
+    TopicPartition tp0 = new TopicPartition(TOPIC1, 0);
+    TopicPartition tp1 = new TopicPartition(TOPIC1, 1);
+    TopicPartition tp2 = new TopicPartition(TOPIC1, 2);
+    // tp0 (10 KB/sec): leader 0, followers 1 and 2 in sync. tp1 (5 KB/sec): leader 1, follower 2 in sync and follower 3 out of sync
+    // (e.g. a new replica of a throttled movement). tp2 (7 KB/sec) has no leader, and the write rate of tp3 is unknown: both ignored.
+    Cluster cluster = new Cluster("id", Arrays.asList(nodes),
+                                  Set.of(new PartitionInfo(TOPIC1, 0, nodes[0], new Node[]{nodes[0], nodes[1], nodes[2]},
+                                                           new Node[]{nodes[0], nodes[1], nodes[2]}),
+                                         new PartitionInfo(TOPIC1, 1, nodes[1], new Node[]{nodes[1], nodes[2], nodes[3]},
+                                                           new Node[]{nodes[1], nodes[2]}),
+                                         new PartitionInfo(TOPIC1, 2, null, new Node[]{nodes[2], nodes[3]}, new Node[]{nodes[2], nodes[3]}),
+                                         new PartitionInfo(TOPIC1, 3, nodes[3], new Node[]{nodes[3], nodes[0]}, new Node[]{nodes[3], nodes[0]})),
+                                  Collections.emptySet(), Collections.emptySet());
+    Map<Integer, Double> followerInKBpsByBroker = new HashMap<>();
+    Map<Integer, Double> leaderOutKBpsByBroker = new HashMap<>();
+    ExecutionUtils.inSyncReplicationTrafficKBps(cluster, Map.of(tp0, 10.0, tp1, 5.0, tp2, 7.0), followerInKBpsByBroker,
+                                                leaderOutKBpsByBroker);
+    assertEquals(Map.of(1, 10.0, 2, 15.0), followerInKBpsByBroker);
+    assertEquals(Map.of(0, 20.0, 1, 5.0), leaderOutKBpsByBroker);
   }
 
   private static void assertThrottlesInMB(List<Double> expectedThrottleMBs, List<Double> actualThrottleMBs) {

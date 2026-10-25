@@ -480,10 +480,11 @@ public final class ExecutorConfig {
   public static final boolean DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED = false;
   public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_DOC = "Enable the concurrency adjuster to dynamically "
       + "adjust the replication throttle (leader and follower throttled rates) of each broker during throttled inter-broker replica "
-      + "movements. The throttle is raised towards the network headroom of the broker (see "
-      + "concurrency.adjuster.replication.throttle.target.network.utilization), at once to the throttle needed by the write rate of "
-      + "the partitions being moved (see concurrency.adjuster.replication.throttle.write.rate.margin), and is reduced if the broker "
-      + "violates any concurrency adjuster limit or hosts (At/Under)MinISR partitions (see "
+      + "movements. While replicas are being moved to (from) a broker, its follower (leader) throttle is raised step by step towards "
+      + "its network headroom (see concurrency.adjuster.replication.throttle.target.network.utilization) and at once to the throttle "
+      + "needed by the write rate of the partitions being moved (see concurrency.adjuster.replication.throttle.write.rate.margin). It "
+      + "is reduced at once when the headroom shrinks, and divided if the broker violates any concurrency adjuster limit or hosts "
+      + "(At/Under)MinISR partitions with an out-of-sync replica (see "
       + "concurrency.adjuster.replication.throttle.min.isr.check.enabled). The throttle of a broker without metrics in the current "
       + "metrics window is left unchanged. It only applies to executions started with a replication throttle.";
 
@@ -523,7 +524,7 @@ public final class ExecutorConfig {
   public static final int DEFAULT_CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE = 2;
   public static final String CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE_DOC = "The fixed number by which the "
       + "replication throttle of a broker will be divided by the concurrency adjuster (if enabled for replication throttle) when the "
-      + "broker violates any concurrency adjuster limit or hosts (At/Under)MinISR partitions (see "
+      + "broker violates any concurrency adjuster limit or hosts (At/Under)MinISR partitions with an out-of-sync replica (see "
       + "concurrency.adjuster.replication.throttle.min.isr.check.enabled).";
 
   /**
@@ -535,7 +536,8 @@ public final class ExecutorConfig {
   public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_DOC = "The target network "
       + "utilization (in (0, 1]) of each broker that the concurrency adjuster (if enabled for replication throttle) aims for. The "
       + "follower (leader) throttled rate of a broker is moved towards this fraction of the broker's inbound (outbound) network "
-      + "capacity minus its inbound (outbound) traffic that is not attributed to the throttled replica movements.";
+      + "capacity minus its inbound (outbound) traffic that the throttle does not limit, i.e. its leader traffic and the replication "
+      + "traffic of in-sync followers.";
 
   /**
    * <code>concurrency.adjuster.replication.throttle.min.isr.check.enabled</code>
@@ -545,24 +547,28 @@ public final class ExecutorConfig {
   public static final boolean DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED = true;
   public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_DOC = "Enable the concurrency adjuster "
       + "(if enabled for replication throttle) to divide the replication throttle of the brokers hosting a replica of an "
-      + "(At/Under)MinISR partition without offline replicas by "
+      + "(At/Under)MinISR partition with an out-of-sync replica and without offline replicas by "
       + "concurrency.adjuster.multiplicative.decrease.replication.throttle at each check, i.e. every concurrency.adjuster.interval.ms "
-      + "/ concurrency.adjuster.num.min.isr.check. It only affects the brokers hosting such partitions, never stops the execution, and "
-      + "is independent of concurrency.adjuster.min.isr.check.enabled.";
+      + "/ concurrency.adjuster.num.min.isr.check. Partitions that are (At/Under)MinISR by their configuration -- all replicas in "
+      + "sync, e.g. a replication factor of 1 or equal to min.insync.replicas -- are ignored, as are the replicas being added by the "
+      + "execution. It only affects the brokers hosting such partitions, never stops the execution, and is independent of "
+      + "concurrency.adjuster.min.isr.check.enabled.";
 
   /**
    * <code>concurrency.adjuster.replication.throttle.write.rate.margin</code>
    */
   public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG
       = "concurrency.adjuster.replication.throttle.write.rate.margin";
-  public static final double DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN = 0.2;
-  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_DOC = "The margin above the write rate of "
-      + "the partitions being moved that the concurrency adjuster (if enabled for replication throttle) keeps in the replication "
-      + "throttle of a broker, so that the new replicas can catch up. The follower (leader) throttled rate of a broker is raised at once "
-      + "to (1 + margin) times the total write rate of the partitions being moved to (from) the broker, but never above the network "
+  public static final double DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN = 1.0;
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_DOC = "The margin above the write rate of the "
+      + "partitions being moved that the concurrency adjuster (if enabled for replication throttle) keeps in the replication throttle "
+      + "of a broker, so that the new replicas can catch up. The follower (leader) throttled rate of a broker is raised at once to (1 "
+      + "+ margin) times the total write rate of the partitions being moved to (from) the broker, but never above the network "
       + "headroom of the broker (see concurrency.adjuster.replication.throttle.target.network.utilization) or "
-      + "concurrency.adjuster.max.replication.throttle. Without such a lower limit, a throttle below the write rate of the partitions "
-      + "being moved stalls their movements.";
+      + "concurrency.adjuster.max.replication.throttle. A throttle below the write rate stalls the movements, and a new replica of a "
+      + "partition at its retention limit needs more than twice the write rate, since retention truncates a replica that falls behind "
+      + "the log start of the leader; while the movements are in progress, the throttle keeps being raised by "
+      + "concurrency.adjuster.additive.increase.replication.throttle as far as the headroom allows.";
 
   /**
    * <code>concurrency.adjuster.min.isr.cache.size</code>
