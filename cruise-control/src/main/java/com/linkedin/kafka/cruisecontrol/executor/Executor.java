@@ -782,6 +782,11 @@ public class Executor {
       }
 
       for (int brokerId : throttledBrokers) {
+        if (!_replicationThrottleAdjusterEnabled) {
+          // Disabled while adjusting (e.g. via the admin endpoint): leave the throttles of the remaining brokers at their last values.
+          LOG.info("Replication throttle adjustment was disabled; the throttles of brokers not adjusted yet are left unchanged.");
+          break;
+        }
         long leaderThrottle = throttleHelper.leaderThrottleRate(brokerId);
         long followerThrottle = throttleHelper.followerThrottleRate(brokerId);
         long newLeaderThrottle;
@@ -970,7 +975,9 @@ public class Executor {
   }
 
   /**
-   * Enable or disable replication throttle adjustment by the concurrency adjuster.
+   * Enable or disable replication throttle adjustment by the concurrency adjuster. Disabling it waits for the throttle update of a
+   * broker that is already in progress (if any) to complete, so no throttle is changed by the concurrency adjuster once this method
+   * returns: during an execution, the replication throttles stay at their last values until the execution ends.
    *
    * @param isReplicationThrottleAdjusterEnabled {@code true} to enable replication throttle adjustment, {@code false} otherwise.
    * @return {@code true} if replication throttle adjustment was enabled before, {@code false} otherwise.
@@ -978,6 +985,13 @@ public class Executor {
   public boolean setReplicationThrottleAdjusterEnabled(boolean isReplicationThrottleAdjusterEnabled) {
     boolean oldValue = _replicationThrottleAdjusterEnabled;
     _replicationThrottleAdjusterEnabled = isReplicationThrottleAdjusterEnabled;
+    if (!isReplicationThrottleAdjusterEnabled) {
+      // An ongoing adjustment holds the lock of the concurrency adjuster and checks this flag before updating each broker, so it
+      // releases the lock right after the update in progress.
+      synchronized (_concurrencyAdjuster) {
+        LOG.debug("No replication throttle adjustment is in progress.");
+      }
+    }
     return oldValue;
   }
 
