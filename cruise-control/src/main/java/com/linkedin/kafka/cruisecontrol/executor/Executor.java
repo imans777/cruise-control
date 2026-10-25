@@ -820,6 +820,28 @@ public class Executor {
     }
 
     /**
+     * Get what a throttle-aware replica movement strategy needs to admit inter-broker replica movements while replication throttle
+     * adjustment is enabled: the network headroom of the given brokers in each direction, bounded by the minimum and maximum
+     * throttles of the adjuster (see {@link ExecutionUtils#initialReplicationThrottle(double, double)}), and the throttle that a
+     * new replica of each partition needs, including the escalation of movements that made no progress at it. Admitting movements
+     * against the headroom keeps brokers within it: the adjuster raises a broker's throttle to the need of its in-flight movements
+     * even above its headroom.
+     *
+     * @param brokerIds Ids of the brokers.
+     * @param leaderHeadroomByBroker A map to populate with the outbound headroom (bytes/sec) of each broker whose headroom is known.
+     * @param followerHeadroomByBroker A map to populate with the inbound headroom (bytes/sec) of each broker whose headroom is known.
+     * @param neededThrottleByPartition A map to populate with the throttle (bytes/sec) that a new replica of each partition needs.
+     */
+    synchronized void admissionInputs(Set<Integer> brokerIds,
+                                      Map<Integer, Long> leaderHeadroomByBroker,
+                                      Map<Integer, Long> followerHeadroomByBroker,
+                                      Map<TopicPartition, Double> neededThrottleByPartition) {
+      initialReplicationThrottles(brokerIds, leaderHeadroomByBroker, followerHeadroomByBroker);
+      neededThrottleByPartition.putAll(neededReplicationThrottleByPartition(
+          partitionWriteRatesKBps(_loadMonitor.currentPartitionMetricValues(), _lastKnownWriteRateKBpsByPartition), escalatedNeeds()));
+    }
+
+    /**
      * @return The escalated throttle (bytes/sec) needed for each new replica, by partition of the escalated movements.
      */
     private Map<TopicPartition, Long> escalatedNeeds() {
@@ -2277,16 +2299,40 @@ public class Executor {
     /**
      * Get the replication throttle budget of brokers based on the inter-broker replica movements in progress and the current
      * write rate of partitions, which is used if the replica movement strategy contains
-     * ThrottleAwareRoundRobinBrokerReplicaMovementStrategy.
+     * ThrottleAwareRoundRobinBrokerReplicaMovementStrategy. While replication throttle adjustment is enabled, each broker side is
+     * budgeted at its network headroom and each movement is charged the throttle that the adjuster gives it -- see
+     * {@link ConcurrencyAdjuster#admissionInputs(Set, Map, Map, Map)}; otherwise, at the execution's replication throttle, with
+     * {@link ExecutorConfig#REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG}.
      *
-     * @return The replication throttle budget of brokers, or {@code null} if the execution has no replication throttle or does
-     * not pick brokers in a round-robin manner.
+     * @return The replication throttle budget of brokers, or {@code null} if the execution has no replication throttle (and
+     * replication throttle adjustment is disabled) or does not pick brokers in a round-robin manner.
      */
     private ReplicationThrottleBudget replicationThrottleBudget() {
-      if (_replicationThrottle == null || !_executionTaskManager.isRoundRobinBrokers()) {
+      if (!_executionTaskManager.isRoundRobinBrokers()) {
         return null;
       }
       Cluster cluster = _metadataClient.cluster();
+      ReplicationThrottleHelper throttleHelper = _replicationThrottleHelper;
+      if (_replicationThrottleAdjusterEnabled && throttleHelper != null) {
+        // The adjuster keeps each started movement at (at least) its need, so admit movements against the brokers' headroom and
+        // charge each one the need the adjuster will give it. A broker whose headroom is unknown is budgeted at its current throttle.
+        Set<Integer> brokerIds = cluster.nodes().stream().map(Node::id).collect(Collectors.toSet());
+        Map<Integer, Long> leaderHeadroomByBroker = new HashMap<>();
+        Map<Integer, Long> followerHeadroomByBroker = new HashMap<>();
+        Map<TopicPartition, Double> neededThrottleByPartition = new HashMap<>();
+        _concurrencyAdjuster.admissionInputs(brokerIds, leaderHeadroomByBroker, followerHeadroomByBroker, neededThrottleByPartition);
+        LOG.debug("Admitting inter-broker replica movements against headroom (leader: {}, follower: {} bytes/sec).",
+                  leaderHeadroomByBroker, followerHeadroomByBroker);
+        return new ReplicationThrottleBudget(_executionTaskManager.inExecutionTasks(Collections.singleton(INTER_BROKER_REPLICA_ACTION)),
+                                             neededThrottleByPartition, task -> currentLeader(cluster, task),
+                                             brokerId -> leaderHeadroomByBroker.getOrDefault(brokerId, throttleHelper.leaderThrottleRate(brokerId)),
+                                             brokerId -> followerHeadroomByBroker.getOrDefault(brokerId,
+                                                                                               throttleHelper.followerThrottleRate(brokerId)),
+                                             0.0);
+      }
+      if (_replicationThrottle == null) {
+        return null;
+      }
       return new ReplicationThrottleBudget(_executionTaskManager.inExecutionTasks(Collections.singleton(INTER_BROKER_REPLICA_ACTION)),
                                            _partitionWriteRateCache.writeRatesInBytesPerSec(), task -> currentLeader(cluster, task),
                                            brokerId -> _replicationThrottle, brokerId -> _replicationThrottle,
