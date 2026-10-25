@@ -106,6 +106,16 @@ public final class ExecutionUtils {
   // The concurrency adjuster ignores a replication throttle change smaller than this fraction of the current throttle: the network
   // headroom fluctuates with the traffic, and each change costs a config update and verification of the broker.
   static final double REPLICATION_THROTTLE_CHANGE_TOLERANCE = 0.05;
+  // The additive increase of the replication throttle of a broker is at least this fraction of its network capacity in that
+  // direction, so brokers with larger network capacity converge to their network headroom in a similar time.
+  static final double REPLICATION_THROTTLE_MIN_INCREASE_FRACTION_OF_CAPACITY = 0.05;
+  // An in-progress movement whose new replicas made no progress for this many consecutive concurrency adjuster runs, while its
+  // replication throttle was at most its needed throttle, gets its needed throttle doubled.
+  static final int REPLICATION_THROTTLE_RUNS_WITHOUT_PROGRESS_TO_ESCALATE = 2;
+  // The minimum decrease (bytes) of the lag of the new replicas of a movement to count as progress.
+  static final long REPLICATION_THROTTLE_MIN_PROGRESS_BYTES = 1024L * 1024L;
+  // A throttle is considered at the needed throttle if it is at most this factor of it.
+  static final double REPLICATION_THROTTLE_AT_NEED_FACTOR = 1.05;
   // Bounds and adjustment parameters of the replication throttle (bytes/sec) used by the concurrency adjuster.
   private static long minReplicationThrottle;
   private static long maxReplicationThrottle;
@@ -225,47 +235,148 @@ public final class ExecutionUtils {
    * {@code w}:
    * <ul>
    *   <li>Leader throttle: its current leader (or its old leader, if the current leader is unknown), which the new replicas fetch
-   *   from, needs {@code w} for each replica to add.</li>
-   *   <li>Follower throttle: each broker to add a replica to needs {@code w}.</li>
+   *   from, needs {@code w} for each replica to add that is not in sync yet.</li>
+   *   <li>Follower throttle: each broker to add a replica to needs {@code w}, until the replica is in sync.</li>
    * </ul>
+   * Kafka does not throttle in-sync replicas, so a new replica in the ISR needs nothing -- e.g. one that caught up and became the
+   * leader before the executor noticed that the movement completed.
    * Each broker with in-progress movements in a direction has an entry in the corresponding map, even if the write rate of the
    * partitions being moved is unknown (counted as {@code 0}). Tasks other than in-progress inter-broker replica movements are
-   * ignored.
+   * ignored. The throttle needed by a movement that made no progress at its needed throttle is escalated -- see
+   * {@link MovementProgress}.
    *
    * @param tasks Execution tasks.
    * @param writeRateKBpsByPartition The write rate (KB/sec) by partition.
    * @param cluster Kafka cluster, to get the current leader of partitions.
+   * @param escalatedNeedByPartition The escalated throttle (bytes/sec) needed for each new replica of a partition being moved, if
+   *                                 its movement has been escalated.
    * @param neededLeaderThrottleByBroker A map to populate with the leader throttle (bytes/sec) needed by each broker.
    * @param neededFollowerThrottleByBroker A map to populate with the follower throttle (bytes/sec) needed by each broker.
    */
   static void neededReplicationThrottles(Collection<ExecutionTask> tasks,
                                          Map<TopicPartition, Double> writeRateKBpsByPartition,
                                          Cluster cluster,
+                                         Map<TopicPartition, Long> escalatedNeedByPartition,
                                          Map<Integer, Long> neededLeaderThrottleByBroker,
                                          Map<Integer, Long> neededFollowerThrottleByBroker) {
-    Map<Integer, Double> leaderWriteRateKBpsByBroker = new HashMap<>();
-    Map<Integer, Double> followerWriteRateKBpsByBroker = new HashMap<>();
     for (ExecutionTask task : tasks) {
       if (task.type() != ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION || task.state() != ExecutionTaskState.IN_PROGRESS) {
         continue;
       }
       ExecutionProposal proposal = task.proposal();
-      if (proposal.replicasToAdd().isEmpty()) {
+      List<Integer> newReplicasOutOfSync = newReplicasOutOfSync(proposal, cluster);
+      if (newReplicasOutOfSync.isEmpty()) {
         continue;
       }
-      double writeRateKBps = writeRateKBpsByPartition.getOrDefault(proposal.topicPartition(), 0.0);
-      Node currentLeader = cluster.leaderFor(proposal.topicPartition());
-      int leader = currentLeader != null ? currentLeader.id() : proposal.oldLeader().brokerId();
-      leaderWriteRateKBpsByBroker.merge(leader, writeRateKBps * proposal.replicasToAdd().size(), Double::sum);
-      proposal.replicasToAdd().forEach(r -> followerWriteRateKBpsByBroker.merge(r.brokerId(), writeRateKBps, Double::sum));
+      TopicPartition tp = proposal.topicPartition();
+      long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBpsByPartition.getOrDefault(tp, 0.0)),
+                                       escalatedNeedByPartition.getOrDefault(tp, 0L));
+      int leader = movementLeader(proposal, cluster);
+      neededLeaderThrottleByBroker.merge(leader, neededPerReplica * newReplicasOutOfSync.size(), Long::sum);
+      newReplicasOutOfSync.forEach(brokerId -> neededFollowerThrottleByBroker.merge(brokerId, neededPerReplica, Long::sum));
     }
-    double bytesPerKBWithMargin = (1 + replicationThrottleWriteRateMargin) * BYTES_IN_KB;
-    for (Map.Entry<Integer, Double> entry : leaderWriteRateKBpsByBroker.entrySet()) {
-      neededLeaderThrottleByBroker.put(entry.getKey(), (long) (entry.getValue() * bytesPerKBWithMargin));
+  }
+
+  /**
+   * @param proposal The proposal of an inter-broker replica movement.
+   * @param cluster Kafka cluster.
+   * @return Ids of the brokers that the movement adds a replica to and whose replica is not in the ISR of the partition yet -- all of
+   * them if the partition is unknown.
+   */
+  static List<Integer> newReplicasOutOfSync(ExecutionProposal proposal, Cluster cluster) {
+    PartitionInfo partitionInfo = cluster.partition(proposal.topicPartition());
+    Set<Integer> inSync = new HashSet<>();
+    if (partitionInfo != null && partitionInfo.inSyncReplicas() != null) {
+      Arrays.stream(partitionInfo.inSyncReplicas()).forEach(node -> inSync.add(node.id()));
     }
-    for (Map.Entry<Integer, Double> entry : followerWriteRateKBpsByBroker.entrySet()) {
-      neededFollowerThrottleByBroker.put(entry.getKey(), (long) (entry.getValue() * bytesPerKBWithMargin));
+    List<Integer> outOfSync = new ArrayList<>();
+    proposal.replicasToAdd().stream().map(ReplicaPlacementInfo::brokerId).filter(id -> !inSync.contains(id)).forEach(outOfSync::add);
+    return outOfSync;
+  }
+
+  /**
+   * @param writeRateKBps The write rate (KB/sec) of a partition.
+   * @return The throttle (bytes/sec) needed for a new replica of the partition to catch up: (1 +
+   * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG}) times its write rate.
+   */
+  static long neededReplicationThrottle(double writeRateKBps) {
+    return (long) (writeRateKBps * (1 + replicationThrottleWriteRateMargin) * BYTES_IN_KB);
+  }
+
+  /**
+   * @param proposal The proposal of an inter-broker replica movement.
+   * @param cluster Kafka cluster.
+   * @return The broker that the new replicas of the movement fetch from: the current leader of the partition, or its old leader if
+   * the current leader is unknown.
+   */
+  static int movementLeader(ExecutionProposal proposal, Cluster cluster) {
+    Node currentLeader = cluster.leaderFor(proposal.topicPartition());
+    return currentLeader != null ? currentLeader.id() : proposal.oldLeader().brokerId();
+  }
+
+  /**
+   * The progress of the new replicas of an in-progress inter-broker replica movement, used to escalate its needed throttle when it
+   * makes no progress at it -- i.e. when the needed throttle derived from the write rate is not enough. A new replica of a partition
+   * at its retention limit is truncated whenever retention deletes past it, so it may need several times the write rate, depending
+   * on the segment size, the retention and the throttle actually achieved.
+   */
+  static final class MovementProgress {
+    private long _bestLagBytes = Long.MAX_VALUE;
+    private int _runsWithoutProgress = 0;
+    private long _escalatedNeed = 0L;
+
+    /**
+     * Record the lag of the new replicas of the movement, i.e. the leader size minus the size of the furthest-behind new replica.
+     *
+     * @param lagBytes The current lag (bytes).
+     * @param atNeededThrottle {@code true} if the movement is at most at its needed throttle on its leader or on a new replica's
+     *                         broker -- i.e. if more throttle could be what it lacks.
+     * @param currentNeed The current throttle (bytes/sec) needed for each new replica of the movement.
+     * @return {@code true} if the needed throttle of the movement was escalated.
+     */
+    boolean recordLag(long lagBytes, boolean atNeededThrottle, long currentNeed) {
+      if (_bestLagBytes == Long.MAX_VALUE || lagBytes <= _bestLagBytes - REPLICATION_THROTTLE_MIN_PROGRESS_BYTES) {
+        _bestLagBytes = Math.min(_bestLagBytes, lagBytes);
+        _runsWithoutProgress = 0;
+        return false;
+      }
+      if (!atNeededThrottle) {
+        _runsWithoutProgress = 0;
+        return false;
+      }
+      if (++_runsWithoutProgress < REPLICATION_THROTTLE_RUNS_WITHOUT_PROGRESS_TO_ESCALATE) {
+        return false;
+      }
+      _escalatedNeed = Math.min(maxReplicationThrottle, 2 * Math.max(minReplicationThrottle, Math.max(currentNeed, _escalatedNeed)));
+      _runsWithoutProgress = 0;
+      // Progress is measured again from here, at the escalated throttle.
+      _bestLagBytes = lagBytes;
+      return true;
     }
+
+    /**
+     * Record that the movement is not at its needed throttle at this run: only consecutive runs at it count towards an escalation.
+     */
+    void notAtNeededThrottle() {
+      _runsWithoutProgress = 0;
+    }
+
+    /**
+     * @return The escalated throttle (bytes/sec) needed for each new replica of the movement, or {@code 0} if not escalated.
+     */
+    long escalatedNeed() {
+      return _escalatedNeed;
+    }
+  }
+
+  /**
+   * @param throttle The throttle (bytes/sec) of a broker in one direction.
+   * @param neededThrottle The throttle (bytes/sec) needed by the in-progress movements of the broker in that direction.
+   * @return {@code true} if the throttle is at most {@link #REPLICATION_THROTTLE_AT_NEED_FACTOR} times the needed throttle (at least
+   * the minimum throttle) -- i.e. the throttle may be what the movements lack.
+   */
+  static boolean atNeededThrottle(long throttle, long neededThrottle) {
+    return throttle <= REPLICATION_THROTTLE_AT_NEED_FACTOR * Math.max(minReplicationThrottle, neededThrottle);
   }
 
   /**
@@ -362,14 +473,13 @@ public final class ExecutionUtils {
    *
    * <ul>
    *   <li>If the target is below the current throttle, the throttle is decreased to the target at once (bounded by the minimum
-   *   throttle), even below the throttle needed by the in-progress replica movements -- i.e. the network headroom wins.</li>
-   *   <li>Otherwise, if {@code canIncrease} is {@code true}, the throttle is raised to the higher of
-   *   <ul>
-   *     <li>the current throttle plus the additive increase, if the broker has in-progress throttled replica movements in this
-   *     direction -- i.e. only if the throttle may be limiting replica movements, and</li>
-   *     <li>the throttle needed by the in-progress replica movements (see {@link #neededReplicationThrottles}), at once,</li>
-   *   </ul>
-   *   but never above the target or the maximum throttle. It is never decreased in this case.</li>
+   *   throttle).</li>
+   *   <li>Otherwise, if {@code canIncrease} is {@code true} and the broker has in-progress throttled replica movements in this
+   *   direction -- i.e. only if the throttle may be limiting replica movements -- it is raised by the additive increase (see
+   *   {@link #additiveIncreaseStep}), but never above the target or the maximum throttle.</li>
+   *   <li>In all cases, the throttle is at least the throttle needed by the in-progress replica movements (see
+   *   {@link #neededReplicationThrottles}), even above the target: a throttle below it would stall them -- see
+   *   {@link #withNeededThrottleFloor}. Only the maximum throttle bounds it.</li>
    * </ul>
    * The concurrency adjuster checks for a decrease at each run, and allows an increase only at metric-based checks. A change smaller
    * than {@link #REPLICATION_THROTTLE_CHANGE_TOLERANCE} of the current throttle is ignored.
@@ -394,19 +504,42 @@ public final class ExecutionUtils {
     long targetThrottle = targetReplicationThrottle(networkCapacityKBps, nonThrottledTrafficKBps);
     long recommendedThrottle = currentThrottle;
     if (targetThrottle < currentThrottle) {
-      // Decrease at once (MIN: minReplicationThrottle).
+      // Decrease at once (MIN: minReplicationThrottle, and the needed throttle below).
       recommendedThrottle = Math.min(currentThrottle, Math.max(minReplicationThrottle, targetThrottle));
-    } else if (canIncrease) {
+    } else if (canIncrease && hasInProgressMovements) {
+      // Additive-increase (MAX: target throttle and maxReplicationThrottle).
       long maxThrottle = Math.min(targetThrottle, maxReplicationThrottle);
-      if (hasInProgressMovements) {
-        // Additive-increase (MAX: target throttle and maxReplicationThrottle).
-        recommendedThrottle = Math.max(recommendedThrottle, Math.min(maxThrottle, currentThrottle + additiveIncreaseReplicationThrottle));
-      }
-      // Increase at once to the throttle needed by the in-progress movements (MAX: target throttle and maxReplicationThrottle).
-      recommendedThrottle = Math.max(recommendedThrottle, Math.min(neededThrottle, maxThrottle));
+      recommendedThrottle = Math.max(currentThrottle, Math.min(maxThrottle, currentThrottle + additiveIncreaseStep(networkCapacityKBps)));
     }
-    return Math.abs(recommendedThrottle - currentThrottle) < REPLICATION_THROTTLE_CHANGE_TOLERANCE * currentThrottle
-           ? currentThrottle : recommendedThrottle;
+    return withNeededThrottleFloor(currentThrottle, recommendedThrottle, neededThrottle);
+  }
+
+  /**
+   * @param networkCapacityKBps The network capacity (KB/sec) of a broker in one traffic direction.
+   * @return The additive increase (bytes/sec) of the replication throttle of the broker in that direction: the larger of
+   * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_ADDITIVE_INCREASE_REPLICATION_THROTTLE_CONFIG} and
+   * {@link #REPLICATION_THROTTLE_MIN_INCREASE_FRACTION_OF_CAPACITY} of the capacity.
+   */
+  static long additiveIncreaseStep(double networkCapacityKBps) {
+    return Math.max(additiveIncreaseReplicationThrottle,
+                    (long) (REPLICATION_THROTTLE_MIN_INCREASE_FRACTION_OF_CAPACITY * networkCapacityKBps * BYTES_IN_KB));
+  }
+
+  /**
+   * Apply the floor of the replication throttle of a broker in one direction to a recommended throttle: the throttle needed by the
+   * in-progress movements in that direction, bounded only by the maximum throttle. A throttle below it would stall the movements --
+   * a stalled movement keeps using its throttle without making progress -- so no decrease goes below it, even below the network
+   * headroom, and a throttle below it is raised to it. Then ignore a change smaller than {@link #REPLICATION_THROTTLE_CHANGE_TOLERANCE}
+   * of the current throttle.
+   *
+   * @param currentThrottle The current throttle (bytes/sec).
+   * @param recommendedThrottle The recommended throttle (bytes/sec) before the floor.
+   * @param neededThrottle The throttle (bytes/sec) needed by the in-progress movements, or {@code 0} if none or unknown.
+   * @return The recommended throttle (bytes/sec).
+   */
+  static long withNeededThrottleFloor(long currentThrottle, long recommendedThrottle, long neededThrottle) {
+    long throttle = Math.max(recommendedThrottle, Math.min(maxReplicationThrottle, neededThrottle));
+    return Math.abs(throttle - currentThrottle) < REPLICATION_THROTTLE_CHANGE_TOLERANCE * currentThrottle ? currentThrottle : throttle;
   }
 
   /**
@@ -494,13 +627,16 @@ public final class ExecutionUtils {
   }
 
   /**
-   * Multiplicative-decrease the given replication throttle (MIN: minimum replication throttle of concurrency adjuster).
+   * Multiplicative-decrease the given replication throttle (MIN: minimum replication throttle of concurrency adjuster, and the
+   * throttle needed by the in-progress movements -- see {@link #withNeededThrottleFloor}).
    *
    * @param currentThrottle The current throttle (bytes/sec).
+   * @param neededThrottle The throttle (bytes/sec) needed by the in-progress movements, or {@code 0} if none or unknown.
    * @return The decreased throttle (bytes/sec).
    */
-  static long decreasedReplicationThrottle(long currentThrottle) {
-    return Math.min(currentThrottle, Math.max(minReplicationThrottle, currentThrottle / multiplicativeDecreaseReplicationThrottle));
+  static long decreasedReplicationThrottle(long currentThrottle, long neededThrottle) {
+    long decreased = Math.min(currentThrottle, Math.max(minReplicationThrottle, currentThrottle / multiplicativeDecreaseReplicationThrottle));
+    return withNeededThrottleFloor(currentThrottle, decreased, neededThrottle);
   }
 
   public static String toMetricName(Short metricId) {

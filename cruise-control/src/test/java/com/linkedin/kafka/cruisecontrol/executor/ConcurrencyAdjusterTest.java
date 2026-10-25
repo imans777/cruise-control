@@ -392,8 +392,9 @@ public class ConcurrencyAdjusterTest {
     // Between metric-based checks, only decreases apply: a throttle above the headroom is decreased at once, ...
     long mb = MB_IN_BYTES;
     assertEquals(5 * mb, ExecutionUtils.recommendedReplicationThrottle(30 * mb, 0L, true, 100 * MB_IN_KB, 75 * MB_IN_KB, false));
-    // ... but neither the additive increase nor the needed throttle raises a throttle below the headroom.
-    assertEquals(20 * mb, ExecutionUtils.recommendedReplicationThrottle(20 * mb, 40 * mb, true, 100 * MB_IN_KB, 10 * MB_IN_KB, false));
+    // ... and the additive increase does not apply, but the needed throttle does: it is a floor, enforced at each run.
+    assertEquals(20 * mb, ExecutionUtils.recommendedReplicationThrottle(20 * mb, 0L, true, 100 * MB_IN_KB, 10 * MB_IN_KB, false));
+    assertEquals(40 * mb, ExecutionUtils.recommendedReplicationThrottle(20 * mb, 40 * mb, true, 100 * MB_IN_KB, 10 * MB_IN_KB, false));
 
     // A change smaller than 5% of the current throttle is ignored: the headroom fluctuates with the traffic.
     // Headroom: 0.8 * 100 - 12 = 68 MB/sec, 2.9% below 70 MB/sec. No change.
@@ -460,14 +461,17 @@ public class ConcurrencyAdjusterTest {
     assertTrue(throttleMBByRound.get(0) > writeRateMB);
     assertThrottlesInMB(List.of(50.0, 50.0), throttleMBByRound.subList(1, 3));
 
-    // Network wins: if the client traffic rises to 60 MB/sec, the throttle is decreased at once to the new headroom -- i.e.
-    // 0.8 * 100 - (60 + 10) = 10 MB/sec, even below the needed throttle.
+    // If the client traffic rises to 60 MB/sec, the throttle is decreased at once towards the new headroom -- i.e.
+    // 0.8 * 100 - (60 + 10) = 10 MB/sec -- but not below the needed throttle (42 MB/sec): below it, the movements would stall and keep
+    // using their throttle without making progress.
     throttleMBByRound = simulateStalledMovementThrottleInMB(5.0, neededMB, 100.0, 10.0, 20.0, 20.0, 60.0, 60.0);
-    assertThrottlesInMB(List.of(50.0, 10.0, 10.0), throttleMBByRound.subList(1, 4));
+    assertThrottlesInMB(List.of(50.0, neededMB, neededMB), throttleMBByRound.subList(1, 4));
 
-    // Network wins: without headroom (0.8 * 100 - (70 + 10) = 0 MB/sec), the throttle is decreased to the minimum throttle despite
-    // the needed throttle, so the movements remain stalled.
+    // Without headroom (0.8 * 100 - (70 + 10) = 0 MB/sec), the throttle is still the needed throttle.
     throttleMBByRound = simulateStalledMovementThrottleInMB(5.0, neededMB, 100.0, 10.0, 70.0, 70.0, 70.0);
+    assertThrottlesInMB(List.of(neededMB, neededMB, neededMB), throttleMBByRound);
+    // Without in-progress needs, it is decreased to the minimum throttle.
+    throttleMBByRound = simulateStalledMovementThrottleInMB(5.0, 0.0, 100.0, 10.0, 70.0, 70.0, 70.0);
     assertThrottlesInMB(List.of(1.0, 1.0, 1.0), throttleMBByRound);
 
     // The needed throttle never exceeds the maximum throttle: movements written at 150 MB/sec need 180 MB/sec, but the throttle stops
@@ -538,7 +542,7 @@ public class ConcurrencyAdjusterTest {
     Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
     Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
     ExecutionUtils.neededReplicationThrottles(List.of(task0, task1, task2, task3, task4, task5), writeRateKBpsByPartition, cluster,
-                                              neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+                                              Collections.emptyMap(), neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
     double margin = 1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN;
     // Leader throttle: broker 0 (current leader of tp0) serves one new replica of tp0, broker 1 (current leader of tp1) serves three
     // new replicas of tp1, and broker 2 (old leader of tp4, whose current leader is unknown) serves one new replica of tp4.
@@ -553,6 +557,120 @@ public class ConcurrencyAdjusterTest {
     assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(3), 1.0);
     assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(4), 1.0);
     assertEquals((5 + 2) * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(5), 1.0);
+
+    // tp1's movement is escalated to 50 MB/sec per new replica, and tp3's (unknown write rate) to 3 MB/sec.
+    neededLeaderThrottleByBroker.clear();
+    neededFollowerThrottleByBroker.clear();
+    ExecutionUtils.neededReplicationThrottles(List.of(task0, task1, task2, task3, task4, task5), writeRateKBpsByPartition, cluster,
+                                              Map.of(tp1, 50 * MB_IN_BYTES, tp3, 3 * MB_IN_BYTES), neededLeaderThrottleByBroker,
+                                              neededFollowerThrottleByBroker);
+    assertEquals(3 * 50 * MB_IN_BYTES + 3 * MB_IN_BYTES, neededLeaderThrottleByBroker.get(1), 1.0);
+    assertEquals(50 * MB_IN_BYTES, neededFollowerThrottleByBroker.get(3), 1.0);
+    assertEquals(50 * MB_IN_BYTES + 2 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(5), 1.0);
+    assertEquals(3 * MB_IN_BYTES, neededFollowerThrottleByBroker.get(6), 1.0);
+    // An escalated need below the need derived from the write rate has no effect.
+    neededLeaderThrottleByBroker.clear();
+    neededFollowerThrottleByBroker.clear();
+    ExecutionUtils.neededReplicationThrottles(List.of(task0), writeRateKBpsByPartition, cluster, Map.of(tp0, MB_IN_BYTES),
+                                              neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+    assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(2), 1.0);
+
+    // New replicas in the ISR are not throttled, so they need nothing: tp1's new replica on broker 3 is in sync, and tp0's new replica
+    // on broker 2 caught up and became the leader before the movement was noticed to be completed.
+    Cluster caughtUpCluster = new Cluster("id", Arrays.asList(nodes),
+                                          Set.of(new PartitionInfo(TOPIC1, 0, nodes[2], new Node[]{nodes[0], nodes[2]},
+                                                                   new Node[]{nodes[0], nodes[2]}),
+                                                 new PartitionInfo(TOPIC1, 1, nodes[1], new Node[]{nodes[0], nodes[1], nodes[2], nodes[3]},
+                                                                   new Node[]{nodes[0], nodes[1], nodes[2], nodes[3]})),
+                                          Collections.emptySet(), Collections.emptySet());
+    neededLeaderThrottleByBroker.clear();
+    neededFollowerThrottleByBroker.clear();
+    ExecutionUtils.neededReplicationThrottles(List.of(task0, task1), writeRateKBpsByPartition, caughtUpCluster, Collections.emptyMap(),
+                                              neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+    assertEquals(Set.of(1), neededLeaderThrottleByBroker.keySet());
+    assertEquals(2 * 5 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(1), 1.0);
+    assertEquals(Set.of(4, 5), neededFollowerThrottleByBroker.keySet());
+  }
+
+  @Test
+  public void testNeededThrottleFloorAndCapacityScaledIncrease() {
+    long mb = MB_IN_BYTES;
+    // The needed throttle beats the network headroom: 0.8 * 100 - 75 = 5 MB/sec, but the movements need 30 MB/sec.
+    assertEquals(30 * mb, ExecutionUtils.recommendedReplicationThrottle(50 * mb, 30 * mb, true, 100 * MB_IN_KB, 75 * MB_IN_KB, true));
+    // ... and is reached at once from below, even at a run that only allows decreases.
+    assertEquals(30 * mb, ExecutionUtils.recommendedReplicationThrottle(2 * mb, 30 * mb, true, 100 * MB_IN_KB, 75 * MB_IN_KB, false));
+    // Only the maximum throttle (100 MB/sec) bounds it.
+    assertEquals(MOCK_MAX_REPLICATION_THROTTLE,
+                 ExecutionUtils.recommendedReplicationThrottle(50 * mb, 150 * mb, true, 100 * MB_IN_KB, 75 * MB_IN_KB, true));
+
+    // The additive increase is at least 5% of the broker's network capacity: 10 MB/sec (configured) on a 125 MB/sec (1 Gbps)
+    // broker, 62.5 MB/sec on a 1250 MB/sec (10 Gbps) broker.
+    assertEquals(10 * mb, ExecutionUtils.additiveIncreaseStep(125 * MB_IN_KB));
+    assertEquals((long) (62.5 * mb), ExecutionUtils.additiveIncreaseStep(1250 * MB_IN_KB));
+    // On the 10 Gbps broker, a throttle of 20 MB/sec rises to 82.5 MB/sec in one metric-based check (MAX: 100 MB/sec).
+    assertEquals((long) (82.5 * mb),
+                 ExecutionUtils.recommendedReplicationThrottle(20 * mb, 0L, true, 1250 * MB_IN_KB, 100 * MB_IN_KB, true));
+  }
+
+  @Test
+  public void testMovementProgressEscalation() {
+    long mb = MB_IN_BYTES;
+    // A movement making progress is never escalated.
+    ExecutionUtils.MovementProgress progress = new ExecutionUtils.MovementProgress();
+    for (long lag = 60; lag > 0; lag -= 10) {
+      assertFalse(progress.recordLag(lag * mb, true, mb));
+    }
+    assertEquals(0L, progress.escalatedNeed());
+
+    // A movement at its needed throttle whose lag does not shrink (a new replica truncated by retention over and over) is escalated
+    // after two runs without progress: its needed throttle doubles.
+    progress = new ExecutionUtils.MovementProgress();
+    assertFalse(progress.recordLag(40 * mb, true, mb));
+    assertFalse(progress.recordLag(65 * mb, true, mb));
+    assertTrue(progress.recordLag(41 * mb, true, mb));
+    assertEquals(2 * mb, progress.escalatedNeed());
+    // It needs progress at the escalated throttle: two more runs without it double it again.
+    assertFalse(progress.recordLag(50 * mb, true, 2 * mb));
+    assertTrue(progress.recordLag(60 * mb, true, 2 * mb));
+    assertEquals(4 * mb, progress.escalatedNeed());
+    // Progress resets the count.
+    assertFalse(progress.recordLag(30 * mb, true, 4 * mb));
+    assertFalse(progress.recordLag(35 * mb, true, 4 * mb));
+    assertFalse(progress.recordLag(20 * mb, true, 4 * mb));
+    assertEquals(4 * mb, progress.escalatedNeed());
+
+    // A movement above its needed throttle is not throttle-bound, so it is never escalated, and only consecutive runs at the needed
+    // throttle count.
+    progress = new ExecutionUtils.MovementProgress();
+    assertFalse(progress.recordLag(40 * mb, false, mb));
+    assertFalse(progress.recordLag(40 * mb, false, mb));
+    assertFalse(progress.recordLag(40 * mb, true, mb));
+    progress.notAtNeededThrottle();
+    assertFalse(progress.recordLag(40 * mb, true, mb));
+    assertTrue(progress.recordLag(40 * mb, true, mb));
+
+    // An escalation with an unknown write rate starts from the minimum throttle, and never exceeds the maximum throttle.
+    progress = new ExecutionUtils.MovementProgress();
+    progress.recordLag(10 * mb, true, 0L);
+    progress.recordLag(10 * mb, true, 0L);
+    assertTrue(progress.recordLag(10 * mb, true, 0L));
+    assertEquals(2 * MOCK_MIN_REPLICATION_THROTTLE, progress.escalatedNeed());
+    progress = new ExecutionUtils.MovementProgress();
+    progress.recordLag(10 * mb, true, 80 * mb);
+    progress.recordLag(10 * mb, true, 80 * mb);
+    assertTrue(progress.recordLag(10 * mb, true, 80 * mb));
+    assertEquals(MOCK_MAX_REPLICATION_THROTTLE, progress.escalatedNeed());
+  }
+
+  @Test
+  public void testAtNeededThrottle() {
+    long mb = MB_IN_BYTES;
+    assertTrue(ExecutionUtils.atNeededThrottle(10 * mb, 10 * mb));
+    assertTrue(ExecutionUtils.atNeededThrottle(10 * mb + mb / 4, 10 * mb));
+    assertFalse(ExecutionUtils.atNeededThrottle(20 * mb, 10 * mb));
+    // A movement with an unknown write rate (no need) is at its needed throttle at the minimum throttle.
+    assertTrue(ExecutionUtils.atNeededThrottle(MOCK_MIN_REPLICATION_THROTTLE, 0L));
+    assertFalse(ExecutionUtils.atNeededThrottle(5 * mb, 0L));
   }
 
   @Test
@@ -689,11 +807,15 @@ public class ConcurrencyAdjusterTest {
   @Test
   public void testDecreasedReplicationThrottle() {
     // Multiplicative decrease.
-    assertEquals(15 * MB_IN_BYTES, ExecutionUtils.decreasedReplicationThrottle(30 * MB_IN_BYTES));
+    assertEquals(15 * MB_IN_BYTES, ExecutionUtils.decreasedReplicationThrottle(30 * MB_IN_BYTES, 0L));
     // Multiplicative decrease is bounded by the minimum throttle.
-    assertEquals(MOCK_MIN_REPLICATION_THROTTLE, ExecutionUtils.decreasedReplicationThrottle(3 * MB_IN_BYTES / 2));
+    assertEquals(MOCK_MIN_REPLICATION_THROTTLE, ExecutionUtils.decreasedReplicationThrottle(3 * MB_IN_BYTES / 2, 0L));
     // Current throttle is already below the minimum throttle. No change.
-    assertEquals(MB_IN_BYTES / 2, ExecutionUtils.decreasedReplicationThrottle(MB_IN_BYTES / 2));
+    assertEquals(MB_IN_BYTES / 2, ExecutionUtils.decreasedReplicationThrottle(MB_IN_BYTES / 2, 0L));
+    // Multiplicative decrease is bounded by the needed throttle of the in-progress movements ...
+    assertEquals(20 * MB_IN_BYTES, ExecutionUtils.decreasedReplicationThrottle(30 * MB_IN_BYTES, 20 * MB_IN_BYTES));
+    // ... and a throttle below it is raised to it.
+    assertEquals(20 * MB_IN_BYTES, ExecutionUtils.decreasedReplicationThrottle(5 * MB_IN_BYTES, 20 * MB_IN_BYTES));
   }
 
   @Test
