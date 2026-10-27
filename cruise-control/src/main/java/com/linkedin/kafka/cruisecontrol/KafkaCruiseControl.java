@@ -281,9 +281,10 @@ public class KafkaCruiseControl {
     }
     if (hasOngoingExecution()) {
       if (!stopOngoingExecution) {
-        throw new IllegalStateException(String.format("Cannot start a new execution while there is an ongoing execution. "
+        String recovery = _executor.ongoingRecoveryDescription();
+        throw new IllegalStateException(String.format("Cannot start a new execution while there is an ongoing execution%s. "
                                                       + "Please use %s=true to stop ongoing execution and start a new one.",
-                                                      STOP_ONGOING_EXECUTION_PARAM));
+                                                      recovery == null ? "" : " (" + recovery + ")", STOP_ONGOING_EXECUTION_PARAM));
       }
     } else {
       Set<TopicPartition> partitionsBeingReassigned;

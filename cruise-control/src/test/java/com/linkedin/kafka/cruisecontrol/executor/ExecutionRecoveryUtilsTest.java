@@ -23,7 +23,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import org.apache.kafka.clients.admin.Config;
+import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.LogDirDescription;
 import org.apache.kafka.clients.admin.PartitionReassignment;
+import org.apache.kafka.clients.admin.ReplicaInfo;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
@@ -34,6 +38,7 @@ import org.junit.Test;
 
 import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.ReplicaLogDirInfo;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -264,5 +269,195 @@ public class ExecutionRecoveryUtilsTest {
     String resumedReason = ExecutionRecoveryUtils.resumedReason("rebalance");
     assertEquals(ExecutionRecoveryUtils.RESUMED_REASON_PREFIX + "rebalance", resumedReason);
     assertEquals(resumedReason, ExecutionRecoveryUtils.resumedReason(resumedReason));
+  }
+
+  private static List<String> interBrokerDivergences(ExecutionTaskState persistedState,
+                                                     Cluster cluster,
+                                                     Map<TopicPartition, PartitionReassignment> ongoing) {
+    PersistedTask task = task(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, persistedState);
+    return ExecutionRecoveryUtils.taskDivergences(state(interBrokerProposal(), null, task), cluster, ongoing, Collections.emptyMap());
+  }
+
+  @Test
+  public void testInterBrokerTaskDivergences() {
+    Map<TopicPartition, PartitionReassignment> none = Collections.emptyMap();
+    // As the execution left them.
+    assertTrue(interBrokerDivergences(ExecutionTaskState.PENDING, cluster(0, 1), none).isEmpty());
+    assertTrue(interBrokerDivergences(ExecutionTaskState.PENDING, cluster(1, 0), none).isEmpty());
+    assertTrue(interBrokerDivergences(ExecutionTaskState.IN_PROGRESS, cluster(0, 1), none).isEmpty());
+    assertTrue(interBrokerDivergences(ExecutionTaskState.IN_PROGRESS, cluster(0, 2), none).isEmpty());
+    assertTrue(interBrokerDivergences(ExecutionTaskState.IN_PROGRESS, cluster(0, 2, 1),
+                                      reassigning(TP, Arrays.asList(0, 2), Collections.singletonList(1))).isEmpty());
+    assertTrue(interBrokerDivergences(ExecutionTaskState.COMPLETED, cluster(0, 2), none).isEmpty());
+    assertTrue(interBrokerDivergences(ExecutionTaskState.DEAD, cluster(0, 1), none).isEmpty());
+    // Being rolled back towards the old replicas.
+    assertTrue(interBrokerDivergences(ExecutionTaskState.DEAD, cluster(0, 1, 2),
+                                      reassigning(TP, Arrays.asList(0, 1), Collections.singletonList(2))).isEmpty());
+
+    // Moved by someone else: a pending task already on its new replicas, a completed task back on its old replicas, a partition
+    // on other replicas or being reassigned elsewhere, and a deleted partition.
+    assertEquals(1, interBrokerDivergences(ExecutionTaskState.PENDING, cluster(0, 2), none).size());
+    assertEquals(1, interBrokerDivergences(ExecutionTaskState.COMPLETED, cluster(0, 1), none).size());
+    assertEquals(1, interBrokerDivergences(ExecutionTaskState.IN_PROGRESS, cluster(0, 3), none).size());
+    assertEquals(1, interBrokerDivergences(ExecutionTaskState.IN_PROGRESS, cluster(0, 1, 3),
+                                           reassigning(TP, Arrays.asList(0, 3), Collections.singletonList(1))).size());
+    List<String> divergences = interBrokerDivergences(ExecutionTaskState.PENDING, emptyCluster(), none);
+    assertEquals(1, divergences.size());
+    assertTrue(divergences.get(0), divergences.get(0).contains("deleted"));
+  }
+
+  private static List<String> intraBrokerDivergences(ExecutionTaskState persistedState, String current, String future) {
+    PersistedTask task = task(ExecutionTask.TaskType.INTRA_BROKER_REPLICA_ACTION, persistedState);
+    ReplicaLogDirInfo info = logDirInfo(current, future);
+    return ExecutionRecoveryUtils.taskDivergences(state(intraBrokerProposal(), null, task), cluster(0, 1), Collections.emptyMap(),
+                                                  Map.of(new TopicPartitionReplica(TP.topic(), TP.partition(), 1), info));
+  }
+
+  @Test
+  public void testIntraBrokerTaskDivergences() {
+    assertTrue(intraBrokerDivergences(ExecutionTaskState.PENDING, "/d1", null).isEmpty());
+    assertTrue(intraBrokerDivergences(ExecutionTaskState.IN_PROGRESS, "/d1", "/d2").isEmpty());
+    assertTrue(intraBrokerDivergences(ExecutionTaskState.IN_PROGRESS, "/d1", null).isEmpty());
+    assertTrue(intraBrokerDivergences(ExecutionTaskState.IN_PROGRESS, "/d2", null).isEmpty());
+    assertTrue(intraBrokerDivergences(ExecutionTaskState.COMPLETED, "/d2", null).isEmpty());
+
+    assertEquals(1, intraBrokerDivergences(ExecutionTaskState.PENDING, "/d2", null).size());
+    assertEquals(1, intraBrokerDivergences(ExecutionTaskState.PENDING, "/d1", "/d3").size());
+    assertEquals(1, intraBrokerDivergences(ExecutionTaskState.COMPLETED, "/d1", null).size());
+    assertEquals(1, intraBrokerDivergences(ExecutionTaskState.IN_PROGRESS, "/d3", null).size());
+    // A replica on an offline logdir, and a replica whose logdir is unknown.
+    assertEquals(1, intraBrokerDivergences(ExecutionTaskState.PENDING, null, null).size());
+    PersistedTask task = task(ExecutionTask.TaskType.INTRA_BROKER_REPLICA_ACTION, ExecutionTaskState.PENDING);
+    assertEquals(1, ExecutionRecoveryUtils.taskDivergences(state(intraBrokerProposal(), null, task), cluster(0, 1), Collections.emptyMap(),
+                                                           Collections.emptyMap()).size());
+  }
+
+  @Test
+  public void testLeadershipTaskOnlyDivergesIfThePartitionIsDeleted() {
+    PersistedTask task = task(ExecutionTask.TaskType.LEADER_ACTION, ExecutionTaskState.PENDING);
+    PersistedExecutionState state = state(leadershipProposal(), null, task);
+    // Leaders also move by themselves.
+    assertTrue(ExecutionRecoveryUtils.taskDivergences(state, cluster(0, 1), Collections.emptyMap(), Collections.emptyMap()).isEmpty());
+    assertTrue(ExecutionRecoveryUtils.taskDivergences(state, cluster(1, 0), Collections.emptyMap(), Collections.emptyMap()).isEmpty());
+    assertEquals(1, ExecutionRecoveryUtils.taskDivergences(state, emptyCluster(), Collections.emptyMap(), Collections.emptyMap()).size());
+  }
+
+  @Test
+  public void testDeadDestinationBrokers() {
+    PersistedExecutionState state = state(interBrokerProposal(), null,
+                                          task(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, ExecutionTaskState.PENDING));
+    assertTrue(ExecutionRecoveryUtils.deadDestinationBrokers(state, cluster(0, 1)).isEmpty());
+    // Broker 1 is only a source of the execution, so it may be dead -- e.g. it is being removed.
+    List<Node> withoutBroker1 = Arrays.asList(NODES.get(0), NODES.get(2), NODES.get(3));
+    assertTrue(ExecutionRecoveryUtils.deadDestinationBrokers(
+        state, new Cluster("cluster", withoutBroker1, Collections.emptySet(), Collections.emptySet(), Collections.emptySet())).isEmpty());
+    // Broker 2 is a destination.
+    List<Node> withoutBroker2 = Arrays.asList(NODES.get(0), NODES.get(1), NODES.get(3));
+    List<String> divergences = ExecutionRecoveryUtils.deadDestinationBrokers(
+        state, new Cluster("cluster", withoutBroker2, Collections.emptySet(), Collections.emptySet(), Collections.emptySet()));
+    assertEquals(List.of("broker 2, a destination of the execution, is not alive"), divergences);
+  }
+
+  private static Config rates(String leaderRate, String followerRate) {
+    List<ConfigEntry> entries = new ArrayList<>();
+    if (leaderRate != null) {
+      entries.add(new ConfigEntry(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG, leaderRate,
+                                  ConfigEntry.ConfigSource.DYNAMIC_BROKER_CONFIG, false, false, Collections.emptyList(), null, null));
+    }
+    if (followerRate != null) {
+      entries.add(new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, followerRate,
+                                  ConfigEntry.ConfigSource.DYNAMIC_BROKER_CONFIG, false, false, Collections.emptyList(), null, null));
+    }
+    return new Config(entries);
+  }
+
+  @Test
+  public void testThrottleDivergences() {
+    PersistedTask task = task(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, ExecutionTaskState.IN_PROGRESS);
+    PersistedExecutionState state = new PersistedExecutionState.Builder(UUID, PersistedExecutionState.Operation.EXECUTE_PROPOSALS)
+        .replicationThrottle(100L).proposals(Collections.singletonList(interBrokerProposal())).tasks(List.of(task)).build();
+    Map<TopicPartition, PartitionReassignment> ongoing = reassigning(TP, Arrays.asList(0, 2), Collections.singletonList(1));
+    RecoveryPlan adopting = ExecutionRecoveryUtils.reconcile(state, cluster(0, 2, 1), ongoing, Collections.emptyMap());
+    // The brokers of an adopted movement must keep the throttle of the execution.
+    assertTrue(ExecutionRecoveryUtils.throttleDivergences(state, adopting, Map.of(0, rates("100", "100"), 1, rates("100", "100"),
+                                                                                  2, rates("100", "100"))).isEmpty());
+    // E.g. someone paused the movement, or removed its throttle.
+    assertEquals(1, ExecutionRecoveryUtils.throttleDivergences(state, adopting, Map.of(0, rates("100", "100"), 1, rates("100", "100"),
+                                                                                       2, rates("100", "0"))).size());
+    assertEquals(2, ExecutionRecoveryUtils.throttleDivergences(state, adopting, Map.of(0, rates("100", "100"), 1, rates("100", "100"),
+                                                                                       2, rates(null, null))).size());
+    // The brokers of a pending movement may have no rate yet, but not a rate set by someone else.
+    RecoveryPlan pending = ExecutionRecoveryUtils.reconcile(state, cluster(0, 1), Collections.emptyMap(), Collections.emptyMap());
+    assertTrue(ExecutionRecoveryUtils.throttleDivergences(state, pending, Map.of(0, rates(null, null), 2, rates(null, null))).isEmpty());
+    assertEquals(1, ExecutionRecoveryUtils.throttleDivergences(state, pending, Map.of(0, rates(null, null), 2, rates("200", null))).size());
+    // An unthrottled execution leaves the rates alone.
+    PersistedExecutionState unthrottled = state.toBuilder().replicationThrottle(null).build();
+    assertTrue(ExecutionRecoveryUtils.throttleDivergences(unthrottled, pending, Map.of(2, rates("200", "200"))).isEmpty());
+  }
+
+  @Test
+  public void testFreeSpaceShortfalls() {
+    PersistedTask task = task(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, ExecutionTaskState.PENDING);
+    // The pending movement adds a 10 MB replica to broker 2.
+    PersistedExecutionState state = state(interBrokerProposal(), null, task);
+    RecoveryPlan plan = ExecutionRecoveryUtils.reconcile(state, cluster(0, 1), Collections.emptyMap(), Collections.emptyMap());
+    long mb = 1024L * 1024L;
+    Map<Integer, Map<String, LogDirDescription>> enough =
+        Map.of(2, Map.of("/d1", new LogDirDescription(null, Collections.emptyMap(), 100 * mb, 6 * mb),
+                         "/d2", new LogDirDescription(null, Collections.emptyMap(), 100 * mb, 6 * mb)));
+    assertTrue(ExecutionRecoveryUtils.freeSpaceShortfalls(state, plan, enough).isEmpty());
+    Map<Integer, Map<String, LogDirDescription>> notEnough =
+        Map.of(2, Map.of("/d1", new LogDirDescription(null, Collections.emptyMap(), 100 * mb, 5 * mb),
+                         "/d2", new LogDirDescription(null, Collections.emptyMap(), 100 * mb, 5 * mb)));
+    List<String> shortfalls = ExecutionRecoveryUtils.freeSpaceShortfalls(state, plan, notEnough);
+    assertEquals(1, shortfalls.size());
+    assertTrue(shortfalls.get(0), shortfalls.get(0).startsWith("broker 2:"));
+    // Unknown usable space is not checked.
+    assertTrue(ExecutionRecoveryUtils.freeSpaceShortfalls(state, plan, Collections.emptyMap()).isEmpty());
+  }
+
+  @Test
+  public void testForeignIntraBrokerReplicaMovements() {
+    TopicPartition other = new TopicPartition("other", 0);
+    Map<Integer, Map<String, LogDirDescription>> logDirs =
+        Map.of(1, Map.of("/d2", new LogDirDescription(null, Map.of(TP, new ReplicaInfo(1L, 0L, true),
+                                                                   other, new ReplicaInfo(1L, 0L, true)))));
+    Set<TopicPartitionReplica> own = Set.of(new TopicPartitionReplica(TP.topic(), TP.partition(), 1));
+    assertEquals(List.of("other-0 on broker 1 is being moved to /d2 by someone else"),
+                 ExecutionRecoveryUtils.foreignIntraBrokerReplicaMovements(logDirs, own));
+  }
+
+  @Test
+  public void testLogDirFingerprint() {
+    TopicPartition other = new TopicPartition("other", 0);
+    Map<Integer, Map<String, LogDirDescription>> before =
+        Map.of(1, Map.of("/d1", new LogDirDescription(null, Map.of(TP, new ReplicaInfo(1L, 0L, false),
+                                                                   other, new ReplicaInfo(1L, 0L, false))),
+                         "/d2", new LogDirDescription(null, Collections.emptyMap())));
+    // The replica of the execution moved, the other did not.
+    Map<Integer, Map<String, LogDirDescription>> executionMoved =
+        Map.of(1, Map.of("/d1", new LogDirDescription(null, Map.of(other, new ReplicaInfo(1L, 0L, false))),
+                         "/d2", new LogDirDescription(null, Map.of(TP, new ReplicaInfo(1L, 0L, false)))));
+    // The other replica moved.
+    Map<Integer, Map<String, LogDirDescription>> otherMoved =
+        Map.of(1, Map.of("/d1", new LogDirDescription(null, Map.of(TP, new ReplicaInfo(1L, 0L, false))),
+                         "/d2", new LogDirDescription(null, Map.of(other, new ReplicaInfo(1L, 0L, false)))));
+    Map<Integer, Long> fingerprint = ExecutionRecoveryUtils.logDirFingerprintByBroker(before, Set.of(1), Set.of(TP));
+    assertTrue(ExecutionRecoveryUtils.logDirFingerprintDivergences(
+        fingerprint, ExecutionRecoveryUtils.logDirFingerprintByBroker(executionMoved, Set.of(1), Set.of(TP))).isEmpty());
+    assertEquals(1, ExecutionRecoveryUtils.logDirFingerprintDivergences(
+        fingerprint, ExecutionRecoveryUtils.logDirFingerprintByBroker(otherMoved, Set.of(1), Set.of(TP))).size());
+  }
+
+  @Test
+  public void testIsFinishedAndCleanupReason() {
+    PersistedTask completed = task(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, ExecutionTaskState.COMPLETED);
+    assertTrue(ExecutionRecoveryUtils.reconcile(state(interBrokerProposal(), null, completed), cluster(0, 2), Collections.emptyMap(),
+                                                Collections.emptyMap()).isFinished());
+    PersistedTask pending = task(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, ExecutionTaskState.PENDING);
+    assertFalse(ExecutionRecoveryUtils.reconcile(state(interBrokerProposal(), null, pending), cluster(0, 1), Collections.emptyMap(),
+                                                 Collections.emptyMap()).isFinished());
+    assertEquals(ExecutionRecoveryUtils.CLEANUP_REASON_PREFIX + "r",
+                 ExecutionRecoveryUtils.cleanupReason(ExecutionRecoveryUtils.resumedReason("r")));
   }
 }

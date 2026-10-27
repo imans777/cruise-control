@@ -13,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import org.apache.kafka.common.TopicPartition;
 
@@ -26,11 +27,14 @@ import static com.linkedin.cruisecontrol.common.utils.Utils.validateNotNull;
  *   <li>the parameters that the execution was started with -- to resume it with the same parameters,</li>
  *   <li>the proposals of the execution -- once per partition, and</li>
  *   <li>the latest known state of each execution task -- to decide on restart whether a task was pending, in progress
- *   (i.e. submitted to Kafka), or finished.</li>
+ *   (i.e. submitted to Kafka), or finished, and</li>
+ *   <li>fingerprints of the replicas that the execution does not move -- to tell on restart whether the cluster has changed
+ *   since, in which case the execution is not resumed.</li>
  * </ul>
  */
 public final class PersistedExecutionState {
-  public static final int CURRENT_VERSION = 1;
+  // Version 2 added the fingerprints and the cleanup-only marker. A version 1 state is recovered, but never resumed.
+  public static final int CURRENT_VERSION = 2;
 
   /**
    * The operation that started the execution.
@@ -61,6 +65,9 @@ public final class PersistedExecutionState {
   private final Long _replicationThrottle;
   private final boolean _kafkaAssignerMode;
   private final boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+  private final boolean _cleanupOnly;
+  private final ReplicaPlacementFingerprint _outsideExecutionFingerprint;
+  private final Map<Integer, Long> _logDirFingerprintByBroker;
   private final Map<TopicPartition, ExecutionProposal> _proposals;
   private final List<PersistedTask> _tasks;
 
@@ -87,6 +94,10 @@ public final class PersistedExecutionState {
     _replicationThrottle = builder._replicationThrottle;
     _kafkaAssignerMode = builder._kafkaAssignerMode;
     _skipInterBrokerReplicaConcurrencyAdjustment = builder._skipInterBrokerReplicaConcurrencyAdjustment;
+    _cleanupOnly = builder._cleanupOnly;
+    _outsideExecutionFingerprint = builder._outsideExecutionFingerprint;
+    _logDirFingerprintByBroker = builder._logDirFingerprintByBroker == null
+                                 ? null : Collections.unmodifiableMap(new TreeMap<>(builder._logDirFingerprintByBroker));
     _proposals = Collections.unmodifiableMap(new LinkedHashMap<>(builder._proposals));
     _tasks = Collections.unmodifiableList(new ArrayList<>(builder._tasks));
     for (PersistedTask task : _tasks) {
@@ -125,6 +136,9 @@ public final class PersistedExecutionState {
         .replicationThrottle(_replicationThrottle)
         .kafkaAssignerMode(_kafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(_skipInterBrokerReplicaConcurrencyAdjustment)
+        .cleanupOnly(_cleanupOnly)
+        .outsideExecutionFingerprint(_outsideExecutionFingerprint)
+        .logDirFingerprintByBroker(_logDirFingerprintByBroker)
         .proposals(_proposals.values())
         .tasks(_tasks);
   }
@@ -228,6 +242,31 @@ public final class PersistedExecutionState {
   }
 
   /**
+   * @return {@code true} if a Cruise Control restart has already decided not to resume this execution -- i.e. later restarts
+   * must only clean it up, {@code false} otherwise.
+   */
+  public boolean cleanupOnly() {
+    return _cleanupOnly;
+  }
+
+  /**
+   * @return The fingerprint of the replica placement of the partitions that the execution does not move, as of the latest
+   * persisted state, or {@code null} if unknown.
+   */
+  public ReplicaPlacementFingerprint outsideExecutionFingerprint() {
+    return _outsideExecutionFingerprint;
+  }
+
+  /**
+   * @return For each broker with intra-broker replica movements, the fingerprint of the logdirs of its replicas that the
+   * execution does not move, as of the start of the execution, or {@code null} if the execution has no intra-broker replica
+   * movements or the fingerprint is unknown.
+   */
+  public Map<Integer, Long> logDirFingerprintByBroker() {
+    return _logDirFingerprintByBroker;
+  }
+
+  /**
    * @return Proposals of the execution by partition.
    */
   public Map<TopicPartition, ExecutionProposal> proposals() {
@@ -273,6 +312,9 @@ public final class PersistedExecutionState {
     private Long _replicationThrottle;
     private boolean _kafkaAssignerMode;
     private boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+    private boolean _cleanupOnly;
+    private ReplicaPlacementFingerprint _outsideExecutionFingerprint;
+    private Map<Integer, Long> _logDirFingerprintByBroker;
     private final Map<TopicPartition, ExecutionProposal> _proposals = new LinkedHashMap<>();
     private final List<PersistedTask> _tasks = new ArrayList<>();
 
@@ -458,6 +500,34 @@ public final class PersistedExecutionState {
      */
     public Builder skipInterBrokerReplicaConcurrencyAdjustment(boolean skip) {
       _skipInterBrokerReplicaConcurrencyAdjustment = skip;
+      return this;
+    }
+
+    /**
+     * @param cleanupOnly {@code true} if the execution must not be resumed anymore, only cleaned up.
+     * @return This builder.
+     */
+    public Builder cleanupOnly(boolean cleanupOnly) {
+      _cleanupOnly = cleanupOnly;
+      return this;
+    }
+
+    /**
+     * @param fingerprint The fingerprint of the replica placement of the partitions that the execution does not move.
+     * @return This builder.
+     */
+    public Builder outsideExecutionFingerprint(ReplicaPlacementFingerprint fingerprint) {
+      _outsideExecutionFingerprint = fingerprint;
+      return this;
+    }
+
+    /**
+     * @param logDirFingerprintByBroker The fingerprint of the logdirs of the replicas that the execution does not move, of each
+     *                                  broker with intra-broker replica movements.
+     * @return This builder.
+     */
+    public Builder logDirFingerprintByBroker(Map<Integer, Long> logDirFingerprintByBroker) {
+      _logDirFingerprintByBroker = logDirFingerprintByBroker;
       return this;
     }
 

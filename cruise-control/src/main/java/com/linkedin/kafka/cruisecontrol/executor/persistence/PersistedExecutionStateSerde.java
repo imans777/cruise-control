@@ -4,20 +4,25 @@
 
 package com.linkedin.kafka.cruisecontrol.executor.persistence;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
-import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.stream.JsonWriter;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutionProposal;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutionTask;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutionTaskState;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutorState;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
+import java.io.IOException;
+import java.io.StringWriter;
+import java.io.UncheckedIOException;
+import java.io.Writer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import org.apache.kafka.common.TopicPartition;
 
 
@@ -64,7 +69,12 @@ public final class PersistedExecutionStateSerde {
   static final String TYPE = "type";
   static final String STATE = "state";
   static final String END_TIME_MS = "endTimeMs";
-  private static final Gson GSON = new Gson();
+  static final String CLEANUP_ONLY = "cleanupOnly";
+  static final String OUTSIDE_EXECUTION_FINGERPRINT = "outsideExecutionFingerprint";
+  static final String HASH = "hash";
+  static final String NUM_PARTITIONS = "numPartitions";
+  static final String NUM_REPLICAS_BY_BROKER = "numReplicasByBroker";
+  static final String LOGDIR_FINGERPRINT_BY_BROKER = "logDirFingerprintByBroker";
 
   private PersistedExecutionStateSerde() {
   }
@@ -74,62 +84,107 @@ public final class PersistedExecutionStateSerde {
    * @return JSON representation of the given execution state.
    */
   public static String toJson(PersistedExecutionState state) {
-    JsonObject json = new JsonObject();
-    json.addProperty(VERSION, state.version());
-    json.addProperty(UUID, state.uuid());
-    json.addProperty(REASON, state.reason());
-    json.addProperty(OPERATION, state.operation().name());
-    json.addProperty(TRIGGERED_BY_USER_REQUEST, state.triggeredByUserRequest());
-    json.addProperty(START_TIME_MS, state.startTimeMs());
-    json.addProperty(LAST_UPDATE_TIME_MS, state.lastUpdateTimeMs());
-    json.addProperty(RESUME_COUNT, state.resumeCount());
-    json.addProperty(EXECUTOR_STATE, state.executorState() == null ? null : state.executorState().name());
-
-    JsonObject parameters = new JsonObject();
-    parameters.add(REMOVED_BROKERS, toJsonArray(state.removedBrokers()));
-    parameters.add(DEMOTED_BROKERS, toJsonArray(state.demotedBrokers()));
-    parameters.add(BROKERS_TO_SKIP_CONCURRENCY_CHECK, toJsonArray(state.brokersToSkipConcurrencyCheck()));
-    parameters.addProperty(INTER_BROKER_PARTITION_MOVEMENT_CONCURRENCY, state.interBrokerPartitionMovementConcurrency());
-    parameters.addProperty(MAX_INTER_BROKER_PARTITION_MOVEMENTS, state.maxInterBrokerPartitionMovements());
-    parameters.addProperty(INTRA_BROKER_PARTITION_MOVEMENT_CONCURRENCY, state.intraBrokerPartitionMovementConcurrency());
-    parameters.addProperty(CLUSTER_LEADERSHIP_MOVEMENT_CONCURRENCY, state.clusterLeadershipMovementConcurrency());
-    parameters.addProperty(BROKER_LEADERSHIP_MOVEMENT_CONCURRENCY, state.brokerLeadershipMovementConcurrency());
-    parameters.addProperty(EXECUTION_PROGRESS_CHECK_INTERVAL_MS, state.executionProgressCheckIntervalMs());
-    parameters.addProperty(REPLICA_MOVEMENT_STRATEGY, state.replicaMovementStrategy());
-    parameters.addProperty(REPLICATION_THROTTLE, state.replicationThrottle());
-    parameters.addProperty(KAFKA_ASSIGNER_MODE, state.kafkaAssignerMode());
-    parameters.addProperty(SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT, state.skipInterBrokerReplicaConcurrencyAdjustment());
-    json.add(PARAMETERS, parameters);
-
-    JsonArray proposals = new JsonArray();
-    for (ExecutionProposal proposal : state.proposals().values()) {
-      JsonObject p = new JsonObject();
-      p.addProperty(TOPIC, proposal.topic());
-      p.addProperty(PARTITION, proposal.partitionId());
-      p.addProperty(PARTITION_SIZE, proposal.partitionSize());
-      p.add(OLD_LEADER, replicaToJson(proposal.oldLeader()));
-      p.add(OLD_REPLICAS, replicasToJson(proposal.oldReplicas()));
-      p.add(NEW_REPLICAS, replicasToJson(proposal.newReplicas()));
-      proposals.add(p);
+    StringWriter writer = new StringWriter();
+    try {
+      writeJson(state, writer);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
     }
-    json.add(PROPOSALS, proposals);
+    return writer.toString();
+  }
 
-    JsonArray tasks = new JsonArray();
-    for (PersistedTask task : state.tasks()) {
-      JsonObject t = new JsonObject();
-      t.addProperty(TYPE, task.type().name());
-      t.addProperty(TOPIC, task.topicPartition().topic());
-      t.addProperty(PARTITION, task.topicPartition().partition());
-      if (task.brokerId() != PersistedTask.NO_BROKER_ID) {
-        t.addProperty(BROKER_ID, task.brokerId());
+  /**
+   * Write the JSON representation of the given execution state to the given writer. The document is streamed rather than built
+   * in memory first, because an execution may have hundreds of thousands of tasks and it is persisted whenever it progresses.
+   *
+   * @param state Execution state to serialize.
+   * @param out Writer to write the JSON representation of the given execution state to.
+   */
+  public static void writeJson(PersistedExecutionState state, Writer out) throws IOException {
+    JsonWriter json = new JsonWriter(out);
+    // Absent optional values are omitted rather than written as null.
+    json.setSerializeNulls(false);
+    json.beginObject();
+    json.name(VERSION).value(state.version());
+    json.name(UUID).value(state.uuid());
+    json.name(REASON).value(state.reason());
+    json.name(OPERATION).value(state.operation().name());
+    json.name(TRIGGERED_BY_USER_REQUEST).value(state.triggeredByUserRequest());
+    json.name(START_TIME_MS).value(state.startTimeMs());
+    json.name(LAST_UPDATE_TIME_MS).value(state.lastUpdateTimeMs());
+    json.name(RESUME_COUNT).value(state.resumeCount());
+    json.name(EXECUTOR_STATE).value(state.executorState() == null ? null : state.executorState().name());
+    json.name(CLEANUP_ONLY).value(state.cleanupOnly());
+
+    json.name(PARAMETERS).beginObject();
+    writeIntegers(json, REMOVED_BROKERS, state.removedBrokers());
+    writeIntegers(json, DEMOTED_BROKERS, state.demotedBrokers());
+    writeIntegers(json, BROKERS_TO_SKIP_CONCURRENCY_CHECK, state.brokersToSkipConcurrencyCheck());
+    json.name(INTER_BROKER_PARTITION_MOVEMENT_CONCURRENCY).value(state.interBrokerPartitionMovementConcurrency());
+    json.name(MAX_INTER_BROKER_PARTITION_MOVEMENTS).value(state.maxInterBrokerPartitionMovements());
+    json.name(INTRA_BROKER_PARTITION_MOVEMENT_CONCURRENCY).value(state.intraBrokerPartitionMovementConcurrency());
+    json.name(CLUSTER_LEADERSHIP_MOVEMENT_CONCURRENCY).value(state.clusterLeadershipMovementConcurrency());
+    json.name(BROKER_LEADERSHIP_MOVEMENT_CONCURRENCY).value(state.brokerLeadershipMovementConcurrency());
+    json.name(EXECUTION_PROGRESS_CHECK_INTERVAL_MS).value(state.executionProgressCheckIntervalMs());
+    json.name(REPLICA_MOVEMENT_STRATEGY).value(state.replicaMovementStrategy());
+    json.name(REPLICATION_THROTTLE).value(state.replicationThrottle());
+    json.name(KAFKA_ASSIGNER_MODE).value(state.kafkaAssignerMode());
+    json.name(SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).value(state.skipInterBrokerReplicaConcurrencyAdjustment());
+    json.endObject();
+
+    ReplicaPlacementFingerprint fingerprint = state.outsideExecutionFingerprint();
+    if (fingerprint != null) {
+      json.name(OUTSIDE_EXECUTION_FINGERPRINT).beginObject();
+      json.name(HASH).value(fingerprint.hash());
+      json.name(NUM_PARTITIONS).value(fingerprint.numPartitions());
+      json.name(NUM_REPLICAS_BY_BROKER).beginObject();
+      for (Map.Entry<Integer, Integer> entry : fingerprint.numReplicasByBroker().entrySet()) {
+        json.name(String.valueOf(entry.getKey())).value(entry.getValue());
       }
-      t.addProperty(STATE, task.state().name());
-      t.addProperty(START_TIME_MS, task.startTimeMs());
-      t.addProperty(END_TIME_MS, task.endTimeMs());
-      tasks.add(t);
+      json.endObject();
+      json.endObject();
     }
-    json.add(TASKS, tasks);
-    return GSON.toJson(json);
+    if (state.logDirFingerprintByBroker() != null) {
+      json.name(LOGDIR_FINGERPRINT_BY_BROKER).beginObject();
+      for (Map.Entry<Integer, Long> entry : state.logDirFingerprintByBroker().entrySet()) {
+        json.name(String.valueOf(entry.getKey())).value(entry.getValue());
+      }
+      json.endObject();
+    }
+
+    json.name(PROPOSALS).beginArray();
+    for (ExecutionProposal proposal : state.proposals().values()) {
+      json.beginObject();
+      json.name(TOPIC).value(proposal.topic());
+      json.name(PARTITION).value(proposal.partitionId());
+      json.name(PARTITION_SIZE).value(proposal.partitionSize());
+      json.name(OLD_LEADER);
+      writeReplica(json, proposal.oldLeader());
+      json.name(OLD_REPLICAS);
+      writeReplicas(json, proposal.oldReplicas());
+      json.name(NEW_REPLICAS);
+      writeReplicas(json, proposal.newReplicas());
+      json.endObject();
+    }
+    json.endArray();
+
+    json.name(TASKS).beginArray();
+    for (PersistedTask task : state.tasks()) {
+      json.beginObject();
+      json.name(TYPE).value(task.type().name());
+      json.name(TOPIC).value(task.topicPartition().topic());
+      json.name(PARTITION).value(task.topicPartition().partition());
+      if (task.brokerId() != PersistedTask.NO_BROKER_ID) {
+        json.name(BROKER_ID).value(task.brokerId());
+      }
+      json.name(STATE).value(task.state().name());
+      json.name(START_TIME_MS).value(task.startTimeMs());
+      json.name(END_TIME_MS).value(task.endTimeMs());
+      json.endObject();
+    }
+    json.endArray();
+    json.endObject();
+    json.flush();
   }
 
   /**
@@ -171,6 +226,26 @@ public final class PersistedExecutionStateSerde {
              .replicationThrottle(optionalLong(parameters, REPLICATION_THROTTLE))
              .kafkaAssignerMode(required(parameters, KAFKA_ASSIGNER_MODE).getAsBoolean())
              .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean());
+      // Fields added in version 2 are optional, so that a version 1 state can still be recovered (but not resumed).
+      JsonElement cleanupOnly = optional(root, CLEANUP_ONLY);
+      builder.cleanupOnly(cleanupOnly != null && cleanupOnly.getAsBoolean());
+      JsonElement fingerprint = optional(root, OUTSIDE_EXECUTION_FINGERPRINT);
+      if (fingerprint != null) {
+        JsonObject f = fingerprint.getAsJsonObject();
+        Map<Integer, Integer> numReplicasByBroker = new TreeMap<>();
+        required(f, NUM_REPLICAS_BY_BROKER).getAsJsonObject().entrySet()
+                                           .forEach(e -> numReplicasByBroker.put(Integer.parseInt(e.getKey()), e.getValue().getAsInt()));
+        builder.outsideExecutionFingerprint(new ReplicaPlacementFingerprint(required(f, HASH).getAsLong(),
+                                                                            required(f, NUM_PARTITIONS).getAsInt(),
+                                                                            numReplicasByBroker));
+      }
+      JsonElement logDirFingerprints = optional(root, LOGDIR_FINGERPRINT_BY_BROKER);
+      if (logDirFingerprints != null) {
+        Map<Integer, Long> logDirFingerprintByBroker = new TreeMap<>();
+        logDirFingerprints.getAsJsonObject().entrySet()
+                          .forEach(e -> logDirFingerprintByBroker.put(Integer.parseInt(e.getKey()), e.getValue().getAsLong()));
+        builder.logDirFingerprintByBroker(logDirFingerprintByBroker);
+      }
 
       List<ExecutionProposal> proposals = new ArrayList<>();
       for (JsonElement element : required(root, PROPOSALS).getAsJsonArray()) {
@@ -203,28 +278,32 @@ public final class PersistedExecutionStateSerde {
     }
   }
 
-  private static JsonElement toJsonArray(Collection<Integer> values) {
+  private static void writeIntegers(JsonWriter json, String name, Collection<Integer> values) throws IOException {
     if (values == null) {
-      return JsonNull.INSTANCE;
+      return;
     }
-    JsonArray array = new JsonArray();
-    values.forEach(array::add);
-    return array;
+    json.name(name).beginArray();
+    for (int value : values) {
+      json.value(value);
+    }
+    json.endArray();
   }
 
-  private static JsonObject replicaToJson(ReplicaPlacementInfo replica) {
-    JsonObject json = new JsonObject();
-    json.addProperty(BROKER_ID, replica.brokerId());
+  private static void writeReplica(JsonWriter json, ReplicaPlacementInfo replica) throws IOException {
+    json.beginObject();
+    json.name(BROKER_ID).value(replica.brokerId());
     if (replica.logdir() != null) {
-      json.addProperty(LOGDIR, replica.logdir());
+      json.name(LOGDIR).value(replica.logdir());
     }
-    return json;
+    json.endObject();
   }
 
-  private static JsonArray replicasToJson(List<ReplicaPlacementInfo> replicas) {
-    JsonArray array = new JsonArray();
-    replicas.forEach(r -> array.add(replicaToJson(r)));
-    return array;
+  private static void writeReplicas(JsonWriter json, List<ReplicaPlacementInfo> replicas) throws IOException {
+    json.beginArray();
+    for (ReplicaPlacementInfo replica : replicas) {
+      writeReplica(json, replica);
+    }
+    json.endArray();
   }
 
   private static ReplicaPlacementInfo replicaFromJson(JsonObject json) {

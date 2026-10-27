@@ -8,6 +8,7 @@ import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedExecutionState;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedTask;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.ReplicaPlacementFingerprint;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.BaseReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
@@ -22,8 +23,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
+import org.apache.kafka.clients.admin.Config;
+import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.LogDirDescription;
 import org.apache.kafka.clients.admin.PartitionReassignment;
+import org.apache.kafka.clients.admin.ReplicaInfo;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
@@ -45,6 +51,10 @@ import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.Replic
 final class ExecutionRecoveryUtils {
   private static final Logger LOG = LoggerFactory.getLogger(ExecutionRecoveryUtils.class);
   static final String RESUMED_REASON_PREFIX = "Resumed after Cruise Control restart: ";
+  static final String CLEANUP_REASON_PREFIX = "Cleaning up after Cruise Control restart: ";
+  // The usable space of a destination must exceed the data to move to it by this factor for the execution to be resumed.
+  static final double FREE_SPACE_MARGIN = 1.1;
+  private static final long BYTES_IN_MB = 1024L * 1024L;
 
   private ExecutionRecoveryUtils() {
   }
@@ -162,6 +172,14 @@ final class ExecutionRecoveryUtils {
         return "there are no remaining tasks to execute";
       }
       return null;
+    }
+
+    /**
+     * @return {@code true} if nothing is left of the execution -- i.e. every task is completed (or finished with an error) and no
+     * reassignment of the execution is in flight, {@code false} otherwise.
+     */
+    boolean isFinished() {
+      return _actionByTask.values().stream().allMatch(a -> a == RecoveryAction.COMPLETED || a == RecoveryAction.FINISHED_WITH_ERROR);
     }
 
     /**
@@ -318,8 +336,320 @@ final class ExecutionRecoveryUtils {
     return RecoveryAction.PENDING;
   }
 
+  /**
+   * Find the differences between the persisted state of the tasks and the current state of the cluster that the execution
+   * itself cannot explain -- i.e. changes made by someone else while Cruise Control was not running. For each task, the cluster
+   * must be where the execution left it:
+   * <ul>
+   *   <li>a pending task: on its old replicas (inter-broker), or its old logdir (intra-broker) -- the execution never touched it;</li>
+   *   <li>an in-progress task: on its old replicas, on its new replicas, or being reassigned towards its new replicas (inter-broker),
+   *   or on its old logdir with or without a future replica on its new logdir, or on its new logdir (intra-broker);</li>
+   *   <li>a completed task: on its new replicas or logdir;</li>
+   *   <li>an aborted or dead task: on its old or new replicas (or logdir), or being rolled back towards its old replicas.</li>
+   * </ul>
+   * A deleted partition is a difference too. Leadership tasks are only checked for deleted partitions, because leaders also move
+   * by themselves -- e.g. by Kafka's automatic preferred leader election.
+   *
+   * @param state Persisted execution state.
+   * @param cluster Current cluster metadata.
+   * @param ongoingReassignments Ongoing partition reassignments in the cluster.
+   * @param logDirInfoByReplica Current log directory information of the replicas of intra-broker replica tasks.
+   * @return Human-readable differences, or an empty list if there are none.
+   */
+  static List<String> taskDivergences(PersistedExecutionState state,
+                                      Cluster cluster,
+                                      Map<TopicPartition, PartitionReassignment> ongoingReassignments,
+                                      Map<TopicPartitionReplica, ReplicaLogDirInfo> logDirInfoByReplica) {
+    List<String> divergences = new ArrayList<>();
+    for (PersistedTask task : state.tasks()) {
+      ExecutionProposal proposal = state.proposals().get(task.topicPartition());
+      PartitionInfo partitionInfo = cluster.partition(task.topicPartition());
+      String divergence;
+      if (partitionInfo == null) {
+        divergence = String.format("%s was deleted", task.topicPartition());
+      } else {
+        switch (task.type()) {
+          case INTER_BROKER_REPLICA_ACTION:
+            divergence = interBrokerTaskDivergence(task, proposal, partitionInfo, ongoingReassignments.get(task.topicPartition()));
+            break;
+          case INTRA_BROKER_REPLICA_ACTION:
+            divergence = intraBrokerTaskDivergence(task, proposal, logDirInfoByReplica);
+            break;
+          default:
+            divergence = null;
+            break;
+        }
+      }
+      if (divergence != null) {
+        divergences.add(divergence);
+      }
+    }
+    return divergences;
+  }
+
+  private static String interBrokerTaskDivergence(PersistedTask task,
+                                                  ExecutionProposal proposal,
+                                                  PartitionInfo partitionInfo,
+                                                  PartitionReassignment ongoingReassignment) {
+    Set<Integer> oldReplicas = brokerIds(proposal.oldReplicas());
+    Set<Integer> newReplicas = brokerIds(proposal.newReplicas());
+    Set<Integer> currentReplicas = Arrays.stream(partitionInfo.replicas()).map(Node::id).collect(Collectors.toSet());
+    Set<Integer> targetReplicas = null;
+    if (ongoingReassignment != null) {
+      targetReplicas = new HashSet<>(ongoingReassignment.replicas());
+      targetReplicas.removeAll(ongoingReassignment.removingReplicas());
+    }
+    boolean expected;
+    switch (task.state()) {
+      case PENDING:
+        expected = targetReplicas == null && currentReplicas.equals(oldReplicas);
+        break;
+      case IN_PROGRESS:
+        expected = targetReplicas == null ? (currentReplicas.equals(oldReplicas) || currentReplicas.equals(newReplicas))
+                                          : targetReplicas.equals(newReplicas);
+        break;
+      case COMPLETED:
+        expected = targetReplicas == null && currentReplicas.equals(newReplicas);
+        break;
+      default:
+        // Aborting, aborted or dead -- possibly being rolled back.
+        expected = targetReplicas == null ? (currentReplicas.equals(oldReplicas) || currentReplicas.equals(newReplicas))
+                                          : targetReplicas.equals(oldReplicas);
+        break;
+    }
+    if (expected) {
+      return null;
+    }
+    return String.format("%s (%s %s -> %s) is %s", task.topicPartition(), task.state(), new TreeSet<>(oldReplicas),
+                         new TreeSet<>(newReplicas), targetReplicas == null ? "on " + new TreeSet<>(currentReplicas)
+                                                                            : "being reassigned to " + new TreeSet<>(targetReplicas));
+  }
+
+  private static String intraBrokerTaskDivergence(PersistedTask task,
+                                                  ExecutionProposal proposal,
+                                                  Map<TopicPartitionReplica, ReplicaLogDirInfo> logDirInfoByReplica) {
+    TopicPartitionReplica replica = new TopicPartitionReplica(task.topicPartition().topic(), task.topicPartition().partition(),
+                                                              task.brokerId());
+    ReplicaPlacementInfo target = proposal.replicasToMoveBetweenDisksByBroker().get(task.brokerId());
+    if (target == null) {
+      return String.format("%s: the execution has no logdir to move it to", replica);
+    }
+    String source = proposal.oldReplicas().stream().filter(r -> r.brokerId() == task.brokerId()).map(ReplicaPlacementInfo::logdir)
+                            .findFirst().orElse(null);
+    ReplicaLogDirInfo info = logDirInfoByReplica.get(replica);
+    if (info == null) {
+      return String.format("%s: its logdir is unknown", replica);
+    }
+    String current = info.getCurrentReplicaLogDir();
+    String future = info.getFutureReplicaLogDir();
+    if (current == null) {
+      return String.format("%s is on an offline logdir", replica);
+    }
+    boolean onSource = source == null ? !current.equals(target.logdir()) : current.equals(source);
+    boolean onTarget = current.equals(target.logdir());
+    boolean expected;
+    switch (task.state()) {
+      case PENDING:
+        expected = onSource && future == null;
+        break;
+      case COMPLETED:
+        expected = onTarget && future == null;
+        break;
+      default:
+        // In progress, aborting, aborted or dead.
+        expected = (onSource && (future == null || future.equals(target.logdir()))) || (onTarget && future == null);
+        break;
+    }
+    if (expected) {
+      return null;
+    }
+    return String.format("%s (%s %s -> %s) is on %s%s", replica, task.state(), source, target.logdir(), current,
+                         future == null ? "" : " with a future replica on " + future);
+  }
+
+  /**
+   * @param state Persisted execution state.
+   * @param cluster Current cluster metadata.
+   * @return Brokers that the execution moves replicas to, which are not alive -- e.g. failed or removed while Cruise Control was not
+   * running. Brokers that the execution only moves replicas away from may be dead -- e.g. a broker being removed or healed.
+   */
+  static List<String> deadDestinationBrokers(PersistedExecutionState state, Cluster cluster) {
+    Set<Integer> aliveBrokers = cluster.nodes().stream().map(Node::id).collect(Collectors.toSet());
+    Set<Integer> deadDestinationBrokers = new TreeSet<>();
+    for (ExecutionProposal proposal : state.proposals().values()) {
+      proposal.newReplicas().forEach(r -> {
+        if (!aliveBrokers.contains(r.brokerId())) {
+          deadDestinationBrokers.add(r.brokerId());
+        }
+      });
+    }
+    return deadDestinationBrokers.stream().map(b -> String.format("broker %d, a destination of the execution, is not alive", b))
+                                 .collect(Collectors.toList());
+  }
+
+  /**
+   * @param logDirsByBroker Current logdirs of brokers.
+   * @param ownReplicas Replicas of the intra-broker replica tasks of the execution.
+   * @return Ongoing intra-broker replica movements that are not part of the execution.
+   */
+  static List<String> foreignIntraBrokerReplicaMovements(Map<Integer, Map<String, LogDirDescription>> logDirsByBroker,
+                                                         Set<TopicPartitionReplica> ownReplicas) {
+    Set<String> movements = new TreeSet<>();
+    logDirsByBroker.forEach((broker, logDirs) -> logDirs.forEach((logDir, description) -> description.replicaInfos().forEach((tp, info) -> {
+      if (info.isFuture() && !ownReplicas.contains(new TopicPartitionReplica(tp.topic(), tp.partition(), broker))) {
+        movements.add(String.format("%s on broker %d is being moved to %s by someone else", tp, broker, logDir));
+      }
+    })));
+    return new ArrayList<>(movements);
+  }
+
+  /**
+   * @param logDirsByBroker Current logdirs of brokers.
+   * @param brokers Brokers to compute the fingerprint of -- i.e. the brokers with intra-broker replica movements.
+   * @param excludedPartitions Partitions to exclude -- i.e. the partitions of the execution.
+   * @return For each of the given brokers whose logdirs are known, a fingerprint of the logdirs of its replicas, except the
+   * excluded ones.
+   */
+  static Map<Integer, Long> logDirFingerprintByBroker(Map<Integer, Map<String, LogDirDescription>> logDirsByBroker,
+                                                     Set<Integer> brokers,
+                                                     Set<TopicPartition> excludedPartitions) {
+    Map<Integer, Long> fingerprintByBroker = new TreeMap<>();
+    for (int broker : brokers) {
+      Map<String, LogDirDescription> logDirs = logDirsByBroker.get(broker);
+      if (logDirs == null) {
+        continue;
+      }
+      long fingerprint = 0L;
+      for (Map.Entry<String, LogDirDescription> logDir : logDirs.entrySet()) {
+        long logDirHash = ReplicaPlacementFingerprint.hashString(logDir.getKey());
+        for (Map.Entry<TopicPartition, ReplicaInfo> replica : logDir.getValue().replicaInfos().entrySet()) {
+          TopicPartition tp = replica.getKey();
+          if (!replica.getValue().isFuture() && !excludedPartitions.contains(tp)) {
+            fingerprint += ReplicaPlacementFingerprint.mix(logDirHash ^ ReplicaPlacementFingerprint.mix(
+                ReplicaPlacementFingerprint.hashString(tp.topic()) ^ ReplicaPlacementFingerprint.mix(tp.partition())));
+          }
+        }
+      }
+      fingerprintByBroker.put(broker, fingerprint);
+    }
+    return fingerprintByBroker;
+  }
+
+  /**
+   * @param persisted The logdir fingerprints persisted when the execution started.
+   * @param current The current logdir fingerprints of the same brokers.
+   * @return Brokers whose replicas outside the execution were moved between logdirs (or created or deleted).
+   */
+  static List<String> logDirFingerprintDivergences(Map<Integer, Long> persisted, Map<Integer, Long> current) {
+    List<String> divergences = new ArrayList<>();
+    persisted.forEach((broker, fingerprint) -> {
+      if (!fingerprint.equals(current.get(broker))) {
+        divergences.add(String.format("broker %d: replicas outside the execution were moved between its logdirs, created or deleted",
+                                      broker));
+      }
+    });
+    return divergences;
+  }
+
+  /**
+   * The throttled rates of the brokers of the execution must be as the execution left them: the brokers of an adopted (i.e. still
+   * ongoing) movement must have the throttle of the execution, and the other brokers either have it or no rate at all. Anything
+   * else was set by someone else while Cruise Control was not running -- e.g. a rate of 0 that pauses a movement on purpose.
+   *
+   * @param state Persisted execution state.
+   * @param plan The recovery plan of the execution.
+   * @param brokerConfigs Current configs of the brokers of the execution.
+   * @return Throttled rates that differ from what the execution left behind, or an empty list if the execution is not throttled.
+   */
+  static List<String> throttleDivergences(PersistedExecutionState state, RecoveryPlan plan, Map<Integer, Config> brokerConfigs) {
+    List<String> divergences = new ArrayList<>();
+    Long throttle = state.replicationThrottle();
+    if (throttle == null) {
+      return divergences;
+    }
+    Set<Integer> adoptedBrokers = new TreeSet<>();
+    plan.adoptedInterBrokerPartitions().forEach(tp -> adoptedBrokers.addAll(participatingBrokers(state.proposals().get(tp))));
+    for (Map.Entry<Integer, Config> entry : new TreeMap<>(brokerConfigs).entrySet()) {
+      for (String rateConfig : List.of(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG,
+                                       ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG)) {
+        ConfigEntry rate = entry.getValue().get(rateConfig);
+        boolean isSet = rate != null && rate.source() == ConfigEntry.ConfigSource.DYNAMIC_BROKER_CONFIG;
+        boolean isOwn = isSet && String.valueOf(throttle).equals(rate.value());
+        if (isSet ? !isOwn : adoptedBrokers.contains(entry.getKey())) {
+          divergences.add(String.format("broker %d: %s is %s, not the throttle of the execution (%d)", entry.getKey(), rateConfig,
+                                        isSet ? rate.value() : "not set", throttle));
+        }
+      }
+    }
+    return divergences;
+  }
+
+  /**
+   * @param proposal An execution proposal.
+   * @return The brokers of the old and new replicas of the given proposal.
+   */
+  static Set<Integer> participatingBrokers(ExecutionProposal proposal) {
+    Set<Integer> brokers = brokerIds(proposal.oldReplicas());
+    brokers.addAll(brokerIds(proposal.newReplicas()));
+    return brokers;
+  }
+
+  /**
+   * The data that the pending replica movements of the execution would add to each destination broker (or logdir, for intra-broker
+   * movements) must fit in its usable space, with a margin of {@value #FREE_SPACE_MARGIN} times the data to move. Brokers (or logdirs)
+   * whose usable space is unknown -- e.g. not reported by the broker -- are not checked.
+   *
+   * @param state Persisted execution state.
+   * @param plan The recovery plan of the execution.
+   * @param logDirsByBroker Current logdirs of brokers.
+   * @return Destinations without enough usable space for the pending movements of the execution.
+   */
+  static List<String> freeSpaceShortfalls(PersistedExecutionState state, RecoveryPlan plan,
+                                          Map<Integer, Map<String, LogDirDescription>> logDirsByBroker) {
+    Map<Integer, Long> requiredMbByBroker = new TreeMap<>();
+    Map<Integer, Map<String, Long>> requiredMbByLogDir = new TreeMap<>();
+    plan.actionByTask().forEach((task, action) -> {
+      if (action != RecoveryAction.PENDING) {
+        return;
+      }
+      ExecutionProposal proposal = state.proposals().get(task.topicPartition());
+      if (task.type() == ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION) {
+        proposal.replicasToAdd().forEach(r -> requiredMbByBroker.merge(r.brokerId(), proposal.partitionSize(), Long::sum));
+      } else if (task.type() == ExecutionTask.TaskType.INTRA_BROKER_REPLICA_ACTION) {
+        ReplicaPlacementInfo target = proposal.replicasToMoveBetweenDisksByBroker().get(task.brokerId());
+        if (target != null) {
+          requiredMbByLogDir.computeIfAbsent(task.brokerId(), b -> new TreeMap<>()).merge(target.logdir(), proposal.partitionSize(), Long::sum);
+        }
+      }
+    });
+    List<String> shortfalls = new ArrayList<>();
+    requiredMbByBroker.forEach((broker, requiredMb) -> {
+      Map<String, LogDirDescription> logDirs = logDirsByBroker.get(broker);
+      if (logDirs == null || logDirs.values().stream().anyMatch(d -> d.error() == null && d.usableBytes().isEmpty())) {
+        return;
+      }
+      long usableBytes = logDirs.values().stream().filter(d -> d.error() == null).mapToLong(d -> d.usableBytes().getAsLong()).sum();
+      if (requiredMb * BYTES_IN_MB * FREE_SPACE_MARGIN > usableBytes) {
+        shortfalls.add(String.format("broker %d: the pending movements add %d MB, but only %d MB are usable", broker, requiredMb,
+                                     usableBytes / BYTES_IN_MB));
+      }
+    });
+    requiredMbByLogDir.forEach((broker, requiredMbByDir) -> requiredMbByDir.forEach((logDir, requiredMb) -> {
+      LogDirDescription description = logDirsByBroker.getOrDefault(broker, Collections.emptyMap()).get(logDir);
+      if (description == null || description.error() != null || description.usableBytes().isEmpty()) {
+        return;
+      }
+      long usableBytes = description.usableBytes().getAsLong();
+      if (requiredMb * BYTES_IN_MB * FREE_SPACE_MARGIN > usableBytes) {
+        shortfalls.add(String.format("broker %d logdir %s: the pending movements add %d MB, but only %d MB are usable", broker, logDir,
+                                     requiredMb, usableBytes / BYTES_IN_MB));
+      }
+    }));
+    return shortfalls;
+  }
+
   private static Set<Integer> brokerIds(List<ReplicaPlacementInfo> replicas) {
-    return replicas.stream().map(ReplicaPlacementInfo::brokerId).collect(Collectors.toSet());
+    return replicas.stream().map(ReplicaPlacementInfo::brokerId).collect(Collectors.toCollection(HashSet::new));
   }
 
   private static List<Integer> orderedBrokerIds(List<ReplicaPlacementInfo> replicas) {
@@ -357,6 +687,15 @@ final class ExecutionRecoveryUtils {
       strategy = strategy == null ? supportedStrategy : strategy.chain(supportedStrategy);
     }
     return strategy.chainBaseReplicaMovementStrategyIfAbsent();
+  }
+
+  /**
+   * @param reason Reason of the interrupted execution.
+   * @return Reason of cleaning up the interrupted execution.
+   */
+  static String cleanupReason(String reason) {
+    String originalReason = reason.startsWith(RESUMED_REASON_PREFIX) ? reason.substring(RESUMED_REASON_PREFIX.length()) : reason;
+    return CLEANUP_REASON_PREFIX + originalReason;
   }
 
   /**

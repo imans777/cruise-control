@@ -579,6 +579,48 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     entries.add(mockStaticConfig);
     assertTrue(ReplicationThrottleHelper.configsEqual(new Config(entries), expectedConfigs));
     EasyMock.verify(mockStaticConfig);
+
+    // A deleted dynamic config that is inherited from a cluster-wide default is deleted from the entity itself.
+    expectedConfigs.put("name6", null);
+    entries.add(new ConfigEntry("name6", "value6", ConfigEntry.ConfigSource.DYNAMIC_DEFAULT_BROKER_CONFIG, false, false,
+                                Collections.emptyList(), null, null));
+    assertTrue(ReplicationThrottleHelper.configsEqual(new Config(entries), expectedConfigs));
+    // ... but not while the entity itself still has it.
+    expectedConfigs.put("name7", null);
+    entries.add(new ConfigEntry("name7", "value7", ConfigEntry.ConfigSource.DYNAMIC_BROKER_CONFIG, false, false,
+                                Collections.emptyList(), null, null));
+    assertFalse(ReplicationThrottleHelper.configsEqual(new Config(entries), expectedConfigs));
+  }
+
+  @Test
+  public void testInterruptedExecutionCleanupKeepsRatesSetByOthers() throws Exception {
+    createTopics();
+    final long throttleRate = 100L;
+    ExecutionProposal proposal = new ExecutionProposal(new TopicPartition(TOPIC0, 0),
+                                                       100,
+                                                       new ReplicaPlacementInfo(0),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+    ReplicationThrottleHelper executionThrottleHelper = new ReplicationThrottleHelper(_adminClient, throttleRate);
+    executionThrottleHelper.setThrottles(Collections.singletonList(proposal));
+    // Someone else changes the follower rate of broker 1 after the execution set it -- e.g. while Cruise Control is not running.
+    ConfigResource broker1 = new ConfigResource(ConfigResource.Type.BROKER, "1");
+    List<AlterConfigOp> ops = Collections.singletonList(
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, "200"), AlterConfigOp.OpType.SET));
+    _adminClient.incrementalAlterConfigs(Collections.singletonMap(broker1, ops)).all().get();
+    executionThrottleHelper.waitForConfigs(broker1, ops);
+
+    ReplicationThrottleHelper cleanupThrottleHelper =
+        ReplicationThrottleHelper.forInterruptedExecution(_adminClient, throttleRate, Collections.emptySet(), 5);
+    cleanupThrottleHelper.clearThrottlesForProposals(Collections.singletonList(proposal), Collections.emptyList());
+    assertExpectedThrottledRateForBroker(0, null);
+    assertExpectedThrottledRateForBroker(2, null);
+    Config broker1Config = _adminClient.describeConfigs(Collections.singletonList(broker1)).all().get().get(broker1);
+    assertNull(broker1Config.get(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG));
+    assertEquals("200", broker1Config.get(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG).value());
+    assertEquals(Collections.singletonList("broker 1: follower.replication.throttled.rate=200 (DYNAMIC_BROKER_CONFIG)"),
+                 cleanupThrottleHelper.keptRates());
+    assertExpectedThrottledReplicas(TOPIC0, "");
   }
 
   private ExecutionTask prepareMockCompleteTask(ExecutionProposal proposal) {

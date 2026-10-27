@@ -5,7 +5,11 @@
 package com.linkedin.kafka.cruisecontrol.executor.persistence;
 
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
+import java.io.BufferedWriter;
 import java.io.IOException;
+import java.io.Writer;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -13,6 +17,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.EnumSet;
 import java.util.Map;
@@ -27,7 +32,8 @@ import org.slf4j.LoggerFactory;
  *
  * <ul>
  *   <li>Each save writes to a temporary file and atomically moves it over the state file, so a crash in the middle of a
- *   save never leaves a partially written state behind.</li>
+ *   save never leaves a partially written state behind. The temporary file is synced to the storage device before the move,
+ *   and the directory after it (where supported), so that a power loss cannot leave an empty or stale state file either.</li>
  *   <li>The state file is readable and writable only by its owner (if supported by the file system).</li>
  *   <li>A state file that cannot be parsed is renamed with a {@value #CORRUPT_FILE_SUFFIX} suffix (for later inspection)
  *   and treated as if there is no stored state -- so that it does not block every subsequent restart.</li>
@@ -65,7 +71,13 @@ public class FileExecutionStateStore implements ExecutionStateStore {
     if (parent != null) {
       Files.createDirectories(parent);
     }
-    Files.writeString(_tempPath, PersistedExecutionStateSerde.toJson(state), StandardCharsets.UTF_8);
+    try (FileChannel channel = FileChannel.open(_tempPath, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                                                StandardOpenOption.WRITE);
+         Writer writer = new BufferedWriter(Channels.newWriter(channel, StandardCharsets.UTF_8))) {
+      PersistedExecutionStateSerde.writeJson(state, writer);
+      writer.flush();
+      channel.force(true);
+    }
     try {
       Files.setPosixFilePermissions(_tempPath, EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
     } catch (UnsupportedOperationException | IOException e) {
@@ -76,6 +88,7 @@ public class FileExecutionStateStore implements ExecutionStateStore {
     } catch (AtomicMoveNotSupportedException e) {
       Files.move(_tempPath, _path, StandardCopyOption.REPLACE_EXISTING);
     }
+    syncDirectory(parent);
   }
 
   @Override
@@ -102,6 +115,24 @@ public class FileExecutionStateStore implements ExecutionStateStore {
     ensureConfigured();
     Files.deleteIfExists(_path);
     Files.deleteIfExists(_tempPath);
+    syncDirectory(_path.toAbsolutePath().getParent());
+  }
+
+  /**
+   * Sync the given directory, so that a rename or deletion in it survives a power loss. Not all platforms support it -- e.g.
+   * opening a directory fails on Windows -- in which case this is a no-op.
+   *
+   * @param directory Directory to sync, or {@code null} to do nothing.
+   */
+  private static void syncDirectory(Path directory) {
+    if (directory == null) {
+      return;
+    }
+    try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+      channel.force(true);
+    } catch (IOException | UnsupportedOperationException e) {
+      LOG.debug("Unable to sync the directory {} of the execution state file.", directory, e);
+    }
   }
 
   private void ensureConfigured() {

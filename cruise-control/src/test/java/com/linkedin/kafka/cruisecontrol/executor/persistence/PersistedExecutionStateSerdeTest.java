@@ -11,8 +11,11 @@ import com.linkedin.kafka.cruisecontrol.executor.ExecutionTask;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutionTaskState;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutorState;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
+import java.io.IOException;
+import java.io.StringWriter;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.Test;
@@ -59,6 +62,9 @@ public class PersistedExecutionStateSerdeTest {
         .replicaMovementStrategy("PostponeUrpReplicaMovementStrategy,BaseReplicaMovementStrategy")
         .replicationThrottle(1000000L)
         .skipInterBrokerReplicaConcurrencyAdjustment(true)
+        .cleanupOnly(true)
+        .outsideExecutionFingerprint(new ReplicaPlacementFingerprint(-42L, 7, Map.of(0, 5, 1, 9)))
+        .logDirFingerprintByBroker(Map.of(1, 123L, 2, -456L))
         .proposals(Arrays.asList(interBroker, intraBroker, otherInterBroker))
         .tasks(Arrays.asList(
             new PersistedTask(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, TP0, PersistedTask.NO_BROKER_ID,
@@ -103,6 +109,9 @@ public class PersistedExecutionStateSerdeTest {
     assertEquals(expected.replicationThrottle(), actual.replicationThrottle());
     assertEquals(expected.kafkaAssignerMode(), actual.kafkaAssignerMode());
     assertEquals(expected.skipInterBrokerReplicaConcurrencyAdjustment(), actual.skipInterBrokerReplicaConcurrencyAdjustment());
+    assertEquals(expected.cleanupOnly(), actual.cleanupOnly());
+    assertEquals(expected.outsideExecutionFingerprint(), actual.outsideExecutionFingerprint());
+    assertEquals(expected.logDirFingerprintByBroker(), actual.logDirFingerprintByBroker());
     assertEquals(expected.proposals().keySet(), actual.proposals().keySet());
     expected.proposals().forEach((tp, proposal) -> assertProposalEquals(proposal, actual.proposals().get(tp)));
     assertEquals(expected.tasks(), actual.tasks());
@@ -128,6 +137,34 @@ public class PersistedExecutionStateSerdeTest {
     assertEquals("", deserialized.reason());
     assertTrue(deserialized.tasks().isEmpty());
     assertTrue(deserialized.proposals().isEmpty());
+    assertFalse(deserialized.cleanupOnly());
+    assertNull(deserialized.outsideExecutionFingerprint());
+    assertNull(deserialized.logDirFingerprintByBroker());
+  }
+
+  @Test
+  public void testVersion1StateIsReadable() {
+    // A version 1 state has none of the fields added in version 2.
+    JsonObject json = JsonParser.parseString(PersistedExecutionStateSerde.toJson(sampleState())).getAsJsonObject();
+    json.addProperty(PersistedExecutionStateSerde.VERSION, 1);
+    json.remove(PersistedExecutionStateSerde.CLEANUP_ONLY);
+    json.remove(PersistedExecutionStateSerde.OUTSIDE_EXECUTION_FINGERPRINT);
+    json.remove(PersistedExecutionStateSerde.LOGDIR_FINGERPRINT_BY_BROKER);
+    PersistedExecutionState state = PersistedExecutionStateSerde.fromJson(json.toString());
+    assertEquals(1, state.version());
+    assertFalse(state.cleanupOnly());
+    assertNull(state.outsideExecutionFingerprint());
+    assertNull(state.logDirFingerprintByBroker());
+    assertEquals(sampleState().tasks(), state.tasks());
+  }
+
+  @Test
+  public void testStreamedJsonEqualsString() throws IOException {
+    StringWriter writer = new StringWriter();
+    PersistedExecutionStateSerde.writeJson(sampleState(), writer);
+    assertEquals(PersistedExecutionStateSerde.toJson(sampleState()), writer.toString());
+    // Absent optional values are omitted rather than written as null.
+    assertFalse(writer.toString().contains("null"));
   }
 
   @Test

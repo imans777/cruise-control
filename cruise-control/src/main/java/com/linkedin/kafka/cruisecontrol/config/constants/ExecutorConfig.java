@@ -532,6 +532,35 @@ public final class ExecutorConfig {
       + " If disabled (or the execution cannot be resumed), Cruise Control waits for the interrupted in-progress tasks to finish and"
       + " removes the replication throttles left behind by the interrupted execution.";
 
+  /**
+   * <code>resume.interrupted.execution.max.age.ms</code>
+   */
+  public static final String RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG = "resume.interrupted.execution.max.age.ms";
+  public static final long DEFAULT_RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS = TimeUnit.HOURS.toMillis(1);
+  public static final String RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_DOC = "The maximum time in ms since an interrupted execution"
+      + " last made progress for it to be resumed upon startup. An older execution was planned for a cluster that has likely"
+      + " changed since, so it is only cleaned up -- i.e. its leftover replication throttles are removed.";
+
+  /**
+   * <code>resume.interrupted.execution.max.count</code>
+   */
+  public static final String RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG = "resume.interrupted.execution.max.count";
+  public static final int DEFAULT_RESUME_INTERRUPTED_EXECUTION_MAX_COUNT = 3;
+  public static final String RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_DOC = "The maximum number of times an interrupted execution"
+      + " is resumed. An execution that was resumed this many times is only cleaned up upon the next startup, so that an"
+      + " execution which keeps Cruise Control from running (e.g. by exhausting its memory) is not resumed forever.";
+
+  /**
+   * <code>interrupted.execution.cleanup.timeout.ms</code>
+   */
+  public static final String INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG = "interrupted.execution.cleanup.timeout.ms";
+  public static final long DEFAULT_INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS = TimeUnit.HOURS.toMillis(1);
+  public static final String INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_DOC = "The maximum time in ms to wait for the partition"
+      + " reassignments of an interrupted execution that is not resumed to finish, before cancelling them and removing the"
+      + " replication throttles that the interrupted execution left behind. Until then, the executor reports the"
+      + " RECOVERING_INTERRUPTED_EXECUTION state, and a new execution can only be started by stopping the cleanup -- which"
+      + " cancels those reassignments right away.";
+
   private ExecutorConfig() {
   }
 
@@ -847,6 +876,24 @@ public final class ExecutorConfig {
                             ConfigDef.Type.BOOLEAN,
                             DEFAULT_RESUME_INTERRUPTED_EXECUTION_ON_STARTUP,
                             ConfigDef.Importance.MEDIUM,
-                            RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_DOC);
+                            RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_DOC)
+                    .define(RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG,
+                            ConfigDef.Type.LONG,
+                            DEFAULT_RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_DOC)
+                    .define(RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG,
+                            ConfigDef.Type.INT,
+                            DEFAULT_RESUME_INTERRUPTED_EXECUTION_MAX_COUNT,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_DOC)
+                    .define(INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG,
+                            ConfigDef.Type.LONG,
+                            DEFAULT_INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_DOC);
   }
 }

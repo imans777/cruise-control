@@ -14,9 +14,11 @@ import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.MonitorConfig;
 import com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorManager;
+import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.ExecutionStateStore;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedExecutionState;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedTask;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.ReplicaPlacementFingerprint;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.utils.CCKafkaClientsIntegrationTestHarness;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import com.linkedin.kafka.cruisecontrol.monitor.LoadMonitor;
@@ -34,10 +36,15 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.AlterConfigOp;
 import org.apache.kafka.clients.admin.Config;
+import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.NewPartitionReassignment;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.producer.Producer;
@@ -63,7 +70,9 @@ import static org.easymock.EasyMock.expectLastCall;
 import static org.easymock.EasyMock.isA;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 
@@ -159,6 +168,14 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
                                MetadataAdminClient metadataClient,
                                ExecutorNotifier notifier,
                                AnomalyDetectorManager anomalyDetectorManager) {
+    return newExecutor(resume, metadataClient, notifier, anomalyDetectorManager, new Properties());
+  }
+
+  private Executor newExecutor(boolean resume,
+                               MetadataAdminClient metadataClient,
+                               ExecutorNotifier notifier,
+                               AnomalyDetectorManager anomalyDetectorManager,
+                               Properties overrides) {
     Properties props = new Properties();
     props.setProperty(BrokerCapacityConfigFileResolver.CAPACITY_CONFIG_FILE, Objects.requireNonNull(
         getClass().getClassLoader().getResource(TestConstants.DEFAULT_BROKER_CAPACITY_CONFIG_FILE)).getFile());
@@ -168,6 +185,7 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     props.setProperty(ExecutorConfig.EXECUTION_PROGRESS_CHECK_INTERVAL_MS_CONFIG, "400");
     props.setProperty(ExecutorConfig.MIN_EXECUTION_PROGRESS_CHECK_INTERVAL_MS_CONFIG, "200");
     props.setProperty(ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG, Boolean.toString(resume));
+    props.putAll(overrides);
     KafkaCruiseControlConfig config = new KafkaCruiseControlConfig(props);
     // The executor closes its admin client upon shutdown.
     Admin executorAdminClient = newAdminClient();
@@ -260,20 +278,66 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
                                  newReplicas.stream().map(ReplicaPlacementInfo::new).collect(Collectors.toList()));
   }
 
-  private static PersistedExecutionState interruptedExecutionState(Long replicationThrottle, List<ExecutionProposal> proposals) {
+  /**
+   * @param replicationThrottle Replication throttle of the interrupted execution.
+   * @param proposals Proposals of the interrupted execution, each with an inter-broker replica task in progress.
+   * @return The state of an execution that was just interrupted, with the fingerprint of the cluster as it is now.
+   */
+  private PersistedExecutionState interruptedExecutionState(Long replicationThrottle, List<ExecutionProposal> proposals) {
     List<PersistedTask> tasks = proposals.stream().map(p -> new PersistedTask(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION,
                                                                               p.topicPartition(), PersistedTask.NO_BROKER_ID,
                                                                               ExecutionTaskState.IN_PROGRESS, 1L, -1L))
                                          .collect(Collectors.toList());
+    Set<TopicPartition> partitions = proposals.stream().map(ExecutionProposal::topicPartition).collect(Collectors.toSet());
     return new PersistedExecutionState.Builder(UUID, PersistedExecutionState.Operation.EXECUTE_PROPOSALS)
         .reason(REASON)
-        .startTimeMs(1L)
-        .lastUpdateTimeMs(2L)
+        .startTimeMs(System.currentTimeMillis())
+        .lastUpdateTimeMs(System.currentTimeMillis())
         .executorState(ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS)
         .replicationThrottle(replicationThrottle)
+        .outsideExecutionFingerprint(ReplicaPlacementFingerprint.of(new MetadataAdminClient(_adminClient).cluster(), partitions))
         .proposals(proposals)
         .tasks(tasks)
         .build();
+  }
+
+  private static Map<String, Object> recovery(Executor executor) {
+    Map<String, Object> recovery = executor.state().recovery();
+    assertNotNull("The executor state does not report the recovery", recovery);
+    return recovery;
+  }
+
+  private String brokerRate(int broker, String rateConfig) throws Exception {
+    ConfigResource resource = new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(broker));
+    ConfigEntry entry = _adminClient.describeConfigs(Collections.singleton(resource)).all().get().get(resource).get(rateConfig);
+    return entry == null ? null : entry.value();
+  }
+
+  /**
+   * Start a reassignment of {@link #TP0} from [0, 1] to [0, 2] that is kept in flight by a tiny replication throttle -- i.e.
+   * the in-flight reassignment of an interrupted execution.
+   *
+   * @param throttle The replication throttle to set.
+   * @return The proposal of the reassignment.
+   */
+  private ExecutionProposal startThrottledReassignment(long throttle) throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    Properties producerProps = new Properties();
+    producerProps.setProperty(ProducerConfig.ACKS_CONFIG, "all");
+    char[] chars = new char[10_000];
+    Arrays.fill(chars, 'x');
+    String value = new String(chars);
+    try (Producer<String, String> producer = createProducer(producerProps)) {
+      for (int i = 0; i < 300; i++) {
+        producer.send(new ProducerRecord<>(TOPIC, 0, null, value));
+      }
+      producer.flush();
+    }
+    ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    new ReplicationThrottleHelper(_adminClient, throttle).setThrottles(List.of(proposal));
+    _adminClient.alterPartitionReassignments(Map.of(TP0, Optional.of(new NewPartitionReassignment(List.of(0, 2))))).all().get();
+    assertTrue(_adminClient.listPartitionReassignments().reassignments().get().containsKey(TP0));
+    return proposal;
   }
 
   private static void waitForExecutionToFinish(Executor executor) {
@@ -325,6 +389,8 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     // The task is persisted as in progress (before it is submitted), then as completed.
     List<ExecutionTaskState> persistedTaskStates = savedStates.stream().map(s -> onlyTask(s).state()).distinct().collect(Collectors.toList());
     assertEquals(List.of(ExecutionTaskState.PENDING, ExecutionTaskState.IN_PROGRESS, ExecutionTaskState.COMPLETED), persistedTaskStates);
+    // Every persisted state has the fingerprint of the replicas outside the execution.
+    assertTrue(savedStates.stream().allMatch(s -> s.outsideExecutionFingerprint() != null));
     // The persisted state is deleted once the execution finishes.
     assertNull(_store.state());
   }
@@ -371,7 +437,7 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     Executor restartedExecutor = newExecutor(true, null, notifier, mockAnomalyDetectorManager(null));
     restartedExecutor.recoverInterruptedExecution(mockLoadMonitor());
     waitUntilTrue(() -> _store.state() == null, "The interrupted execution is not cleaned up", WAIT_TIME_MS, 100L);
-    assertFalse(restartedExecutor.hasOngoingExecution());
+    waitForExecutionToFinish(restartedExecutor);
     assertTrue(notifier.anyMessageContains("there are no remaining tasks to execute"));
     assertTrue(notifier.anyMessageContains("COMPLETED=1"));
   }
@@ -415,11 +481,12 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     Executor executor = newExecutor(false, null, notifier, anomalyDetectorManager);
     executor.recoverInterruptedExecution(mockLoadMonitor());
     waitUntilTrue(() -> _store.state() == null, "The interrupted execution is not cleaned up", WAIT_TIME_MS, 100L);
+    waitForExecutionToFinish(executor);
 
     assertFalse(hasThrottles());
     // The execution is not resumed.
     assertEquals(List.of(0, 1), currentReplicas(0));
-    assertFalse(executor.hasOngoingExecution());
+    assertEquals("CLEANED_UP", recovery(executor).get("status"));
     assertTrue(notifier.anyMessageContains(ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG + " is disabled"));
     EasyMock.verify(anomalyDetectorManager);
   }
@@ -457,26 +524,10 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
 
   @Test
   public void testResumeAdoptsOngoingReassignment() throws Exception {
-    createTopic(Map.of(0, List.of(0, 1)));
-    // Produce some data and throttle the replication to keep the reassignment ongoing.
-    Properties producerProps = new Properties();
-    producerProps.setProperty(ProducerConfig.ACKS_CONFIG, "all");
-    char[] chars = new char[10_000];
-    Arrays.fill(chars, 'x');
-    String value = new String(chars);
-    try (Producer<String, String> producer = createProducer(producerProps)) {
-      for (int i = 0; i < 300; i++) {
-        producer.send(new ProducerRecord<>(TOPIC, 0, null, value));
-      }
-      producer.flush();
-    }
-    ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
     long throttle = 10_000L;
-    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttle);
-    throttleHelper.setThrottles(List.of(proposal));
     // The interrupted execution submitted the reassignment before the restart.
-    _adminClient.alterPartitionReassignments(Map.of(TP0, Optional.of(new NewPartitionReassignment(List.of(0, 2))))).all().get();
-    assertTrue(_adminClient.listPartitionReassignments().reassignments().get().containsKey(TP0));
+    ExecutionProposal proposal = startThrottledReassignment(throttle);
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttle);
     _store.save(interruptedExecutionState(throttle, List.of(proposal)));
     int numSavedStatesBeforeResume = _store.savedStates().size();
 
@@ -501,5 +552,148 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     assertNull(_store.state());
     assertFalse(hasThrottles());
     EasyMock.verify(anomalyDetectorManager);
+  }
+
+  @Test
+  public void testRecoveryKeepsThrottledRateSetByOthers() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    long throttle = 100_000L;
+    new ReplicationThrottleHelper(_adminClient, throttle).setThrottles(List.of(proposal));
+    _store.save(interruptedExecutionState(throttle, List.of(proposal)));
+    // An operator changes the follower rate of broker 2 while Cruise Control is not running.
+    ConfigResource broker2 = new ConfigResource(ConfigResource.Type.BROKER, "2");
+    _adminClient.incrementalAlterConfigs(Map.of(broker2, List.of(new AlterConfigOp(
+        new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, "5000"), AlterConfigOp.OpType.SET))))
+                .all().get();
+    waitUntilTrue(() -> {
+      try {
+        return "5000".equals(brokerRate(2, ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG));
+      } catch (Exception e) {
+        return false;
+      }
+    }, "The rate is not changed", WAIT_TIME_MS, 100L);
+
+    Executor executor = newExecutor(false, null, new RecordingNotifier(), mockAnomalyDetectorManager(null));
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitUntilTrue(() -> _store.state() == null, "The interrupted execution is not cleaned up", WAIT_TIME_MS, 100L);
+    waitForExecutionToFinish(executor);
+
+    // The rates of the execution are removed; the rate set by the operator is kept and reported.
+    assertEquals("5000", brokerRate(2, ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG));
+    assertNull(brokerRate(2, ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG));
+    assertNull(brokerRate(0, ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG));
+    assertNull(brokerRate(1, ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG));
+    assertEquals(List.of("broker 2: follower.replication.throttled.rate=5000 (DYNAMIC_BROKER_CONFIG)"),
+                 recovery(executor).get("keptThrottles"));
+  }
+
+  @Test
+  public void testResumeIsRefusedIfReplicasOutsideTheExecutionMoved() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1), 1, List.of(2, 1)));
+    ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    _store.save(interruptedExecutionState(null, List.of(proposal)));
+    // While Cruise Control is not running, an operator moves a replica of a partition outside the execution to broker 0.
+    _adminClient.alterPartitionReassignments(Map.of(TP1, Optional.of(new NewPartitionReassignment(List.of(2, 0))))).all().get();
+    waitUntilTrue(() -> List.of(2, 0).equals(currentReplicas(1)), "Reassignment did not complete", WAIT_TIME_MS, 100L);
+
+    RecordingNotifier notifier = new RecordingNotifier();
+    Executor executor = newExecutor(true, null, notifier, mockAnomalyDetectorManager(null));
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitUntilTrue(() -> _store.state() == null, "The interrupted execution is not cleaned up", WAIT_TIME_MS, 100L);
+    waitForExecutionToFinish(executor);
+
+    // Not resumed: the partition of the execution stays where it was.
+    assertEquals(List.of(0, 1), currentReplicas(0));
+    Map<String, Object> recovery = recovery(executor);
+    assertTrue(String.valueOf(recovery.get("reasonNotResumed")), String.valueOf(recovery.get("reasonNotResumed"))
+                                                                       .contains("the cluster has changed since the execution was interrupted"));
+    // Broker 0 gained a replica outside the execution, broker 1 lost one.
+    List<?> divergences = (List<?>) recovery.get("divergences");
+    assertEquals(String.valueOf(divergences), 2, divergences.size());
+    assertReplicaCountChange(String.valueOf(divergences.get(0)), 0, 1);
+    assertReplicaCountChange(String.valueOf(divergences.get(1)), 1, -1);
+    assertTrue(notifier.anyMessageContains("the cluster has changed since the execution was interrupted"));
+  }
+
+  private static void assertReplicaCountChange(String divergence, int broker, int change) {
+    Matcher matcher = Pattern.compile("broker (\\d+): (\\d+) -> (\\d+) replicas outside the execution").matcher(divergence);
+    assertTrue(divergence, matcher.matches());
+    assertEquals(divergence, broker, Integer.parseInt(matcher.group(1)));
+    assertEquals(divergence, change, Integer.parseInt(matcher.group(3)) - Integer.parseInt(matcher.group(2)));
+  }
+
+  @Test
+  public void testResumeIsRefusedIfTheExecutionIsTooOld() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    _store.save(interruptedExecutionState(null, List.of(proposal)).toBuilder()
+                                                                     .lastUpdateTimeMs(System.currentTimeMillis() - TimeUnit.HOURS.toMillis(2))
+                                                                     .build());
+    Executor executor = newExecutor(true, null, new RecordingNotifier(), mockAnomalyDetectorManager(null));
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitUntilTrue(() -> _store.state() == null, "The interrupted execution is not cleaned up", WAIT_TIME_MS, 100L);
+    waitForExecutionToFinish(executor);
+    assertEquals(List.of(0, 1), currentReplicas(0));
+    assertTrue(String.valueOf(recovery(executor).get("reasonNotResumed")).contains(ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG));
+  }
+
+  @Test
+  public void testCleanupIsAnOngoingExecutionUntilStopped() throws Exception {
+    long throttle = 10_000L;
+    ExecutionProposal proposal = startThrottledReassignment(throttle);
+    _store.save(interruptedExecutionState(throttle, List.of(proposal)).toBuilder().removedBrokers(Set.of(1)).build());
+
+    Executor executor = newExecutor(false, null, new RecordingNotifier(), mockAnomalyDetectorManager(null));
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    // The cleanup is reported, waits for the in-flight reassignment, and keeps new executions from starting.
+    assertTrue(executor.hasOngoingExecution());
+    assertEquals(ExecutorState.State.RECOVERING_INTERRUPTED_EXECUTION, executor.state().state());
+    waitUntilTrue(() -> List.of(TP0.toString()).equals(executor.state().recovery().get("inFlightPartitionMovements")),
+                  "The in-flight reassignment is not reported", WAIT_TIME_MS, 100L);
+    assertEquals("WAITING_FOR_IN_FLIGHT_MOVEMENTS", recovery(executor).get("status"));
+    assertTrue(executor.ongoingRecoveryDescription().contains(UUID));
+    assertThrows(OngoingExecutionException.class, () -> executor.setGeneratingProposalsForExecution("new-uuid", () -> "new", true));
+    // A later restart must not resume it either; the broker that it was removing stays recently removed.
+    assertTrue(_store.state().cleanupOnly());
+    assertTrue(executor.recentlyRemovedBrokers().contains(1));
+
+    // Stopping the cleanup cancels the in-flight reassignment and removes the throttles.
+    executor.userTriggeredStopExecution(false);
+    waitForExecutionToFinish(executor);
+    assertEquals(List.of(0, 1), currentReplicas(0));
+    assertFalse(_adminClient.listPartitionReassignments().reassignments().get().containsKey(TP0));
+    assertFalse(hasThrottles());
+    assertNull(_store.state());
+    assertEquals("CLEANED_UP", recovery(executor).get("status"));
+    assertNull(executor.ongoingRecoveryDescription());
+  }
+
+  @Test
+  public void testCleanupTimeoutCancelsInFlightReassignment() throws Exception {
+    long throttle = 10_000L;
+    ExecutionProposal proposal = startThrottledReassignment(throttle);
+    _store.save(interruptedExecutionState(throttle, List.of(proposal)));
+    Properties overrides = new Properties();
+    overrides.setProperty(ExecutorConfig.INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG, "2000");
+    Executor executor = newExecutor(false, null, new RecordingNotifier(), mockAnomalyDetectorManager(null), overrides);
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitForExecutionToFinish(executor);
+    assertEquals(List.of(0, 1), currentReplicas(0));
+    assertFalse(hasThrottles());
+    assertNull(_store.state());
+  }
+
+  @Test
+  public void testCleanupOnlyStateIsNotResumed() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    _store.save(interruptedExecutionState(null, List.of(proposal)).toBuilder().cleanupOnly(true).build());
+    Executor executor = newExecutor(true, null, new RecordingNotifier(), mockAnomalyDetectorManager(null));
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitForExecutionToFinish(executor);
+    assertEquals(List.of(0, 1), currentReplicas(0));
+    assertNull(_store.state());
+    assertTrue(String.valueOf(recovery(executor).get("reasonNotResumed")).contains("already decided not to resume"));
   }
 }

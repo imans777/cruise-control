@@ -35,6 +35,7 @@ import com.linkedin.kafka.cruisecontrol.executor.concurrency.ExecutionConcurrenc
 import com.linkedin.kafka.cruisecontrol.executor.persistence.ExecutionStateStore;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedExecutionState;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedTask;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.ReplicaPlacementFingerprint;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
@@ -51,6 +52,7 @@ import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
@@ -66,8 +68,11 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AlterPartitionReassignmentsResult;
+import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.clients.admin.ElectLeadersResult;
+import org.apache.kafka.clients.admin.LogDirDescription;
+import org.apache.kafka.clients.admin.NewPartitionReassignment;
 import org.apache.kafka.clients.admin.PartitionReassignment;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaFuture;
@@ -118,6 +123,11 @@ public class Executor {
 
   private static final int NO_STOP_EXECUTION = 0;
   private static final int STOP_EXECUTION = 1;
+  // The number of attempts to read back a config change while cleaning up an interrupted execution -- a few, so that the cleanup
+  // ends in minutes even if a config keeps being changed by someone else.
+  private static final int INTERRUPTED_EXECUTION_CONFIG_CHANGE_RETRIES = 5;
+  private static final long MAX_INTERRUPTED_EXECUTION_CLEANUP_RETRY_BACKOFF_MS = TimeUnit.MINUTES.toMillis(1);
+  private static final int MAX_INTERRUPTED_EXECUTION_CANCELLATIONS = 5;
 
   // Some state for external service to query
   private final AtomicInteger _stopSignal;
@@ -171,6 +181,13 @@ public class Executor {
   private final ExecutionStateStore _executionStateStore;
   private final Object _executionStateStoreLock;
   private final boolean _resumeInterruptedExecutionOnStartup;
+  private final long _resumeInterruptedExecutionMaxAgeMs;
+  private final int _resumeInterruptedExecutionMaxCount;
+  private final long _interruptedExecutionCleanupTimeoutMs;
+  // The recovery of the latest execution interrupted by a restart -- reported in the executor state until the next execution starts.
+  private volatile InterruptedExecutionRecovery _interruptedExecutionRecovery;
+  // The latest cluster metadata retrieved by the ongoing execution -- to fingerprint the replicas outside the execution.
+  private volatile Cluster _latestClusterOfExecution;
   // Set upon shutdown to retain the persisted state of an execution interrupted by the shutdown -- i.e. to recover it upon restart.
   private volatile boolean _shutdownRequested;
   // The parameters of the ongoing execution to persist, or null if the state of the ongoing execution is not persisted.
@@ -315,6 +332,11 @@ public class Executor {
                                                                                       ExecutionStateStore.class);
     _executionStateStoreLock = new Object();
     _resumeInterruptedExecutionOnStartup = config.getBoolean(ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG);
+    _resumeInterruptedExecutionMaxAgeMs = config.getLong(ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG);
+    _resumeInterruptedExecutionMaxCount = config.getInt(ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG);
+    _interruptedExecutionCleanupTimeoutMs = config.getLong(ExecutorConfig.INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG);
+    _interruptedExecutionRecovery = null;
+    _latestClusterOfExecution = null;
     _shutdownRequested = false;
     _executionStateToPersist = null;
     _recoveryPlanToResume = null;
@@ -798,7 +820,8 @@ public class Executor {
    * @return The current executor state.
    */
   public ExecutorState state() {
-    return _executorState;
+    InterruptedExecutionRecovery recovery = _interruptedExecutionRecovery;
+    return recovery == null ? _executorState : _executorState.withRecovery(recovery.getJsonStructure());
   }
 
   /**
@@ -964,7 +987,9 @@ public class Executor {
                                                                recentlyRemovedBrokers(), isTriggeredByUserRequest);
     _executionTaskManager.setExecutionModeForTaskTracker(_isKafkaAssignerMode);
     // Get a snapshot of (1) cluster and (2) minIsr with time by topic name.
-    StrategyOptions strategyOptions = new StrategyOptions.Builder(_metadataClient.cluster())
+    Cluster cluster = _metadataClient.cluster();
+    _latestClusterOfExecution = cluster;
+    StrategyOptions strategyOptions = new StrategyOptions.Builder(cluster)
         .minIsrWithTimeByTopic(_topicMinIsrCache.minIsrWithTimeByTopic()).build();
     _executionTaskManager.addExecutionProposals(proposals, brokersToSkipConcurrencyCheck, strategyOptions, replicaMovementStrategy);
     if (_recoveryPlanToResume != null) {
@@ -1162,6 +1187,11 @@ public class Executor {
     ProposalExecutionRunnable proposalExecutionRunnable = new ProposalExecutionRunnable(loadMonitor, demotedBrokers, removedBrokers,
                                                                                         replicationThrottle, isTriggeredByUserRequest,
                                                                                         _recoveryPlanToResume != null);
+    if (_recoveryPlanToResume == null) {
+      // A new execution -- the recovery of an earlier interrupted execution is no longer reported.
+      _interruptedExecutionRecovery = null;
+    }
+    maybeFingerprintLogDirsOfExecution();
     // Persist the initial state of the execution before starting it.
     synchronized (_executionStateStoreLock) {
       _lastPersistedTaskStateVersion = -1L;
@@ -1198,12 +1228,16 @@ public class Executor {
         proposals.putIfAbsent(task.proposal().topicPartition(), task.proposal());
         persistedTasks.add(PersistedTask.of(task));
       }
-      PersistedExecutionState state = executionStateToPersist.toBuilder()
-                                                             .executorState(executorState)
-                                                             .lastUpdateTimeMs(System.currentTimeMillis())
-                                                             .proposals(proposals.values())
-                                                             .tasks(persistedTasks)
-                                                             .build();
+      PersistedExecutionState.Builder stateBuilder = executionStateToPersist.toBuilder()
+                                                                            .executorState(executorState)
+                                                                            .lastUpdateTimeMs(System.currentTimeMillis())
+                                                                            .proposals(proposals.values())
+                                                                            .tasks(persistedTasks);
+      Cluster cluster = _latestClusterOfExecution;
+      if (cluster != null) {
+        stateBuilder.outsideExecutionFingerprint(ReplicaPlacementFingerprint.of(cluster, proposals.keySet()));
+      }
+      PersistedExecutionState state = stateBuilder.build();
       try {
         _executionStateStore.save(state);
         _lastPersistedTaskStateVersion = taskStateVersion;
@@ -1217,6 +1251,36 @@ public class Executor {
         }
       }
     }
+  }
+
+  /**
+   * If the execution that is about to start moves replicas between logdirs, record the logdirs of the other replicas of its brokers,
+   * so that upon recovery, Cruise Control can tell whether replicas were moved between those logdirs while it was not running.
+   * Failing to retrieve the logdirs only prevents resuming the execution after a restart.
+   */
+  private void maybeFingerprintLogDirsOfExecution() {
+    PersistedExecutionState executionStateToPersist = _executionStateToPersist;
+    if (executionStateToPersist == null) {
+      return;
+    }
+    Set<Integer> brokers = new TreeSet<>();
+    Set<TopicPartition> partitionsOfExecution = new HashSet<>();
+    for (ExecutionTask task : _executionTaskManager.allTasks()) {
+      partitionsOfExecution.add(task.proposal().topicPartition());
+      if (task.type() == INTRA_BROKER_REPLICA_ACTION) {
+        brokers.add(task.brokerId());
+      }
+    }
+    Map<Integer, Long> logDirFingerprintByBroker = null;
+    if (!brokers.isEmpty()) {
+      try {
+        logDirFingerprintByBroker = ExecutionRecoveryUtils.logDirFingerprintByBroker(describeLogDirs(brokers), brokers, partitionsOfExecution);
+      } catch (InterruptedException | ExecutionException | TimeoutException e) {
+        LOG.warn("User task {}: Failed to retrieve the logdirs of brokers {} -- the execution cannot be resumed after a restart.", _uuid,
+                 brokers, e);
+      }
+    }
+    _executionStateToPersist = executionStateToPersist.toBuilder().logDirFingerprintByBroker(logDirFingerprintByBroker).build();
   }
 
   /**
@@ -1236,6 +1300,8 @@ public class Executor {
         _executionStateStore.delete();
       } catch (IOException | RuntimeException e) {
         LOG.warn("Failed to delete the persisted state of execution {}.", uuid, e);
+        _executorNotifier.sendAlert(String.format("Task [%s] failed to delete its persisted execution state, so the next restart of "
+                                                  + "Cruise Control will recover it as an interrupted execution: %s", uuid, e.getMessage()));
       }
     }
   }
@@ -1423,6 +1489,24 @@ public class Executor {
   }
 
   /**
+   * @return A description of the ongoing execution if it is the recovery of an execution interrupted by a Cruise Control restart
+   * (i.e. its cleanup or its resumption), {@code null} otherwise.
+   */
+  public String ongoingRecoveryDescription() {
+    InterruptedExecutionRecovery recovery = _interruptedExecutionRecovery;
+    if (!_hasOngoingExecution || recovery == null) {
+      return null;
+    }
+    if (_executorState.state() == ExecutorState.State.RECOVERING_INTERRUPTED_EXECUTION) {
+      return String.format("Cruise Control is cleaning up the execution %s that was interrupted by a restart", recovery.uuid());
+    }
+    if (recovery.status() == InterruptedExecutionRecovery.Status.RESUMED && recovery.uuid().equals(_uuid)) {
+      return String.format("the ongoing execution %s is resumed after a Cruise Control restart", recovery.uuid());
+    }
+    return null;
+  }
+
+  /**
    * Whether there is an ongoing operation triggered by current Cruise Control deployment.
    *
    * @return {@code true} if there is an ongoing execution.
@@ -1480,12 +1564,17 @@ public class Executor {
    *   <li>The persisted state is reconciled with the current state of the cluster (see
    *   {@link ExecutionRecoveryUtils#reconcile}) -- e.g. a task that was in progress before the restart is checked for
    *   whether it is still being executed by Kafka, has completed, or has not started.</li>
-   *   <li>If {@link ExecutorConfig#RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG} is enabled and the execution can be
-   *   resumed, the remaining tasks are resumed with the original parameters of the execution. Tasks that are still being
-   *   executed by Kafka are adopted -- i.e. monitored until completion without being submitted again.</li>
-   *   <li>Otherwise, the executor waits for the in-flight reassignments of the interrupted execution to finish and removes
-   *   the replication throttles that the interrupted execution left behind.</li>
+   *   <li>If {@link ExecutorConfig#RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG} is enabled, the execution is resumed with its
+   *   original parameters -- unless it is older than {@link ExecutorConfig#RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG}, was
+   *   resumed {@link ExecutorConfig#RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG} times already, or the cluster has changed
+   *   since it was interrupted in any way the execution itself cannot explain (see {@link #divergences}). Tasks that are still
+   *   being executed by Kafka are adopted -- i.e. monitored until completion without being submitted again.</li>
+   *   <li>Otherwise, the interrupted execution is cleaned up (see {@link InterruptedExecutionCleanupRunnable}): the executor
+   *   reports {@link ExecutorState.State#RECOVERING_INTERRUPTED_EXECUTION} while it waits (for at most
+   *   {@link ExecutorConfig#INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG}) for the in-flight reassignments of the interrupted
+   *   execution to finish, and removes the replication throttles that the interrupted execution left behind.</li>
    * </ul>
+   * Either way, the executor state reports what happened (see {@link ExecutorState#recovery()}) until the next execution starts.
    *
    * @param loadMonitor Load monitor.
    */
@@ -1510,24 +1599,23 @@ public class Executor {
       return;
     }
     LOG.info("Recovering the interrupted execution {}.", state);
+    InterruptedExecutionRecovery recovery = new InterruptedExecutionRecovery(state);
+    _interruptedExecutionRecovery = recovery;
 
     ExecutionRecoveryUtils.RecoveryPlan recoveryPlan;
+    Cluster cluster = null;
+    Map<TopicPartition, PartitionReassignment> ongoingReassignments = null;
     try {
-      recoveryPlan = ExecutionRecoveryUtils.reconcile(state, _metadataClient.cluster(), ExecutionUtils.ongoingPartitionReassignments(_adminClient),
-                                                      logDirInfoForIntraBrokerReplicaTasks(state));
+      cluster = _metadataClient.cluster();
+      ongoingReassignments = ExecutionUtils.ongoingPartitionReassignments(_adminClient);
+      recoveryPlan = ExecutionRecoveryUtils.reconcile(state, cluster, ongoingReassignments, logDirInfoForIntraBrokerReplicaTasks(state));
+      recovery.setTasksByAction(recoveryPlan.numTasksByAction());
     } catch (Exception e) {
       LOG.error("Failed to reconcile the interrupted execution {} with the cluster state.", state.uuid(), e);
       recoveryPlan = null;
     }
 
-    String reasonToNotResume;
-    if (recoveryPlan == null) {
-      reasonToNotResume = "failed to reconcile the interrupted execution with the cluster state";
-    } else if (!_resumeInterruptedExecutionOnStartup) {
-      reasonToNotResume = ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG + " is disabled";
-    } else {
-      reasonToNotResume = recoveryPlan.reasonToNotResume();
-    }
+    String reasonToNotResume = reasonToNotResume(state, recoveryPlan, cluster, ongoingReassignments, recovery);
     String summary = String.format("Task [%s] execution (reason: %s) was interrupted by a Cruise Control restart (started: %s, last "
                                    + "updated: %s, executor state: %s). Recovered task states: %s.", state.uuid(), state.reason(),
                                    utcDateFor(state.startTimeMs()), utcDateFor(state.lastUpdateTimeMs()), state.executorState(),
@@ -1535,6 +1623,7 @@ public class Executor {
     if (reasonToNotResume == null) {
       try {
         resumeInterruptedExecution(recoveryPlan, loadMonitor);
+        recovery.setStatus(InterruptedExecutionRecovery.Status.RESUMED);
         String message = summary + " Resuming the execution.";
         OPERATION_LOG.info(message);
         _executorNotifier.sendNotification(message);
@@ -1545,14 +1634,159 @@ public class Executor {
         reasonToNotResume = "failed to resume the execution: " + e.getMessage();
       }
     }
+    recovery.setReasonNotResumed(reasonToNotResume);
     String message = String.format("%s Not resuming the execution because %s. Removing the leftover replication throttles of the "
                                    + "interrupted execution after its in-flight partition reassignments (if any) finish.",
                                    summary, reasonToNotResume);
-    OPERATION_LOG.warn(message);
-    _executorNotifier.sendAlert(message);
-    List<ExecutionProposal> interBrokerReplicaProposals = interBrokerReplicaProposals(state, null);
-    _proposalExecutor.execute(new InterruptedExecutionCleanupRunnable(state.uuid(), state.replicationThrottle(),
-                                                                      interBrokerReplicaProposals, Collections.emptyList(), true));
+    if (recoveryPlan != null && recoveryPlan.isFinished()) {
+      // E.g. the execution finished, but its state could not be deleted -- nothing to alert about.
+      OPERATION_LOG.info(message);
+      _executorNotifier.sendNotification(message);
+    } else {
+      OPERATION_LOG.warn(message);
+      _executorNotifier.sendAlert(message);
+    }
+    startInterruptedExecutionCleanup(state, recovery);
+  }
+
+  /**
+   * @param state Persisted state of the interrupted execution.
+   * @param recoveryPlan The recovery plan of the interrupted execution, or {@code null} if reconciling it failed.
+   * @param cluster The cluster metadata used to reconcile the interrupted execution.
+   * @param ongoingReassignments The ongoing partition reassignments used to reconcile the interrupted execution.
+   * @param recovery The recovery of the interrupted execution to report the divergences (if any) in.
+   * @return The reason to not resume the interrupted execution, or {@code null} if it can be resumed.
+   */
+  private String reasonToNotResume(PersistedExecutionState state,
+                                   ExecutionRecoveryUtils.RecoveryPlan recoveryPlan,
+                                   Cluster cluster,
+                                   Map<TopicPartition, PartitionReassignment> ongoingReassignments,
+                                   InterruptedExecutionRecovery recovery) {
+    if (recoveryPlan == null) {
+      return "failed to reconcile the interrupted execution with the cluster state";
+    }
+    if (!_resumeInterruptedExecutionOnStartup) {
+      return ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG + " is disabled";
+    }
+    if (state.cleanupOnly()) {
+      return "an earlier start of Cruise Control already decided not to resume it";
+    }
+    if (state.outsideExecutionFingerprint() == null) {
+      return "its state does not tell whether the cluster has changed since -- e.g. it was persisted by an older version";
+    }
+    long ageMs = System.currentTimeMillis() - state.lastUpdateTimeMs();
+    if (ageMs > _resumeInterruptedExecutionMaxAgeMs) {
+      return String.format("it last made progress %d seconds ago, more than %s (%d ms)", TimeUnit.MILLISECONDS.toSeconds(ageMs),
+                           ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG, _resumeInterruptedExecutionMaxAgeMs);
+    }
+    if (state.resumeCount() >= _resumeInterruptedExecutionMaxCount) {
+      return String.format("it has already been resumed %d times (%s)", state.resumeCount(),
+                           ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG);
+    }
+    String reason = recoveryPlan.reasonToNotResume();
+    if (reason != null) {
+      return reason;
+    }
+    List<String> divergences;
+    try {
+      divergences = divergences(state, recoveryPlan, cluster, ongoingReassignments);
+    } catch (Exception e) {
+      LOG.error("Failed to check whether the cluster has changed since the execution {} was interrupted.", state.uuid(), e);
+      return "failed to check whether the cluster has changed since the execution was interrupted: " + e.getMessage();
+    }
+    if (!divergences.isEmpty()) {
+      recovery.setDivergences(divergences);
+      return String.format("the cluster has changed since the execution was interrupted (%d difference(s), e.g. %s)",
+                           divergences.size(), divergences.get(0));
+    }
+    return null;
+  }
+
+  /**
+   * Find the differences between the cluster as the interrupted execution left it and the cluster now, which the execution itself
+   * cannot explain -- i.e. changes made by someone else while Cruise Control was not running. Resuming an execution planned for a
+   * different cluster could e.g. move replicas to a broker that has been filled up since, so any difference prevents the resume:
+   * <ul>
+   *   <li>a partition of the execution is not where the execution left it -- see {@link ExecutionRecoveryUtils#taskDivergences};</li>
+   *   <li>a broker that the execution moves replicas to is not alive;</li>
+   *   <li>a replica outside the execution was moved to another broker, or partitions were created or deleted -- see
+   *   {@link ReplicaPlacementFingerprint};</li>
+   *   <li>a replica is being moved between logdirs by someone else, or (if the execution moves replicas between logdirs) a
+   *   replica outside the execution was moved between the logdirs of a broker of the execution;</li>
+   *   <li>a throttled rate of a broker of the execution is not what the execution left behind;</li>
+   *   <li>a destination of the pending movements does not have enough usable space for them.</li>
+   * </ul>
+   *
+   * @param state Persisted state of the interrupted execution.
+   * @param recoveryPlan The recovery plan of the interrupted execution.
+   * @param cluster Current cluster metadata.
+   * @param ongoingReassignments Ongoing partition reassignments in the cluster.
+   * @return Human-readable differences, or an empty list if the cluster is as the interrupted execution left it.
+   */
+  private List<String> divergences(PersistedExecutionState state,
+                                   ExecutionRecoveryUtils.RecoveryPlan recoveryPlan,
+                                   Cluster cluster,
+                                   Map<TopicPartition, PartitionReassignment> ongoingReassignments)
+      throws InterruptedException, ExecutionException, TimeoutException {
+    List<String> divergences = new ArrayList<>(ExecutionRecoveryUtils.taskDivergences(state, cluster, ongoingReassignments,
+                                                                                      logDirInfoForIntraBrokerReplicaTasks(state)));
+    divergences.addAll(ExecutionRecoveryUtils.deadDestinationBrokers(state, cluster));
+    Set<TopicPartition> partitionsOfExecution = state.proposals().keySet();
+    divergences.addAll(state.outsideExecutionFingerprint().differencesTo(ReplicaPlacementFingerprint.of(cluster, partitionsOfExecution)));
+
+    Set<Integer> aliveBrokers = cluster.nodes().stream().map(Node::id).collect(Collectors.toSet());
+    Map<Integer, Map<String, LogDirDescription>> logDirsByBroker = describeLogDirs(aliveBrokers);
+    Set<TopicPartitionReplica> intraBrokerReplicas = new HashSet<>();
+    for (PersistedTask task : state.tasks()) {
+      if (task.type() == INTRA_BROKER_REPLICA_ACTION) {
+        intraBrokerReplicas.add(new TopicPartitionReplica(task.topicPartition().topic(), task.topicPartition().partition(), task.brokerId()));
+      }
+    }
+    divergences.addAll(ExecutionRecoveryUtils.foreignIntraBrokerReplicaMovements(logDirsByBroker, intraBrokerReplicas));
+    if (!intraBrokerReplicas.isEmpty()) {
+      Map<Integer, Long> persistedLogDirFingerprints = state.logDirFingerprintByBroker();
+      if (persistedLogDirFingerprints == null) {
+        divergences.add("the logdirs of the replicas outside the execution were unknown when the execution started");
+      } else {
+        divergences.addAll(ExecutionRecoveryUtils.logDirFingerprintDivergences(
+            persistedLogDirFingerprints,
+            ExecutionRecoveryUtils.logDirFingerprintByBroker(logDirsByBroker, persistedLogDirFingerprints.keySet(), partitionsOfExecution)));
+      }
+    }
+    if (state.replicationThrottle() != null) {
+      Set<Integer> brokers = new TreeSet<>();
+      recoveryPlan.actionByTask().forEach((task, action) -> {
+        if (task.type() == INTER_BROKER_REPLICA_ACTION
+            && (action == ExecutionRecoveryUtils.RecoveryAction.PENDING || action == ExecutionRecoveryUtils.RecoveryAction.ADOPT)) {
+          brokers.addAll(ExecutionRecoveryUtils.participatingBrokers(state.proposals().get(task.topicPartition())));
+        }
+      });
+      brokers.retainAll(aliveBrokers);
+      divergences.addAll(ExecutionRecoveryUtils.throttleDivergences(state, recoveryPlan, describeBrokerConfigs(brokers)));
+    }
+    divergences.addAll(ExecutionRecoveryUtils.freeSpaceShortfalls(state, recoveryPlan, logDirsByBroker));
+    return divergences;
+  }
+
+  private Map<Integer, Map<String, LogDirDescription>> describeLogDirs(Set<Integer> brokers)
+      throws InterruptedException, ExecutionException, TimeoutException {
+    if (brokers.isEmpty()) {
+      return Collections.emptyMap();
+    }
+    return _adminClient.describeLogDirs(brokers).allDescriptions()
+                       .get(_config.getLong(ExecutorConfig.LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS);
+  }
+
+  private Map<Integer, Config> describeBrokerConfigs(Set<Integer> brokers) throws InterruptedException, ExecutionException, TimeoutException {
+    Map<Integer, Config> configByBroker = new HashMap<>();
+    if (brokers.isEmpty()) {
+      return configByBroker;
+    }
+    List<ConfigResource> resources = brokers.stream().map(b -> new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(b)))
+                                            .collect(Collectors.toList());
+    _adminClient.describeConfigs(resources).all().get(ReplicationThrottleHelper.CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .forEach((resource, config) -> configByBroker.put(Integer.parseInt(resource.name()), config));
+    return configByBroker;
   }
 
   /**
@@ -1571,9 +1805,9 @@ public class Executor {
     List<ExecutionProposal> finishedProposals = interBrokerReplicaProposals(state, partitionsToResume);
     List<ExecutionProposal> adoptedProposals = recoveryPlan.adoptedInterBrokerPartitions().stream().map(tp -> state.proposals().get(tp))
                                                            .collect(Collectors.toList());
-    if (!finishedProposals.isEmpty()) {
-      _proposalExecutor.execute(new InterruptedExecutionCleanupRunnable(state.uuid(), state.replicationThrottle(), finishedProposals,
-                                                                        adoptedProposals, false));
+    if (state.replicationThrottle() != null && !finishedProposals.isEmpty()) {
+      _proposalExecutor.execute(new FinishedMovementThrottleCleanupRunnable(state.uuid(), state.replicationThrottle(), finishedProposals,
+                                                                           adoptedProposals));
     }
 
     setGeneratingProposalsForExecution(state.uuid(), () -> ExecutionRecoveryUtils.resumedReason(state.reason()), false);
@@ -1612,6 +1846,67 @@ public class Executor {
     } finally {
       _recoveryPlanToResume = null;
     }
+  }
+
+  /**
+   * Start cleaning up the given interrupted execution, which is not resumed. The cleanup is reported as an ongoing execution in
+   * {@link ExecutorState.State#RECOVERING_INTERRUPTED_EXECUTION} state: a new execution (or self-healing) cannot start before the
+   * cleanup finishes or is stopped -- stopping it cancels the in-flight reassignments of the interrupted execution right away.
+   *
+   * @param state Persisted state of the interrupted execution.
+   * @param recovery The recovery of the interrupted execution.
+   */
+  private void startInterruptedExecutionCleanup(PersistedExecutionState state, InterruptedExecutionRecovery recovery) {
+    // The brokers that the interrupted execution was demoting or removing were not done yet, so new executions must not move
+    // leaderships or replicas back to them.
+    long now = _time.milliseconds();
+    if (state.demotedBrokers() != null) {
+      state.demotedBrokers().forEach(id -> _latestDemoteStartTimeMsByBrokerId.merge(id, now, Executor::keepPermanentTimestamp));
+    }
+    if (state.removedBrokers() != null) {
+      state.removedBrokers().forEach(id -> _latestRemoveStartTimeMsByBrokerId.merge(id, now, Executor::keepPermanentTimestamp));
+    }
+    // Later restarts must not resume an execution that this restart decided not to resume.
+    if (!state.cleanupOnly()) {
+      synchronized (_executionStateStoreLock) {
+        try {
+          _executionStateStore.save(state.toBuilder().cleanupOnly(true).build());
+        } catch (IOException | RuntimeException e) {
+          LOG.warn("Interrupted execution {}: Failed to persist that it is only to be cleaned up.", state.uuid(), e);
+        }
+      }
+    }
+    try {
+      _flipOngoingExecutionMutex.acquire();
+      try {
+        _hasOngoingExecution = true;
+        _stopSignal.set(NO_STOP_EXECUTION);
+        _executionStoppedByUser.set(false);
+        // Block Executor from shutting down until the cleanup stopped.
+        _noOngoingExecutionSemaphore.acquire();
+      } catch (InterruptedException ie) {
+        _hasOngoingExecution = false;
+        throw ie;
+      } finally {
+        _flipOngoingExecutionMutex.release();
+      }
+    } catch (InterruptedException ie) {
+      LOG.warn("Interrupted execution {}: Interrupted before the cleanup started -- it is retried upon the next restart.", state.uuid());
+      recovery.setStatus(InterruptedExecutionRecovery.Status.RETAINED_FOR_RESTART);
+      Thread.currentThread().interrupt();
+      return;
+    }
+    _uuid = state.uuid();
+    String reason = ExecutionRecoveryUtils.cleanupReason(state.reason());
+    _reasonSupplier = () -> reason;
+    _executorState = ExecutorState.recoveringInterruptedExecution(_uuid, reason, recentlyDemotedBrokers(), recentlyRemovedBrokers(),
+                                                                  state.triggeredByUserRequest());
+    recovery.setStatus(InterruptedExecutionRecovery.Status.WAITING_FOR_IN_FLIGHT_MOVEMENTS);
+    _proposalExecutor.execute(new InterruptedExecutionCleanupRunnable(state, recovery));
+  }
+
+  private static Long keepPermanentTimestamp(Long existingTimestamp, Long newTimestamp) {
+    return existingTimestamp == ExecutionUtils.PERMANENT_TIMESTAMP ? existingTimestamp : newTimestamp;
   }
 
   /**
@@ -1658,94 +1953,220 @@ public class Executor {
   }
 
   /**
-   * Removes the replication throttles left behind by an execution that was interrupted by a Cruise Control restart.
-   * Runs in the proposal executor thread, so no other execution can start setting its throttles until this cleanup is over.
+   * @param brokers Brokers of the movements of an interrupted execution.
+   * @return The given brokers that are not alive.
    */
-  private class InterruptedExecutionCleanupRunnable implements Runnable {
+  private Set<Integer> deadBrokers(Set<Integer> brokers) {
+    Set<Integer> deadBrokers = new HashSet<>(brokers);
+    deadBrokers.removeAll(_metadataClient.cluster().nodes().stream().map(Node::id).collect(Collectors.toSet()));
+    return deadBrokers;
+  }
+
+  private static Set<Integer> participatingBrokers(List<ExecutionProposal> proposals) {
+    Set<Integer> brokers = new HashSet<>();
+    proposals.forEach(p -> brokers.addAll(ExecutionRecoveryUtils.participatingBrokers(p)));
+    return brokers;
+  }
+
+  /**
+   * Removes the replication throttles that a resumed execution no longer needs -- i.e. of the movements of the interrupted execution
+   * that finished (or were dropped) before the restart. Runs in the proposal executor thread before the resumed execution starts.
+   */
+  private class FinishedMovementThrottleCleanupRunnable implements Runnable {
     private final String _interruptedExecutionUuid;
     private final Long _replicationThrottle;
-    private final List<ExecutionProposal> _proposalsToClear;
-    private final List<ExecutionProposal> _inProgressProposals;
-    private final boolean _waitForInFlightAndDeleteState;
+    private final List<ExecutionProposal> _finishedProposals;
+    private final List<ExecutionProposal> _adoptedProposals;
 
-    /**
-     * @param interruptedExecutionUuid UUID of the interrupted execution.
-     * @param replicationThrottle Replication throttle of the interrupted execution, or {@code null} if it was not throttled.
-     * @param proposalsToClear Inter-broker replica proposals whose throttles are to be removed.
-     * @param inProgressProposals Inter-broker replica proposals that are still in progress (i.e. retain throttled rates of
-     *                            their brokers).
-     * @param waitForInFlightAndDeleteState {@code true} to wait for the ongoing reassignments of the proposals to clear
-     *                                      before removing their throttles, and to delete the persisted execution state after
-     *                                      the cleanup, {@code false} to remove the throttles right away.
-     */
-    InterruptedExecutionCleanupRunnable(String interruptedExecutionUuid,
-                                        Long replicationThrottle,
-                                        List<ExecutionProposal> proposalsToClear,
-                                        List<ExecutionProposal> inProgressProposals,
-                                        boolean waitForInFlightAndDeleteState) {
+    FinishedMovementThrottleCleanupRunnable(String interruptedExecutionUuid,
+                                            Long replicationThrottle,
+                                            List<ExecutionProposal> finishedProposals,
+                                            List<ExecutionProposal> adoptedProposals) {
       _interruptedExecutionUuid = interruptedExecutionUuid;
       _replicationThrottle = replicationThrottle;
-      _proposalsToClear = proposalsToClear;
-      _inProgressProposals = inProgressProposals;
-      _waitForInFlightAndDeleteState = waitForInFlightAndDeleteState;
+      _finishedProposals = finishedProposals;
+      _adoptedProposals = adoptedProposals;
     }
 
     @Override
     public void run() {
       try {
-        if (_waitForInFlightAndDeleteState && !waitForInFlightPartitionReassignments()) {
-          LOG.info("Interrupted execution {}: Retaining the persisted execution state to recover it upon restart.",
-                   _interruptedExecutionUuid);
+        LOG.info("Interrupted execution {}: Removing leftover replication throttles of {} finished partition movement(s).",
+                 _interruptedExecutionUuid, _finishedProposals.size());
+        ReplicationThrottleHelper.forInterruptedExecution(_adminClient, _replicationThrottle, deadBrokers(participatingBrokers(_finishedProposals)),
+                                                          INTERRUPTED_EXECUTION_CONFIG_CHANGE_RETRIES)
+                                 .clearThrottlesForProposals(_finishedProposals, _adoptedProposals);
+      } catch (InterruptedException e) {
+        LOG.warn("Interrupted execution {}: Interrupted while removing leftover replication throttles.", _interruptedExecutionUuid);
+        Thread.currentThread().interrupt();
+      } catch (Exception e) {
+        LOG.error("Interrupted execution {}: Failed to remove leftover replication throttles.", _interruptedExecutionUuid, e);
+        _executorNotifier.sendAlert(String.format("Task [%s] resumed execution failed to remove the leftover replication throttles of "
+                                                  + "its finished partition movements: %s", _interruptedExecutionUuid, e.getMessage()));
+      }
+    }
+  }
+
+  /**
+   * Cleans up an execution that was interrupted by a Cruise Control restart and is not resumed (see
+   * {@link #startInterruptedExecutionCleanup}): waits for the in-flight reassignments of the interrupted execution to finish,
+   * then removes the replication throttles that the interrupted execution left behind, and deletes its persisted state.
+   *
+   * <ul>
+   *   <li>The wait is bounded by {@link ExecutorConfig#INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG}; a stop request (e.g.
+   *   {@code stop_proposal_execution}, or a new request with {@code stop_ongoing_execution=true}) ends it right away. Either way,
+   *   the in-flight reassignments of the interrupted execution are cancelled before its throttles are removed.</li>
+   *   <li>If the Kafka cluster cannot be reached, the cleanup retries with a backoff until the timeout.</li>
+   *   <li>A throttled rate is removed only if it is still the throttle of the interrupted execution -- see
+   *   {@link ReplicationThrottleHelper#forInterruptedExecution}.</li>
+   *   <li>If Cruise Control shuts down, or the cleanup fails, the persisted state is kept, so that the cleanup is retried upon the
+   *   next restart.</li>
+   * </ul>
+   */
+  private class InterruptedExecutionCleanupRunnable implements Runnable {
+    private final PersistedExecutionState _state;
+    private final InterruptedExecutionRecovery _recovery;
+
+    InterruptedExecutionCleanupRunnable(PersistedExecutionState state, InterruptedExecutionRecovery recovery) {
+      _state = state;
+      _recovery = recovery;
+    }
+
+    @Override
+    public void run() {
+      String uuid = _state.uuid();
+      try {
+        List<ExecutionProposal> proposals = interBrokerReplicaProposals(_state, null);
+        if (!waitForOrCancelInFlightPartitionReassignments(proposals)) {
+          LOG.info("Interrupted execution {}: Retaining the persisted execution state to clean it up upon restart.", uuid);
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.RETAINED_FOR_RESTART);
           return;
         }
-        if (_replicationThrottle != null && !_proposalsToClear.isEmpty()) {
-          Set<Integer> aliveBrokers = _metadataClient.cluster().nodes().stream().map(Node::id).collect(Collectors.toSet());
-          Set<Integer> deadBrokers = new HashSet<>();
-          for (ExecutionProposal proposal : _proposalsToClear) {
-            proposal.oldReplicas().forEach(r -> deadBrokers.add(r.brokerId()));
-            proposal.newReplicas().forEach(r -> deadBrokers.add(r.brokerId()));
-          }
-          deadBrokers.removeAll(aliveBrokers);
-          LOG.info("Interrupted execution {}: Removing leftover replication throttles of {} partition(s).", _interruptedExecutionUuid,
-                   _proposalsToClear.size());
-          new ReplicationThrottleHelper(_adminClient, _replicationThrottle, deadBrokers)
-              .clearThrottlesForProposals(_proposalsToClear, _inProgressProposals);
+        if (_state.replicationThrottle() != null && !proposals.isEmpty()) {
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.REMOVING_THROTTLES);
+          LOG.info("Interrupted execution {}: Removing leftover replication throttles of {} partition(s).", uuid, proposals.size());
+          Set<Integer> deadBrokers = deadBrokers(participatingBrokers(proposals));
+          ReplicationThrottleHelper throttleHelper =
+              ReplicationThrottleHelper.forInterruptedExecution(_adminClient, _state.replicationThrottle(), deadBrokers,
+                                                                INTERRUPTED_EXECUTION_CONFIG_CHANGE_RETRIES);
+          throttleHelper.clearThrottlesForProposals(proposals, Collections.emptyList());
+          List<String> keptThrottles = new ArrayList<>(throttleHelper.keptRates());
+          // The throttled rates of a broker can only be removed while it is alive.
+          new TreeSet<>(deadBrokers).forEach(b -> keptThrottles.add(String.format("broker %d: not alive -- its throttled rates (if any) "
+                                                                                  + "were not removed", b)));
+          _recovery.setKeptThrottles(keptThrottles);
         }
-        if (_waitForInFlightAndDeleteState) {
-          deletePersistedExecutionState(_interruptedExecutionUuid);
-          String message = String.format("Task [%s] interrupted execution is cleaned up.", _interruptedExecutionUuid);
-          OPERATION_LOG.info(message);
+        deletePersistedExecutionState(uuid);
+        _recovery.setStatus(InterruptedExecutionRecovery.Status.CLEANED_UP);
+        List<String> keptThrottles = _recovery.keptThrottles();
+        String message = String.format("Task [%s] interrupted execution is cleaned up.%s", uuid, keptThrottles.isEmpty()
+            ? "" : " Throttled rates that were not removed: " + keptThrottles);
+        OPERATION_LOG.info(message);
+        if (keptThrottles.stream().anyMatch(t -> t.contains("not alive"))) {
+          _executorNotifier.sendAlert(message);
+        } else {
           _executorNotifier.sendNotification(message);
         }
       } catch (InterruptedException e) {
-        LOG.warn("Interrupted execution {}: Interrupted while cleaning up.", _interruptedExecutionUuid);
+        LOG.warn("Interrupted execution {}: Interrupted while cleaning up -- it is retried upon the next restart.", uuid);
+        _recovery.setStatus(InterruptedExecutionRecovery.Status.RETAINED_FOR_RESTART);
         Thread.currentThread().interrupt();
       } catch (Exception e) {
-        LOG.error("Interrupted execution {}: Failed to clean up.", _interruptedExecutionUuid, e);
+        LOG.error("Interrupted execution {}: Failed to clean up.", uuid, e);
+        _recovery.setFailed(e.getMessage());
         _executorNotifier.sendAlert(String.format("Task [%s] interrupted execution failed to remove its leftover replication throttles: "
-                                                  + "%s", _interruptedExecutionUuid, e.getMessage()));
+                                                  + "%s. It is retried upon the next restart.", uuid, e.getMessage()));
+      } finally {
+        finishInterruptedExecutionCleanup();
       }
     }
 
     /**
-     * @return {@code true} if there are no ongoing reassignments of the proposals to clear, {@code false} if the wait is
-     * cancelled due to shutdown.
+     * Wait for the in-flight reassignments of the given proposals to finish. If the cleanup is stopped by a request or times out,
+     * cancel them.
+     *
+     * @param proposals Inter-broker replica proposals of the interrupted execution.
+     * @return {@code true} if there are no in-flight reassignments of the given proposals anymore, {@code false} if the wait ended
+     * due to a shutdown.
      */
-    private boolean waitForInFlightPartitionReassignments() throws InterruptedException, ExecutionException, TimeoutException {
-      Set<TopicPartition> partitions = _proposalsToClear.stream().map(ExecutionProposal::topicPartition).collect(Collectors.toSet());
+    private boolean waitForOrCancelInFlightPartitionReassignments(List<ExecutionProposal> proposals) throws InterruptedException {
+      Set<TopicPartition> partitions = proposals.stream().map(ExecutionProposal::topicPartition).collect(Collectors.toSet());
+      long deadlineMs = System.currentTimeMillis() + _interruptedExecutionCleanupTimeoutMs;
+      _recovery.setCleanupDeadlineMs(deadlineMs);
+      long retryBackoffMs = executionProgressCheckIntervalMs();
+      int numCancellations = 0;
       while (true) {
-        Set<TopicPartition> inFlight = new HashSet<>(ExecutionUtils.partitionsBeingReassigned(_adminClient));
-        inFlight.retainAll(partitions);
-        if (inFlight.isEmpty()) {
-          return true;
-        }
         if (_shutdownRequested) {
           return false;
         }
-        LOG.info("Interrupted execution {}: Waiting for {} in-flight partition reassignment(s) to finish: {}",
-                 _interruptedExecutionUuid, inFlight.size(), inFlight);
+        Set<TopicPartition> inFlight;
+        try {
+          inFlight = new HashSet<>(ExecutionUtils.partitionsBeingReassigned(_adminClient));
+          retryBackoffMs = executionProgressCheckIntervalMs();
+        } catch (ExecutionException | TimeoutException e) {
+          if (System.currentTimeMillis() >= deadlineMs || _stopSignal.get() != NO_STOP_EXECUTION) {
+            throw new IllegalStateException("Failed to retrieve the ongoing partition reassignments of the interrupted execution.", e);
+          }
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.WAITING_FOR_KAFKA);
+          LOG.warn("Interrupted execution {}: Failed to retrieve the ongoing partition reassignments -- retrying in {} ms.", _state.uuid(),
+                   retryBackoffMs, e);
+          Thread.sleep(retryBackoffMs);
+          retryBackoffMs = Math.min(retryBackoffMs * 2, MAX_INTERRUPTED_EXECUTION_CLEANUP_RETRY_BACKOFF_MS);
+          continue;
+        }
+        inFlight.retainAll(partitions);
+        _recovery.setInFlightMovements(inFlight);
+        if (inFlight.isEmpty()) {
+          return true;
+        }
+        boolean stopRequested = _stopSignal.get() != NO_STOP_EXECUTION;
+        if (stopRequested || System.currentTimeMillis() >= deadlineMs) {
+          if (numCancellations++ >= MAX_INTERRUPTED_EXECUTION_CANCELLATIONS) {
+            throw new IllegalStateException(String.format("Failed to cancel the in-flight partition reassignments %s.", inFlight));
+          }
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.CANCELLING_IN_FLIGHT_MOVEMENTS);
+          LOG.warn("Interrupted execution {}: Cancelling {} in-flight partition reassignment(s) because {}: {}", _state.uuid(),
+                   inFlight.size(), stopRequested ? "the cleanup was stopped" : "the cleanup timed out", inFlight);
+          cancelPartitionReassignments(inFlight);
+        } else {
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.WAITING_FOR_IN_FLIGHT_MOVEMENTS);
+          LOG.info("Interrupted execution {}: Waiting for {} in-flight partition reassignment(s) to finish: {}", _state.uuid(),
+                   inFlight.size(), inFlight);
+        }
         Thread.sleep(executionProgressCheckIntervalMs());
       }
+    }
+
+    private void cancelPartitionReassignments(Set<TopicPartition> partitions) {
+      Map<TopicPartition, Optional<NewPartitionReassignment>> cancellations = new HashMap<>();
+      partitions.forEach(tp -> cancellations.put(tp, ExecutionUtils.cancelReassignmentValue()));
+      _adminClient.alterPartitionReassignments(cancellations).values().forEach((tp, future) -> {
+        try {
+          future.get(ReplicationThrottleHelper.CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        } catch (ExecutionException | TimeoutException e) {
+          // E.g. the reassignment finished in the meantime -- the next check tells.
+          LOG.warn("Interrupted execution {}: Failed to cancel the reassignment of {}.", _state.uuid(), tp, e);
+        }
+      });
+    }
+
+    /**
+     * Report that the cleanup is over -- the counterpart of marking it as an ongoing execution in
+     * {@link #startInterruptedExecutionCleanup}. It must not call a synchronized method of the executor: a shutdown holds the
+     * executor's lock while it waits for the cleanup to stop.
+     */
+    private void finishInterruptedExecutionCleanup() {
+      // Resets the stop request (if any) that the cleanup received -- the task manager has no tasks of the cleanup.
+      _executionTaskManager.clear();
+      _uuid = null;
+      _reasonSupplier = null;
+      _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());
+      _hasOngoingExecution = false;
+      _stopSignal.set(NO_STOP_EXECUTION);
+      _executionStoppedByUser.set(false);
+      _noOngoingExecutionSemaphore.release();
     }
   }
 
@@ -1872,6 +2293,7 @@ public class Executor {
           deletePersistedExecutionState(_uuid);
         }
         _executionStateToPersist = null;
+        _latestClusterOfExecution = null;
         // Clear completed execution.
         clearCompletedExecution();
       }
@@ -2305,7 +2727,9 @@ public class Executor {
       if (LOG.isDebugEnabled()) {
         LOG.debug("Tasks in execution: {}", inExecutionTasks());
       }
-      return _metadataClient.cluster();
+      Cluster cluster = _metadataClient.cluster();
+      _latestClusterOfExecution = cluster;
+      return cluster;
     }
 
     /**
