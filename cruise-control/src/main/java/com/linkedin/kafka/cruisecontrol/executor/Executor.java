@@ -2299,16 +2299,16 @@ public class Executor {
     /**
      * Get the replication throttle budget of brokers based on the inter-broker replica movements in progress and the current
      * write rate of partitions, which is used if the replica movement strategy contains
-     * ThrottleAwareRoundRobinBrokerReplicaMovementStrategy. While replication throttle adjustment is enabled, each broker side is
+     * ThrottleAwareReplicaMovementStrategy. While replication throttle adjustment is enabled, each broker side is
      * budgeted at its network headroom and each movement is charged the throttle that the adjuster gives it -- see
      * {@link ConcurrencyAdjuster#admissionInputs(Set, Map, Map, Map)}; otherwise, at the execution's replication throttle, with
      * {@link ExecutorConfig#REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG}.
      *
      * @return The replication throttle budget of brokers, or {@code null} if the execution has no replication throttle (and
-     * replication throttle adjustment is disabled) or does not pick brokers in a round-robin manner.
+     * replication throttle adjustment is disabled) or its replica movement strategy is not throttle-aware.
      */
     private ReplicationThrottleBudget replicationThrottleBudget() {
-      if (!_executionTaskManager.isRoundRobinBrokers()) {
+      if (!_executionTaskManager.isThrottleAware()) {
         return null;
       }
       Cluster cluster = _metadataClient.cluster();
