@@ -563,21 +563,21 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttleRate, ReplicationThrottleHelper.RETRIES,
                                                                              new HashSet<>(), appliedThrottles) {
       @Override
-      void changeBrokerConfigs(int brokerId, Collection<AlterConfigOp> ops)
+      void changeBrokerConfigs(int brokerId, Collection<AlterConfigOp> ops, Map<String, String> deletedValues)
           throws ExecutionException, InterruptedException, TimeoutException {
         if (failRemoval.get() && brokerId == brokerToFail) {
           throw new TimeoutException("Injected failure");
         }
-        super.changeBrokerConfigs(brokerId, ops);
+        super.changeBrokerConfigs(brokerId, ops, deletedValues);
       }
 
       @Override
-      void changeTopicConfigs(String topic, Collection<AlterConfigOp> ops)
+      void changeTopicConfigs(String topic, Collection<AlterConfigOp> ops, Map<String, String> deletedValues)
           throws ExecutionException, InterruptedException, TimeoutException {
         if (failRemoval.get() && topic.equals(TOPIC1)) {
           throw new TimeoutException("Injected failure");
         }
-        super.changeTopicConfigs(topic, ops);
+        super.changeTopicConfigs(topic, ops, deletedValues);
       }
     };
     // Throttles brokers 0, 1, 2 and topic0 replicas 0:0, 0:1, 0:2.
@@ -736,6 +736,16 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     expectedConfigs.put("name8", null);
     entries.add(mockConfigEntry("name8", "value8", ConfigEntry.ConfigSource.DYNAMIC_BROKER_CONFIG));
     assertFalse(ReplicationThrottleHelper.configsEqual(new Config(entries), expectedConfigs));
+    // In the case that a deleted config is reported with the default config source but still with the deleted value, the
+    // deletion is not applied yet; a different value from the default config source means that it is applied
+    Map<String, String> expectedDeletion = Collections.singletonMap("name9", null);
+    Config staleDefaultConfig = new Config(Collections.singletonList(mockConfigEntry("name9", "value9", ConfigEntry.ConfigSource.DEFAULT_CONFIG)));
+    assertFalse(ReplicationThrottleHelper.configsEqual(staleDefaultConfig, expectedDeletion, Collections.singletonMap("name9", "value9")));
+    assertTrue(ReplicationThrottleHelper.configsEqual(staleDefaultConfig, expectedDeletion, Collections.singletonMap("name9", "other-value")));
+    // ... which does not apply to a cluster-wide dynamic default with the deleted value
+    Config clusterDefaultConfig =
+        new Config(Collections.singletonList(mockConfigEntry("name9", "value9", ConfigEntry.ConfigSource.DYNAMIC_DEFAULT_BROKER_CONFIG)));
+    assertTrue(ReplicationThrottleHelper.configsEqual(clusterDefaultConfig, expectedDeletion, Collections.singletonMap("name9", "value9")));
   }
 
   private ExecutionTask prepareMockCompleteTask(ExecutionProposal proposal) {

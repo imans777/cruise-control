@@ -334,12 +334,17 @@ class ReplicationThrottleHelper {
 
   void changeTopicConfigs(String topic, Collection<AlterConfigOp> ops)
   throws ExecutionException, InterruptedException, TimeoutException {
+    changeTopicConfigs(topic, ops, Collections.emptyMap());
+  }
+
+  void changeTopicConfigs(String topic, Collection<AlterConfigOp> ops, Map<String, String> deletedValues)
+  throws ExecutionException, InterruptedException, TimeoutException {
     ConfigResource cf = new ConfigResource(ConfigResource.Type.TOPIC, topic);
     Map<ConfigResource, Collection<AlterConfigOp>> configs = Collections.singletonMap(cf, ops);
     try {
       _adminClient.incrementalAlterConfigs(configs).all()
           .get(CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-      waitForConfigs(cf, ops);
+      waitForConfigs(cf, ops, deletedValues);
     } catch (Exception e) {
       if (!topicExists(topic)) {
         LOG.debug("Failed to change configs for topic {} since it does not exist", topic);
@@ -351,11 +356,16 @@ class ReplicationThrottleHelper {
 
   void changeBrokerConfigs(int brokerId, Collection<AlterConfigOp> ops)
   throws ExecutionException, InterruptedException, TimeoutException {
+    changeBrokerConfigs(brokerId, ops, Collections.emptyMap());
+  }
+
+  void changeBrokerConfigs(int brokerId, Collection<AlterConfigOp> ops, Map<String, String> deletedValues)
+  throws ExecutionException, InterruptedException, TimeoutException {
     ConfigResource cf = new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(brokerId));
     Map<ConfigResource, Collection<AlterConfigOp>> configs = Collections.singletonMap(cf, ops);
     _adminClient.incrementalAlterConfigs(configs).all()
         .get(CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-    waitForConfigs(cf, ops);
+    waitForConfigs(cf, ops, deletedValues);
   }
 
   boolean topicExists(String topic) throws InterruptedException, TimeoutException, ExecutionException {
@@ -389,6 +399,7 @@ class ReplicationThrottleHelper {
       return;
     }
     List<AlterConfigOp> ops = new ArrayList<>();
+    Map<String, String> deletedValues = new HashMap<>();
 
     ConfigEntry currentLeaderThrottledReplicas = topicConfigs.get(LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG);
     if (currentLeaderThrottledReplicas != null) {
@@ -399,6 +410,7 @@ class ReplicationThrottleHelper {
         String newThrottledReplicas = removeReplicasFromConfig(currentLeaderThrottledReplicas.value(), replicas);
         if (newThrottledReplicas.isEmpty()) {
           ops.add(new AlterConfigOp(new ConfigEntry(LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG, null), AlterConfigOp.OpType.DELETE));
+          deletedValues.put(LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG, currentLeaderThrottledReplicas.value());
         } else {
           ops.add(new AlterConfigOp(new ConfigEntry(LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG, newThrottledReplicas), AlterConfigOp.OpType.SET));
         }
@@ -413,13 +425,14 @@ class ReplicationThrottleHelper {
         String newThrottledReplicas = removeReplicasFromConfig(currentFollowerThrottledReplicas.value(), replicas);
         if (newThrottledReplicas.isEmpty()) {
           ops.add(new AlterConfigOp(new ConfigEntry(FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG, null), AlterConfigOp.OpType.DELETE));
+          deletedValues.put(FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG, currentFollowerThrottledReplicas.value());
         } else {
           ops.add(new AlterConfigOp(new ConfigEntry(FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG, newThrottledReplicas), AlterConfigOp.OpType.SET));
         }
       }
     }
     if (!ops.isEmpty()) {
-      changeTopicConfigs(topic, ops);
+      changeTopicConfigs(topic, ops, deletedValues);
     }
   }
 
@@ -429,12 +442,14 @@ class ReplicationThrottleHelper {
     ConfigEntry currLeaderThrottle = brokerConfigs.get(LEADER_REPLICATION_THROTTLED_RATE_CONFIG);
     ConfigEntry currFollowerThrottle = brokerConfigs.get(FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG);
     List<AlterConfigOp> ops = new ArrayList<>();
+    Map<String, String> deletedValues = new HashMap<>();
     if (currLeaderThrottle != null) {
       if (LOWER_PRECEDENCE_CONFIG_SOURCES.contains(currLeaderThrottle.source())) {
         LOG.debug("Skipping removal for leader throttle rate not set on broker {}: {}", brokerId, currLeaderThrottle);
       } else {
         LOG.debug("Removing leader throttle rate: {} on broker {}", currLeaderThrottle, brokerId);
         ops.add(new AlterConfigOp(new ConfigEntry(LEADER_REPLICATION_THROTTLED_RATE_CONFIG, null), AlterConfigOp.OpType.DELETE));
+        deletedValues.put(LEADER_REPLICATION_THROTTLED_RATE_CONFIG, currLeaderThrottle.value());
       }
     }
     if (currFollowerThrottle != null) {
@@ -443,15 +458,27 @@ class ReplicationThrottleHelper {
       } else {
         LOG.debug("Removing follower throttle rate: {} on broker {}", currFollowerThrottle, brokerId);
         ops.add(new AlterConfigOp(new ConfigEntry(FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, null), AlterConfigOp.OpType.DELETE));
+        deletedValues.put(FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, currFollowerThrottle.value());
       }
     }
     if (!ops.isEmpty()) {
-      changeBrokerConfigs(brokerId, ops);
+      changeBrokerConfigs(brokerId, ops, deletedValues);
     }
   }
 
   // Retries until we can read the configs changes we just wrote
   void waitForConfigs(ConfigResource cf, Collection<AlterConfigOp> ops) {
+    waitForConfigs(cf, ops, Collections.emptyMap());
+  }
+
+  /**
+   * Wait until the given config changes are applied to the given entity.
+   *
+   * @param cf The entity whose configs are changed.
+   * @param ops The config changes.
+   * @param deletedValues The values of the configs that {@code ops} delete, as read before deleting them (if known).
+   */
+  private void waitForConfigs(ConfigResource cf, Collection<AlterConfigOp> ops, Map<String, String> deletedValues) {
     // Use HashMap::new instead of Collectors.toMap to allow inserting null values
     Map<String, String> expectedConfigs = ops.stream()
             .collect(HashMap::new, (m, o) -> m.put(o.configEntry().name(), o.configEntry().value()), HashMap::putAll);
@@ -459,7 +486,7 @@ class ReplicationThrottleHelper {
     boolean retryResponse = CruiseControlMetricsUtils.retry(() -> {
       try {
         Config configs = getEntityConfigs(cf);
-        if (configsEqual(configs, expectedConfigs)) {
+        if (configsEqual(configs, expectedConfigs, deletedValues)) {
           return false;
         }
         LOG.warn("Attempt {}/{}: configs {} are not applied to {} yet, current values: {}. If this persists, check whether "
@@ -483,6 +510,16 @@ class ReplicationThrottleHelper {
   }
 
   static boolean configsEqual(Config configs, Map<String, String> expectedValues) {
+    return configsEqual(configs, expectedValues, Collections.emptyMap());
+  }
+
+  /**
+   * @param configs The configs read from an entity.
+   * @param expectedValues The expected values of the configs, {@code null} for a deleted config.
+   * @param deletedValues The values of the deleted configs before they were deleted (if known).
+   * @return {@code true} if the given configs have the expected values, {@code false} otherwise.
+   */
+  static boolean configsEqual(Config configs, Map<String, String> expectedValues, Map<String, String> deletedValues) {
     for (Map.Entry<String, String> entry : expectedValues.entrySet()) {
       ConfigEntry configEntry = configs.get(entry.getKey());
       if (configEntry == null || configEntry.value() == null || configEntry.value().isEmpty()) {
@@ -490,6 +527,10 @@ class ReplicationThrottleHelper {
           return false;
         }
       } else if (LOWER_PRECEDENCE_CONFIG_SOURCES.contains(configEntry.source()) && entry.getValue() == null) {
+        if (configEntry.source() == ConfigEntry.ConfigSource.DEFAULT_CONFIG && configEntry.value().equals(deletedValues.get(entry.getKey()))) {
+          // A broker may report the Kafka default as the source of a deleted config before it stops reporting the deleted value.
+          return false;
+        }
         // Deleting a dynamic config does not remove a value from a lower precedence source, e.g. the cluster-wide default.
         LOG.debug("Found {} config: {}, skipping comparison", configEntry.source(), configEntry);
       } else if (!Objects.equals(entry.getValue(), configEntry.value())) {
