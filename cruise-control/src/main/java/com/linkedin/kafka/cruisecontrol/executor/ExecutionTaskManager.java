@@ -88,10 +88,11 @@ public class ExecutionTaskManager {
   }
 
   /**
-   * @return {@code true} if brokers are picked in a round-robin manner for inter-broker replica movements, {@code false} otherwise.
+   * @return {@code true} if inter-broker replica movements are started within the replication throttle budget of brokers,
+   * {@code false} otherwise.
    */
-  synchronized boolean isRoundRobinBrokers() {
-    return _executionTaskPlanner.isRoundRobinBrokers();
+  synchronized boolean isThrottleAware() {
+    return _executionTaskPlanner.isThrottleAware();
   }
 
   /**

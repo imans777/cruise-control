@@ -11,7 +11,7 @@ import com.linkedin.kafka.cruisecontrol.executor.concurrency.ExecutionConcurrenc
 import com.linkedin.kafka.cruisecontrol.executor.strategy.BaseReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
-import com.linkedin.kafka.cruisecontrol.executor.strategy.ThrottleAwareRoundRobinBrokerReplicaMovementStrategy;
+import com.linkedin.kafka.cruisecontrol.executor.strategy.ThrottleAwareReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -65,10 +65,8 @@ import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.Replic
  * The task is tracked both under source broker and destination broker's plan.
  * Once a task is fulfilled, the task will be removed from both source broker and destination broker's execution plan.
  * <p>
- * If the replica movement strategy contains {@link ThrottleAwareRoundRobinBrokerReplicaMovementStrategy}, brokers are picked in a
- * round-robin manner (i.e. brokers with fewer scheduled inter-broker replica movements first), and all brokers hosting a replica
- * of the partition before or after the movement are considered to be involved in the corresponding inter-broker replica movement.
- * Moreover, if the execution has a replication throttle, a movement is started only if the replication throttle of its source
+ * If the replica movement strategy contains {@link ThrottleAwareReplicaMovementStrategy} and the execution has a replication
+ * throttle, an inter-broker replica movement is started only if the replication throttle of its source
  * (i.e. the current leader of the partition) and destination brokers can carry the write rates of the movements in progress on
  * them plus the write rate of this partition, increased by a margin (see {@link ReplicationThrottleBudget}), unless no movement
  * is in progress on them. Hence, on a broker, cooler partitions fill the replication throttle first, and a hot partition that
@@ -80,8 +78,7 @@ public class ExecutionTaskPlanner {
   private static final Logger LOG = LoggerFactory.getLogger(ExecutionTaskPlanner.class);
   private Map<Integer, SortedSet<ExecutionTask>> _interPartMoveTasksByBrokerId;
   private Comparator<Integer> _interPartMoveBrokerComparator;
-  private boolean _roundRobinBrokers;
-  private final Map<Integer, Integer> _numInterBrokerMovementsScheduledByBrokerId;
+  private boolean _throttleAware;
   private final Set<TopicPartition> _partitionsExceedingReplicationThrottle;
   private final Map<Integer, SortedSet<ExecutionTask>> _intraPartMoveTasksByBrokerId;
   private final Set<ExecutionTask> _remainingInterBrokerReplicaMovements;
@@ -106,8 +103,7 @@ public class ExecutionTaskPlanner {
   public ExecutionTaskPlanner(Admin adminClient, KafkaCruiseControlConfig config) {
     _executionId = 0L;
     _interPartMoveTasksByBrokerId = new HashMap<>();
-    _roundRobinBrokers = false;
-    _numInterBrokerMovementsScheduledByBrokerId = new HashMap<>();
+    _throttleAware = false;
     _partitionsExceedingReplicationThrottle = new HashSet<>();
     _intraPartMoveTasksByBrokerId = new HashMap<>();
     _remainingInterBrokerReplicaMovements = new HashSet<>();
@@ -222,8 +218,7 @@ public class ExecutionTaskPlanner {
                                                                 ? _defaultReplicaMovementTaskStrategy
                                                                 : replicaMovementStrategy.chainBaseReplicaMovementStrategyIfAbsent();
     _interPartMoveTasksByBrokerId = chosenReplicaMovementTaskStrategy.applyStrategy(_remainingInterBrokerReplicaMovements, strategyOptions);
-    _roundRobinBrokers = ThrottleAwareRoundRobinBrokerReplicaMovementStrategy.isEnabledIn(chosenReplicaMovementTaskStrategy);
-    _numInterBrokerMovementsScheduledByBrokerId.clear();
+    _throttleAware = ThrottleAwareReplicaMovementStrategy.isEnabledIn(chosenReplicaMovementTaskStrategy);
     _partitionsExceedingReplicationThrottle.clear();
     _interPartMoveBrokerComparator = brokerComparator(strategyOptions, chosenReplicaMovementTaskStrategy);
   }
@@ -300,10 +295,11 @@ public class ExecutionTaskPlanner {
   }
 
   /**
-   * @return {@code true} if brokers are picked in a round-robin manner for inter-broker replica movements, {@code false} otherwise.
+   * @return {@code true} if inter-broker replica movements are started within the replication throttle budget of brokers,
+   * {@code false} otherwise.
    */
-  boolean isRoundRobinBrokers() {
-    return _roundRobinBrokers;
+  boolean isThrottleAware() {
+    return _throttleAware;
   }
 
   /**
@@ -393,7 +389,7 @@ public class ExecutionTaskPlanner {
 
   /**
    * Get a list of executable inter-broker replica movements that comply with the concurrency constraint, partitions in move
-   * constraint and, if brokers are picked in a round-robin manner, the replication throttle budget provided.
+   * constraint and, if the replica movement strategy is throttle-aware, the replication throttle budget provided.
    *
    * @param readyBrokers The brokers that is ready to execute more movements.
    * @param inProgressPartitions Topic partitions of replicas that are already in progress. This is needed because the
@@ -452,39 +448,38 @@ public class ExecutionTaskPlanner {
             maxPartitionMovesReached = true;
             break;
           }
-          // Skip this proposal if any broker involved in this proposal has already involved in this round.
+          // Skip this proposal if either source broker or destination broker of this proposal has already
+          // involved in this round.
           int sourceBroker = task.proposal().oldLeader().brokerId();
           Set<Integer> destinationBrokers = task.proposal().replicasToAdd().stream().mapToInt(ReplicaPlacementInfo::brokerId)
                                                 .boxed().collect(Collectors.toSet());
-          Set<Integer> brokersInvolvedInTask = brokersInvolved(task);
-          if (KafkaCruiseControlUtils.containsAny(brokerInvolved, brokersInvolvedInTask)) {
+          if (brokerInvolved.contains(sourceBroker)
+              || KafkaCruiseControlUtils.containsAny(brokerInvolved, destinationBrokers)) {
             continue;
           }
           TopicPartition tp = task.proposal().topicPartition();
           // Check if the proposal is executable.
           if (isExecutableProposal(task.proposal(), readyBrokers)
-              && (!_roundRobinBrokers || budget == null || budget.fits(task))
+              && (!_throttleAware || budget == null || budget.fits(task))
               && !inProgressPartitions.contains(tp)
               && !partitionsInvolved.contains(tp)) {
             partitionsInvolved.add(tp);
             executableReplicaMovements.add(task);
             // Record the brokers as involved in this round and stop involving them again in this round.
-            brokerInvolved.addAll(brokersInvolvedInTask);
-            // The first task and the number of scheduled movements of each involved broker might have changed.
-            // Let's remove the brokers before these change, then add them again later by comparing their new state.
-            Set<Integer> brokersToReorder = brokersInvolvedInTask.stream().filter(_interPartMoveTasksByBrokerId::containsKey)
-                                                                 .collect(Collectors.toSet());
-            interPartMoveBrokerIds.removeAll(brokersToReorder);
+            brokerInvolved.add(sourceBroker);
+            brokerInvolved.addAll(destinationBrokers);
+            // The first task of each involved broker might have changed.
+            // Let's remove the brokers before the tasks change, then add them again later by comparing their new first tasks.
+            interPartMoveBrokerIds.remove(sourceBroker);
+            interPartMoveBrokerIds.removeAll(destinationBrokers);
             // Remove the proposal from the execution plan.
             removeInterBrokerReplicaActionForExecution(task);
-            if (_roundRobinBrokers) {
-              brokersInvolvedInTask.forEach(broker -> _numInterBrokerMovementsScheduledByBrokerId.merge(broker, 1, Integer::sum));
-              if (budget != null) {
-                maybeWarnReplicationThrottleExceeded(task, budget);
-                budget.reserve(task);
-              }
+            if (_throttleAware && budget != null) {
+              maybeWarnReplicationThrottleExceeded(task, budget);
+              budget.reserve(task);
             }
-            interPartMoveBrokerIds.addAll(brokersToReorder);
+            interPartMoveBrokerIds.add(sourceBroker);
+            interPartMoveBrokerIds.addAll(destinationBrokers);
             // Decrement the slots for both source and destination brokers
             readyBrokers.put(sourceBroker, readyBrokers.get(sourceBroker) - 1);
             for (int broker : destinationBrokers) {
@@ -536,7 +531,6 @@ public class ExecutionTaskPlanner {
   public void clear() {
     _intraPartMoveTasksByBrokerId.clear();
     _interPartMoveTasksByBrokerId.clear();
-    _numInterBrokerMovementsScheduledByBrokerId.clear();
     _partitionsExceedingReplicationThrottle.clear();
     _remainingLeadershipMovements.clear();
     _remainingInterBrokerReplicaMovements.clear();
@@ -583,27 +577,6 @@ public class ExecutionTaskPlanner {
     }
   }
 
-  /**
-   * Get the brokers involved in the given inter-broker replica movement task.
-   * <ul>
-   *   <li>If brokers are picked in a round-robin manner: all brokers hosting a replica of the partition before or after the movement.</li>
-   *   <li>Otherwise: the source broker (i.e. old leader) and the destination brokers (i.e. brokers to add a replica to).</li>
-   * </ul>
-   * @param task Inter-broker replica movement task.
-   * @return The brokers involved in the given task.
-   */
-  private Set<Integer> brokersInvolved(ExecutionTask task) {
-    ExecutionProposal proposal = task.proposal();
-    Set<Integer> brokers = new HashSet<>();
-    brokers.add(proposal.oldLeader().brokerId());
-    proposal.replicasToAdd().forEach(r -> brokers.add(r.brokerId()));
-    if (_roundRobinBrokers) {
-      proposal.oldReplicas().forEach(r -> brokers.add(r.brokerId()));
-      proposal.newReplicas().forEach(r -> brokers.add(r.brokerId()));
-    }
-    return brokers;
-  }
-
   private void removeInterBrokerReplicaActionForExecution(ExecutionTask task) {
     int sourceBroker = task.proposal().oldLeader().brokerId();
     _interPartMoveTasksByBrokerId.get(sourceBroker).remove(task);
@@ -616,8 +589,6 @@ public class ExecutionTaskPlanner {
   /**
    * The comparing order:
    * <ul>
-   *   <li>If brokers are picked in a round-robin manner, the number of inter-broker replica movements scheduled so far for each broker.
-   *   Prioritize broker with the smaller number</li>
    *   <li>Priority of the first task of each broker</li>
    *   <li>The task set size of each broker. Prioritize broker with the larger size</li>
    *   <li>Broker ID integer. Prioritize broker with the smaller ID</li>
@@ -641,13 +612,6 @@ public class ExecutionTaskPlanner {
       }
       if (taskSet2Size == 0) {
         return PRIORITIZE_BROKER_1;
-      }
-      if (_roundRobinBrokers) {
-        int numScheduled1 = _numInterBrokerMovementsScheduledByBrokerId.getOrDefault(broker1, 0);
-        int numScheduled2 = _numInterBrokerMovementsScheduledByBrokerId.getOrDefault(broker2, 0);
-        if (numScheduled1 != numScheduled2) {
-          return Integer.compare(numScheduled1, numScheduled2);
-        }
       }
       int compareFirstTasks = taskComparator.compare(taskSet1.first(), taskSet2.first());
       return compareFirstTasks != 0 ? compareFirstTasks
