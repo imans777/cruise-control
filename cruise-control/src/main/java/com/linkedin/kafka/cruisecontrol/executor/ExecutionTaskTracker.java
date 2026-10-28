@@ -35,6 +35,8 @@ public class ExecutionTaskTracker {
   private volatile long _inExecutionIntraBrokerDataMovementInMB;
   private volatile long _finishedInterBrokerDataMovementInMB;
   private volatile long _finishedIntraBrokerDataMovementInMB;
+  private volatile long _completedInterBrokerDataMovementInMB;
+  private volatile long _completedIntraBrokerDataMovementInMB;
   private volatile long _executionStartMs;
   private boolean _isKafkaAssignerMode;
   private final Time _time;
@@ -62,10 +64,12 @@ public class ExecutionTaskTracker {
   public static final String GAUGE_ONGOING_EXECUTION_DURATION_MS = "ongoing-execution-duration-ms";
   public static final String GAUGE_INTER_BROKER_DATA_TOTAL_MB = "ongoing-execution-inter-broker-data-movement-total-MB";
   public static final String GAUGE_INTER_BROKER_DATA_FINISHED_MB = "ongoing-execution-inter-broker-data-movement-finished-MB";
+  public static final String GAUGE_INTER_BROKER_DATA_COMPLETED_MB = "ongoing-execution-inter-broker-data-movement-completed-MB";
   public static final String GAUGE_INTER_BROKER_DATA_IN_EXECUTION_MB = "ongoing-execution-inter-broker-data-movement-in-execution-MB";
   public static final String GAUGE_INTER_BROKER_DATA_REMAINING_MB = "ongoing-execution-inter-broker-data-movement-remaining-MB";
   public static final String GAUGE_INTRA_BROKER_DATA_TOTAL_MB = "ongoing-execution-intra-broker-data-movement-total-MB";
   public static final String GAUGE_INTRA_BROKER_DATA_FINISHED_MB = "ongoing-execution-intra-broker-data-movement-finished-MB";
+  public static final String GAUGE_INTRA_BROKER_DATA_COMPLETED_MB = "ongoing-execution-intra-broker-data-movement-completed-MB";
   public static final String GAUGE_INTRA_BROKER_DATA_IN_EXECUTION_MB = "ongoing-execution-intra-broker-data-movement-in-execution-MB";
   public static final String GAUGE_INTRA_BROKER_DATA_REMAINING_MB = "ongoing-execution-intra-broker-data-movement-remaining-MB";
   private static final long NO_ONGOING_EXECUTION = -1L;
@@ -89,6 +93,8 @@ public class ExecutionTaskTracker {
     _inExecutionIntraBrokerDataMovementInMB = 0L;
     _finishedInterBrokerDataMovementInMB = 0L;
     _finishedIntraBrokerDataMovementInMB = 0L;
+    _completedInterBrokerDataMovementInMB = 0L;
+    _completedIntraBrokerDataMovementInMB = 0L;
     _executionStartMs = NO_ONGOING_EXECUTION;
     _isKafkaAssignerMode = false;
     _time = time;
@@ -131,11 +137,14 @@ public class ExecutionTaskTracker {
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_ONGOING_EXECUTION_DURATION_MS),
                                       (Gauge<Long>) this::ongoingExecutionDurationMs);
     // Data to move in the ongoing execution. Similar to the number of pending tasks, the remaining data to move is reported
-    // as 0 once a stop is requested, because pending tasks will not be executed.
+    // as 0 once a stop is requested, because pending tasks will not be executed. The finished data movement includes aborted
+    // and dead tasks, whereas the completed data movement includes only the completed tasks.
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTER_BROKER_DATA_TOTAL_MB),
                                       (Gauge<Long>) () -> _totalInterBrokerDataToMoveInMB);
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTER_BROKER_DATA_FINISHED_MB),
                                       (Gauge<Long>) () -> _finishedInterBrokerDataMovementInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTER_BROKER_DATA_COMPLETED_MB),
+                                      (Gauge<Long>) () -> _completedInterBrokerDataMovementInMB);
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTER_BROKER_DATA_IN_EXECUTION_MB),
                                       (Gauge<Long>) () -> _inExecutionInterBrokerDataMovementInMB);
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTER_BROKER_DATA_REMAINING_MB),
@@ -144,6 +153,8 @@ public class ExecutionTaskTracker {
                                       (Gauge<Long>) () -> _totalIntraBrokerDataToMoveInMB);
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTRA_BROKER_DATA_FINISHED_MB),
                                       (Gauge<Long>) () -> _finishedIntraBrokerDataMovementInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTRA_BROKER_DATA_COMPLETED_MB),
+                                      (Gauge<Long>) () -> _completedIntraBrokerDataMovementInMB);
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTRA_BROKER_DATA_IN_EXECUTION_MB),
                                       (Gauge<Long>) () -> _inExecutionIntraBrokerDataMovementInMB);
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTRA_BROKER_DATA_REMAINING_MB),
@@ -237,12 +248,19 @@ public class ExecutionTaskTracker {
                || task.state() == ExecutionTaskState.DEAD
                || task.state() == ExecutionTaskState.COMPLETED) {
       _partitionDataMovementRateMeter.mark(dataToMove);
+      boolean isCompleted = task.state() == ExecutionTaskState.COMPLETED;
       if (task.type() == TaskType.INTRA_BROKER_REPLICA_ACTION) {
         _inExecutionIntraBrokerDataMovementInMB -= dataToMove;
         _finishedIntraBrokerDataMovementInMB += dataToMove;
+        if (isCompleted) {
+          _completedIntraBrokerDataMovementInMB += dataToMove;
+        }
       } else if (task.type() == TaskType.INTER_BROKER_REPLICA_ACTION) {
         _inExecutionInterBrokerDataMovementInMB -= dataToMove;
         _finishedInterBrokerDataMovementInMB += dataToMove;
+        if (isCompleted) {
+          _completedInterBrokerDataMovementInMB += dataToMove;
+        }
       }
     }
   }
@@ -250,7 +268,8 @@ public class ExecutionTaskTracker {
   /**
    * Add new tasks to ExecutionTaskTracker to trace their execution.
    * Tasks are added homogeneously -- all tasks have the same task type.
-   * The first tasks added after {@link #clear()} mark the start of the ongoing execution.
+   * The first tasks added after {@link #clear()} mark the start of the ongoing execution, and clear a stop that was requested
+   * while there was no ongoing execution.
    *
    * @param tasks    New tasks to add.
    * @param taskType Task type of new tasks.
@@ -258,6 +277,10 @@ public class ExecutionTaskTracker {
   public void addTasksToTrace(Collection<ExecutionTask> tasks, TaskType taskType) {
     if (_executionStartMs == NO_ONGOING_EXECUTION) {
       _executionStartMs = _time.milliseconds();
+      // The executor resets its stop signal when an execution starts, so a stop requested while there was no ongoing
+      // execution does not apply to this one. Otherwise, the pending tasks and the remaining data to move of this execution
+      // would be reported as 0.
+      _stopRequested = false;
     }
     _tasksByType.get(taskType).get(ExecutionTaskState.PENDING).addAll(tasks);
     if (taskType == TaskType.INTER_BROKER_REPLICA_ACTION) {
@@ -322,6 +345,8 @@ public class ExecutionTaskTracker {
     _inExecutionIntraBrokerDataMovementInMB = 0L;
     _finishedInterBrokerDataMovementInMB = 0L;
     _finishedIntraBrokerDataMovementInMB = 0L;
+    _completedInterBrokerDataMovementInMB = 0L;
+    _completedIntraBrokerDataMovementInMB = 0L;
     _executionStartMs = NO_ONGOING_EXECUTION;
     _stopRequested = false;
   }

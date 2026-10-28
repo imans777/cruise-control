@@ -38,10 +38,12 @@ Cruise Control metrics are useful to monitor the state of Cruise Control itself.
 | The duration of the ongoing execution in ms (0 if there is no ongoing execution)                     | kafka.cruisecontrol:name=Executor.ongoing-execution-duration-ms                                |
 | The inter-broker data to move in the ongoing execution in MB                                         | kafka.cruisecontrol:name=Executor.ongoing-execution-inter-broker-data-movement-total-MB        |
 | The finished (completed, aborted or dead) inter-broker data movement of the ongoing execution in MB  | kafka.cruisecontrol:name=Executor.ongoing-execution-inter-broker-data-movement-finished-MB     |
+| The completed inter-broker data movement of the ongoing execution in MB (excludes aborted and dead)  | kafka.cruisecontrol:name=Executor.ongoing-execution-inter-broker-data-movement-completed-MB    |
 | The in-execution (in progress or aborting) inter-broker data movement of the ongoing execution in MB | kafka.cruisecontrol:name=Executor.ongoing-execution-inter-broker-data-movement-in-execution-MB |
 | The remaining inter-broker data to move in the ongoing execution in MB (0 once a stop is requested)  | kafka.cruisecontrol:name=Executor.ongoing-execution-inter-broker-data-movement-remaining-MB    |
 | The intra-broker data to move in the ongoing execution in MB                                         | kafka.cruisecontrol:name=Executor.ongoing-execution-intra-broker-data-movement-total-MB        |
 | The finished (completed, aborted or dead) intra-broker data movement of the ongoing execution in MB  | kafka.cruisecontrol:name=Executor.ongoing-execution-intra-broker-data-movement-finished-MB     |
+| The completed intra-broker data movement of the ongoing execution in MB (excludes aborted and dead)  | kafka.cruisecontrol:name=Executor.ongoing-execution-intra-broker-data-movement-completed-MB    |
 | The in-execution (in progress or aborting) intra-broker data movement of the ongoing execution in MB | kafka.cruisecontrol:name=Executor.ongoing-execution-intra-broker-data-movement-in-execution-MB |
 | The remaining intra-broker data to move in the ongoing execution in MB (0 once a stop is requested)  | kafka.cruisecontrol:name=Executor.ongoing-execution-intra-broker-data-movement-remaining-MB    |
 | The number of (all) execution stopped                                                                | kafka.cruisecontrol:name=Executor.execution-stopped                                            |
@@ -72,8 +74,9 @@ Cruise Control metrics are useful to monitor the state of Cruise Control itself.
 
 The `ongoing-execution-*-data-movement-*-MB` and `ongoing-execution-duration-ms` sensors describe the ongoing execution and are
 reset to 0 once the execution finishes. They can be combined to monitor the progress of an execution: for example, the progress of
-inter-broker replica movements is `finished-MB / total-MB`, and its remaining time can be estimated as
-`(remaining-MB + in-execution-MB) / partition-movement-MB-per-second`.
+inter-broker replica movements is `completed-MB / total-MB`, and its remaining time can be estimated as
+`(remaining-MB + in-execution-MB) / partition-movement-MB-per-second`. `finished-MB - completed-MB` is the data of the aborted and dead
+tasks, e.g. the in-progress movements that were rolled back when the execution was stopped.
 
 
 ### LoadMonitor Sensors
