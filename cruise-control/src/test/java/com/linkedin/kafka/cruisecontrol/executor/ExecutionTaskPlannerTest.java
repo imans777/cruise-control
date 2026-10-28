@@ -17,7 +17,7 @@ import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeOneAboveMinI
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeSmallReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
-import com.linkedin.kafka.cruisecontrol.executor.strategy.ThrottleAwareRoundRobinBrokerReplicaMovementStrategy;
+import com.linkedin.kafka.cruisecontrol.executor.strategy.ThrottleAwareReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
@@ -418,63 +418,25 @@ public class ExecutionTaskPlannerTest {
   }
 
   @Test
-  public void testThrottleAwareRoundRobinBrokerStrategyRotatesBrokers() {
-    // Broker 0 is the leader of both p0 and p1, which have smaller execution ids than p2.
+  public void testNumRemainingInterBrokerReplicaMovementsByBrokerId() {
     ExecutionProposal p0 = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 10, _r0, List.of(_r0, _r1), List.of(_r0, _r2));
     ExecutionProposal p1 = new ExecutionProposal(new TopicPartition(TOPIC1, 1), 10, _r0, List.of(_r0, _r1), List.of(_r0, _r2));
     ExecutionProposal p2 = new ExecutionProposal(new TopicPartition(TOPIC1, 2), 10, _r3, List.of(_r3, _r4), List.of(_r3, _r5));
     List<ExecutionProposal> proposals = List.of(p0, p1, p2);
-    StrategyOptions strategyOptions = strategyOptionsFor(proposals);
-
-    // The base strategy keeps picking broker 0 as long as it has the task with the highest priority.
-    ExecutionTaskPlanner basePlanner =
+    ExecutionTaskPlanner planner =
         new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
-    basePlanner.addExecutionProposals(proposals, strategyOptions, null);
+    planner.addExecutionProposals(proposals, strategyOptionsFor(proposals), null);
+
     // Brokers 0 and 2 are involved in two movements each, brokers 3 and 5 in one movement each.
-    Map<Integer, Integer> numMovementsByBrokerId = basePlanner.numRemainingInterBrokerReplicaMovementsByBrokerId();
+    Map<Integer, Integer> numMovementsByBrokerId = planner.numRemainingInterBrokerReplicaMovementsByBrokerId();
     assertEquals(Map.of(0, 2, 2, 2, 3, 1, 5, 1), numMovementsByBrokerId);
     assertEquals(List.of(2, 2, 1, 1), new ArrayList<>(numMovementsByBrokerId.values()));
-    assertEquals(List.of(p0, p1, p2), getInterBrokerReplicaMovementsOneByOne(basePlanner, proposals.size()));
-    assertTrue(basePlanner.numRemainingInterBrokerReplicaMovementsByBrokerId().isEmpty());
-
-    // The throttle-aware round-robin broker strategy picks broker 0 again only after the other brokers had their turn.
-    Properties roundRobinProps = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
-    roundRobinProps.setProperty(ExecutorConfig.DEFAULT_REPLICA_MOVEMENT_STRATEGIES_CONFIG,
-                                ThrottleAwareRoundRobinBrokerReplicaMovementStrategy.class.getName());
-    ExecutionTaskPlanner roundRobinPlanner = new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(roundRobinProps));
-    roundRobinPlanner.addExecutionProposals(proposals, strategyOptions, null);
-    assertEquals(List.of(p0, p2, p1), getInterBrokerReplicaMovementsOneByOne(roundRobinPlanner, proposals.size()));
+    assertEquals(List.of(p0, p1, p2), getInterBrokerReplicaMovementsOneByOne(planner, proposals.size()));
+    assertTrue(planner.numRemainingInterBrokerReplicaMovementsByBrokerId().isEmpty());
   }
 
   @Test
-  public void testThrottleAwareRoundRobinBrokerStrategyConsidersAllReplicasInvolved() {
-    // Broker 1 is a follower of p0 (whose replica is being removed) and the leader of p1.
-    ExecutionProposal p0 = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 10, _r0, List.of(_r0, _r1), List.of(_r0, _r2));
-    ExecutionProposal p1 = new ExecutionProposal(new TopicPartition(TOPIC1, 1), 10, _r1, List.of(_r1, _r3), List.of(_r1, _r4));
-    ExecutionProposal p2 = new ExecutionProposal(new TopicPartition(TOPIC1, 2), 10, _r5, List.of(_r5, new ReplicaPlacementInfo(6)),
-                                                 List.of(_r5, new ReplicaPlacementInfo(7)));
-    List<ExecutionProposal> proposals = List.of(p0, p1, p2);
-    StrategyOptions strategyOptions = strategyOptionsFor(proposals);
-    int maxInterBrokerPartitionMovements = 2;
-
-    // The base strategy only considers the leader and destination brokers as involved, so p0 and p1 are picked together.
-    ExecutionTaskPlanner basePlanner =
-        new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
-    basePlanner.addExecutionProposals(proposals, strategyOptions, null);
-    List<ExecutionTask> tasks = basePlanner.getInterBrokerReplicaMovementTasks(readyBrokers(), Collections.emptySet(),
-                                                                               maxInterBrokerPartitionMovements);
-    assertEquals(List.of(p0, p1), proposalsOf(tasks));
-
-    // The throttle-aware round-robin broker strategy considers broker 1 as involved in p0, so p2 is picked together with p0.
-    ExecutionTaskPlanner roundRobinPlanner =
-        new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
-    roundRobinPlanner.addExecutionProposals(proposals, strategyOptions, new ThrottleAwareRoundRobinBrokerReplicaMovementStrategy());
-    tasks = roundRobinPlanner.getInterBrokerReplicaMovementTasks(readyBrokers(), Collections.emptySet(), maxInterBrokerPartitionMovements);
-    assertEquals(List.of(p0, p2), proposalsOf(tasks));
-  }
-
-  @Test
-  public void testDynamicConfigThrottleAwareRoundRobinBrokerStrategy() {
+  public void testDynamicConfigThrottleAwareStrategy() {
     ExecutionProposal p0 = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 10, _r0, List.of(_r0, _r1), List.of(_r0, _r2));
     ExecutionProposal p1 = new ExecutionProposal(new TopicPartition(TOPIC1, 1), 10, _r0, List.of(_r0, _r1), List.of(_r0, _r2));
     ExecutionProposal p2 = new ExecutionProposal(new TopicPartition(TOPIC1, 2), 10, _r3, List.of(_r3, _r4), List.of(_r3, _r5));
@@ -483,22 +445,30 @@ public class ExecutionTaskPlannerTest {
     ExecutionTaskPlanner planner =
         new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
 
-    // Throttle-aware round-robin broker strategy chained after another strategy.
-    ReplicaMovementStrategy chainedStrategy =
-        new PrioritizeLargeReplicaMovementStrategy().chain(new ThrottleAwareRoundRobinBrokerReplicaMovementStrategy());
-    assertTrue(ThrottleAwareRoundRobinBrokerReplicaMovementStrategy.isEnabledIn(chainedStrategy.chainBaseReplicaMovementStrategyIfAbsent()));
+    // Throttle-aware strategy chained after another strategy, which still determines the order of tasks.
+    ReplicaMovementStrategy chainedStrategy = new PrioritizeLargeReplicaMovementStrategy().chain(new ThrottleAwareReplicaMovementStrategy());
+    assertTrue(ThrottleAwareReplicaMovementStrategy.isEnabledIn(chainedStrategy.chainBaseReplicaMovementStrategyIfAbsent()));
     planner.addExecutionProposals(proposals, strategyOptions, chainedStrategy);
-    assertEquals(List.of(p0, p2, p1), getInterBrokerReplicaMovementsOneByOne(planner, proposals.size()));
+    assertTrue(planner.isThrottleAware());
+    assertEquals(List.of(p0, p1, p2), getInterBrokerReplicaMovementsOneByOne(planner, proposals.size()));
     planner.clear();
 
     // Falls back to the default strategy for the next execution.
-    assertFalse(ThrottleAwareRoundRobinBrokerReplicaMovementStrategy.isEnabledIn(new PrioritizeLargeReplicaMovementStrategy()));
+    assertFalse(ThrottleAwareReplicaMovementStrategy.isEnabledIn(new PrioritizeLargeReplicaMovementStrategy()));
     planner.addExecutionProposals(proposals, strategyOptions, null);
+    assertFalse(planner.isThrottleAware());
     assertEquals(List.of(p0, p1, p2), getInterBrokerReplicaMovementsOneByOne(planner, proposals.size()));
+
+    // Throttle-aware strategy as the default strategy.
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(ExecutorConfig.DEFAULT_REPLICA_MOVEMENT_STRATEGIES_CONFIG, ThrottleAwareReplicaMovementStrategy.class.getName());
+    ExecutionTaskPlanner throttleAwarePlanner = new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(props));
+    throttleAwarePlanner.addExecutionProposals(proposals, strategyOptions, null);
+    assertTrue(throttleAwarePlanner.isThrottleAware());
   }
 
   @Test
-  public void testThrottleAwareRoundRobinBrokerStrategyRespectsReplicationThrottle() {
+  public void testThrottleAwareStrategyRespectsReplicationThrottle() {
     long throttle = 50L * BYTES_PER_MB;
     ReplicaPlacementInfo r6 = new ReplicaPlacementInfo(6);
     ReplicaPlacementInfo r7 = new ReplicaPlacementInfo(7);
@@ -518,7 +488,7 @@ public class ExecutionTaskPlannerTest {
     // Only one hot partition starts per call, and the cool partition fills the remaining budget of broker 2.
     ExecutionTaskPlanner planner =
         new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
-    planner.addExecutionProposals(proposals, strategyOptions, new ThrottleAwareRoundRobinBrokerReplicaMovementStrategy());
+    planner.addExecutionProposals(proposals, strategyOptions, new ThrottleAwareReplicaMovementStrategy());
     List<ExecutionTask> inProgressTasks = planner.getInterBrokerReplicaMovementTasks(
         readyBrokers(), Collections.emptySet(), maxInterBrokerPartitionMovements,
         budget(Collections.emptyList(), writeRateByPartition, throttle));
@@ -534,7 +504,7 @@ public class ExecutionTaskPlannerTest {
     assertEquals(1, tasks.size());
     assertEquals(1, planner.remainingInterBrokerReplicaMovements().size());
 
-    // Without the throttle-aware round-robin broker strategy, the replication throttle budget is ignored.
+    // Without the throttle-aware strategy, the replication throttle budget is ignored.
     ExecutionTaskPlanner basePlanner =
         new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
     basePlanner.addExecutionProposals(proposals, strategyOptions, null);
@@ -544,7 +514,7 @@ public class ExecutionTaskPlannerTest {
 
     // Without a replication throttle budget, all movements start.
     planner.clear();
-    planner.addExecutionProposals(proposals, strategyOptions, new ThrottleAwareRoundRobinBrokerReplicaMovementStrategy());
+    planner.addExecutionProposals(proposals, strategyOptions, new ThrottleAwareReplicaMovementStrategy());
     tasks = planner.getInterBrokerReplicaMovementTasks(readyBrokers(), Collections.emptySet(), maxInterBrokerPartitionMovements, null);
     assertEquals(Set.copyOf(proposals), new HashSet<>(proposalsOf(tasks)));
 
@@ -557,7 +527,7 @@ public class ExecutionTaskPlannerTest {
                                                      ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, 100L);
     inProgressTask.inProgress(0L);
     planner.clear();
-    planner.addExecutionProposals(List.of(hot), strategyOptionsFor(List.of(hot)), new ThrottleAwareRoundRobinBrokerReplicaMovementStrategy());
+    planner.addExecutionProposals(List.of(hot), strategyOptionsFor(List.of(hot)), new ThrottleAwareReplicaMovementStrategy());
     assertTrue(planner.getInterBrokerReplicaMovementTasks(readyBrokers(), Collections.emptySet(), maxInterBrokerPartitionMovements,
                                                           budget(List.of(inProgressTask), hotWriteRateByPartition, throttle)).isEmpty());
     // ... and starts alone when nothing is in progress on its brokers.
