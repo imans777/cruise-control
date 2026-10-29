@@ -25,10 +25,12 @@ import com.google.common.util.concurrent.AtomicDouble;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils;
 import com.linkedin.kafka.cruisecontrol.common.MetadataAdminClient;
 import com.linkedin.kafka.cruisecontrol.common.TopicMinIsrCache;
+import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorManager;
+import com.linkedin.kafka.cruisecontrol.exception.BrokerCapacityResolutionException;
 import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ConcurrencyAdjustingRecommendation;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ExecutionConcurrencyManager;
@@ -40,6 +42,7 @@ import com.linkedin.kafka.cruisecontrol.servlet.UserTaskManager;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -60,9 +63,11 @@ import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AlterPartitionReassignmentsResult;
 import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.clients.admin.ElectLeadersResult;
+import org.apache.kafka.clients.admin.LogDirDescription;
 import org.apache.kafka.clients.admin.PartitionReassignment;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.TopicPartitionReplica;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
@@ -1613,11 +1618,17 @@ public class Executor {
       LOG.info("User task {}: Starting {} inter-broker partition movements.", _uuid, numTotalPartitionMovements);
 
       int partitionsToMove = numTotalPartitionMovements;
+      DiskCapacityTracker diskCapacityTracker = newDiskCapacityTracker(INTER_BROKER_REPLICA_ACTION);
       // Exhaust all the pending partition movements.
       while ((partitionsToMove > 0 || !inExecutionTasks().isEmpty()) && _stopSignal.get() == NO_STOP_EXECUTION) {
         // Get tasks to execute.
-        List<ExecutionTask> tasksToExecute = _executionTaskManager.getInterBrokerReplicaMovementTasks();
+        locateNewReplicas(diskCapacityTracker);
+        diskCapacityTracker.beginPlanning();
+        List<ExecutionTask> tasksToExecute = _executionTaskManager.getInterBrokerReplicaMovementTasks(diskCapacityTracker);
         LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
+        if (tasksToExecute.isEmpty() && inExecutionTasks().isEmpty()) {
+          diskCapacityTracker = handleMovementsBlockedByDiskCapacity(diskCapacityTracker, INTER_BROKER_REPLICA_ACTION);
+        }
 
         AlterPartitionReassignmentsResult result = null;
         if (!tasksToExecute.isEmpty()) {
@@ -1682,11 +1693,16 @@ public class Executor {
       LOG.info("User task {}: Starting {} intra-broker partition movements.", _uuid, numTotalPartitionMovements);
 
       int partitionsToMove = numTotalPartitionMovements;
+      DiskCapacityTracker diskCapacityTracker = newDiskCapacityTracker(INTRA_BROKER_REPLICA_ACTION);
       // Exhaust all the pending partition movements.
       while ((partitionsToMove > 0 || !inExecutionTasks().isEmpty()) && _stopSignal.get() == NO_STOP_EXECUTION) {
         // Get tasks to execute.
-        List<ExecutionTask> tasksToExecute = _executionTaskManager.getIntraBrokerReplicaMovementTasks();
+        diskCapacityTracker.beginPlanning();
+        List<ExecutionTask> tasksToExecute = _executionTaskManager.getIntraBrokerReplicaMovementTasks(diskCapacityTracker);
         LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
+        if (tasksToExecute.isEmpty() && inExecutionTasks().isEmpty()) {
+          diskCapacityTracker = handleMovementsBlockedByDiskCapacity(diskCapacityTracker, INTRA_BROKER_REPLICA_ACTION);
+        }
 
         if (!tasksToExecute.isEmpty()) {
           // Execute the tasks.
@@ -1732,6 +1748,85 @@ public class Executor {
                  partitionMovementTasksByState.get(ExecutionTaskState.COMPLETED),
                  executionTasksSummary.remainingIntraBrokerDataToMoveInMB(),
                  executionTasksSummary.taskStat().get(LEADER_ACTION).get(ExecutionTaskState.PENDING));
+      }
+    }
+
+    /**
+     * Create a disk capacity tracker for the remaining replica movements of the given type, based on a snapshot of the log
+     * dirs of the alive brokers that these movements move replicas from or to. Movements to dead brokers are not checked, since
+     * they fail anyway.
+     *
+     * @param type The type of replica movement tasks, i.e. {@link ExecutionTask.TaskType#INTER_BROKER_REPLICA_ACTION} or
+     *             {@link ExecutionTask.TaskType#INTRA_BROKER_REPLICA_ACTION}.
+     * @return A new disk capacity tracker.
+     */
+    private DiskCapacityTracker newDiskCapacityTracker(ExecutionTask.TaskType type) {
+      Set<Integer> brokerIds = _executionTaskManager.brokersInvolvedInRemainingReplicaMovements(type);
+      Cluster cluster = _metadataClient.cluster();
+      brokerIds.removeIf(brokerId -> cluster.nodeById(brokerId) == null);
+      Map<Integer, BrokerCapacityInfo> capacityByBroker = new HashMap<>();
+      for (int brokerId : brokerIds) {
+        try {
+          capacityByBroker.put(brokerId, _loadMonitor.brokerCapacity(cluster.nodeById(brokerId)));
+        } catch (TimeoutException | BrokerCapacityResolutionException e) {
+          LOG.warn("User task {}: Unable to resolve the capacity of broker {} to check replica movements against its disk capacity.",
+                   _uuid, brokerId, e);
+        }
+      }
+      Map<Integer, Map<String, LogDirDescription>> logDirsByBroker = describeLogDirs(brokerIds, _adminClient, _config);
+      Set<Integer> unreachableBrokers = new HashSet<>(brokerIds);
+      unreachableBrokers.removeAll(logDirsByBroker.keySet());
+      return new DiskCapacityTracker(logDirsByBroker, unreachableBrokers, capacityByBroker,
+                                     logSegmentDeleteDelayMs(brokerIds, _adminClient, _config), _time);
+    }
+
+    /**
+     * Tell the given disk capacity tracker the log dirs that the new replicas of started inter-broker replica movements were
+     * created in, among those it does not know yet.
+     *
+     * @param diskCapacityTracker The disk capacity tracker of the ongoing inter-broker replica movements.
+     */
+    private void locateNewReplicas(DiskCapacityTracker diskCapacityTracker) {
+      Set<TopicPartitionReplica> newReplicas = diskCapacityTracker.newReplicasToLocate();
+      if (!newReplicas.isEmpty()) {
+        diskCapacityTracker.locateNewReplicas(currentLogDirs(newReplicas, _adminClient, _config));
+      }
+    }
+
+    /**
+     * Handle the case that no replica movement of the given type is in progress and none of the remaining ones can start. If
+     * movements were deferred for disk capacity:
+     * <ul>
+     *   <li>wait while replicas replaced by completed movements are not deleted yet,</li>
+     *   <li>otherwise, if movements were started since the log dirs were last described, describe them again to check the
+     *   remaining movements against the actual disk usage,</li>
+     *   <li>otherwise, fail the execution, since no movement can free disk space anymore.</li>
+     * </ul>
+     *
+     * @param diskCapacityTracker The disk capacity tracker of the ongoing replica movements.
+     * @param type The type of replica movement tasks, i.e. {@link ExecutionTask.TaskType#INTER_BROKER_REPLICA_ACTION} or
+     *             {@link ExecutionTask.TaskType#INTRA_BROKER_REPLICA_ACTION}.
+     * @return The disk capacity tracker to use for the next replica movements.
+     */
+    private DiskCapacityTracker handleMovementsBlockedByDiskCapacity(DiskCapacityTracker diskCapacityTracker, ExecutionTask.TaskType type) {
+      if (_stopSignal.get() != NO_STOP_EXECUTION) {
+        return diskCapacityTracker;
+      }
+      String movements = type == INTER_BROKER_REPLICA_ACTION ? "inter-broker replica movements" : "intra-broker replica movements";
+      switch (diskCapacityTracker.whenNothingCanStart()) {
+        case WAIT_FOR_DELETIONS:
+          LOG.info("User task {}: The remaining {} wait for the replicas replaced by completed movements to be deleted.", _uuid, movements);
+          return diskCapacityTracker;
+        case RETAKE_SNAPSHOT:
+          LOG.info("User task {}: None of the remaining {} fits the disk capacity of the log dirs it writes to. Describing the log dirs "
+                   + "again to check them against the actual disk usage.", _uuid, movements);
+          return newDiskCapacityTracker(type);
+        case FAIL:
+          throw new IllegalStateException(String.format("None of the remaining %s fits the disk capacity of the log dirs it writes to, "
+                                                        + "and no movement is in progress to free disk space: %s.", movements,
+                                                        diskCapacityTracker.describeRefusals()));
+        default:
+          return diskCapacityTracker;
       }
     }
 

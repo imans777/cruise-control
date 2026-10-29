@@ -80,6 +80,8 @@ The anomaly detector identifies four types of anomalies:
 ### Executor
 The executor is responsible for carrying out the optimization proposals from the analyzer. The executor is designed in a way that it is safely interruptible when executing the proposals. The executor ensures that the execution is resource-aware and does not overwhelm any broker.
 
+Kafka copies a replica in full to its new broker or disk before it deletes the old one, so a disk can fill up on the way to a balanced final state. The executor therefore starts a replica movement only if the disk (log dir) it writes to can hold a full copy of the replica, counting the movements in progress and the space that completed movements free once Kafka deletes the replaced replicas (after `log.segment.delete.delay.ms`). A movement that does not fit is deferred until enough space is freed. The capacity of a log dir is the smaller of its size reported by Kafka and its disk capacity in the broker capacity config.
+
 ## Pluggable modules
 Cruise Control has a few [pluggable components](https://github.com/cruise-control-for-kafka/cruise-control/wiki/Pluggable-Components) to meet various requirements from the users.
 
