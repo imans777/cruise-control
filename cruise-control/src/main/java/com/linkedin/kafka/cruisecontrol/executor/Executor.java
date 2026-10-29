@@ -2184,6 +2184,8 @@ public class Executor {
         tasksToReexecute = Collections.emptyList();
       }
       if (!tasksToReexecute.isEmpty()) {
+        // The destination brokers may have lost the recorded logdirs of the replicas to add -- e.g. upon a restart.
+        _replicasWithRecordedLogdirs.addAll(setLogdirsOfReplicasToAdd(tasksToReexecute, _adminClient, _config));
         AlterPartitionReassignmentsResult result = ExecutionUtils.submitReplicaReassignmentTasks(_adminClient, tasksToReexecute);
         // Process the partition reassignment result.
         Set<TopicPartition> noReassignmentToCancel = new HashSet<>();
