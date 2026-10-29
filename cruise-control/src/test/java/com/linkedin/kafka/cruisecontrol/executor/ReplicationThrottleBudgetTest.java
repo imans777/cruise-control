@@ -89,6 +89,23 @@ public class ReplicationThrottleBudgetTest {
   }
 
   @Test
+  public void testFitsIfNothingInUseOnlyIfIdleBrokerSidesAllowed() {
+    ReplicationThrottleBudget budget = budget(Collections.emptyList(), 0.2);
+    // 150 * 1.2 > 100 on the idle leader side of broker 0 and follower side of broker 1.
+    ExecutionTask hotTask = task(150.0, _r0, List.of(_r0), List.of(_r0, _r1));
+    assertTrue(budget.fits(hotTask, true));
+    assertFalse(budget.fits(hotTask, false));
+    // 80 * 1.2 <= 100 on the idle leader side of broker 2 and follower side of broker 3.
+    ExecutionTask task = task(80.0, _r2, List.of(_r2), List.of(_r2, _r3));
+    assertTrue(budget.fits(task, false));
+    // Broker sides in use are checked the same way: (80 + 10) * 1.2 > 100 on the follower side of broker 3.
+    budget.reserve(task);
+    ExecutionTask coolTask = task(10.0, _r4, List.of(_r4), List.of(_r4, _r3));
+    assertFalse(budget.fits(coolTask, true));
+    assertFalse(budget.fits(coolTask, false));
+  }
+
+  @Test
   public void testReserveAccumulates() {
     ReplicationThrottleBudget budget = budget(Collections.emptyList(), 0.0);
     ExecutionTask task0 = task(40.0, _r0, List.of(_r0), List.of(_r0, _r2));

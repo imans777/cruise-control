@@ -80,17 +80,31 @@ class ReplicationThrottleBudget {
    * @return {@code true} if the given task fits in the replication throttle budget, {@code false} otherwise.
    */
   boolean fits(ExecutionTask task) {
+    return fits(task, true);
+  }
+
+  /**
+   * A task fits if, on each side of each broker it involves, the throttle can carry the write rate in use plus the write rate of
+   * the task, both increased by the margin, or, if idle broker sides are allowed, no write rate is in use.
+   *
+   * @param task Inter-broker replica movement task.
+   * @param allowIdleBrokerSides {@code true} to let the task fit on a broker side with no write rate in use even if the throttle
+   *                             cannot carry the write rate of the task, {@code false} otherwise.
+   * @return {@code true} if the given task fits in the replication throttle budget, {@code false} otherwise.
+   */
+  boolean fits(ExecutionTask task, boolean allowIdleBrokerSides) {
     double writeRate = writeRate(task);
     int sourceBroker = sourceBroker(task);
     List<Integer> fetchingBrokers = fetchingBrokers(task, sourceBroker);
     if (fetchingBrokers.isEmpty()) {
       return true;
     }
-    if (!fitsOnBrokerSide(_leaderUsageByBrokerId, _leaderThrottleByBrokerId, sourceBroker, writeRate * fetchingBrokers.size())) {
+    if (!fitsOnBrokerSide(_leaderUsageByBrokerId, _leaderThrottleByBrokerId, sourceBroker, writeRate * fetchingBrokers.size(),
+                          allowIdleBrokerSides)) {
       return false;
     }
     for (int fetchingBroker : fetchingBrokers) {
-      if (!fitsOnBrokerSide(_followerUsageByBrokerId, _followerThrottleByBrokerId, fetchingBroker, writeRate)) {
+      if (!fitsOnBrokerSide(_followerUsageByBrokerId, _followerThrottleByBrokerId, fetchingBroker, writeRate, allowIdleBrokerSides)) {
         return false;
       }
     }
@@ -181,9 +195,10 @@ class ReplicationThrottleBudget {
   private boolean fitsOnBrokerSide(Map<Integer, Double> usageByBrokerId,
                                    Function<Integer, Long> throttleByBrokerId,
                                    int brokerId,
-                                   double need) {
+                                   double need,
+                                   boolean allowIdle) {
     double usage = usageByBrokerId.getOrDefault(brokerId, 0.0);
-    if (usage <= 0.0) {
+    if (allowIdle && usage <= 0.0) {
       return true;
     }
     return !exceeds(throttleByBrokerId.apply(brokerId), usage + need);
