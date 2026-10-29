@@ -63,6 +63,7 @@ import org.apache.kafka.clients.admin.ElectLeadersResult;
 import org.apache.kafka.clients.admin.PartitionReassignment;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.TopicPartitionReplica;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
@@ -1308,6 +1309,8 @@ public class Executor {
     private final Collection<Integer> _demotedBrokers;
 
     private final Collection<Integer> _removedBrokers;
+    // Replicas to add whose logdirs their destination brokers recorded.
+    private final Set<TopicPartitionReplica> _replicasWithRecordedLogdirs;
 
     ProposalExecutionRunnable(LoadMonitor loadMonitor,
                               Collection<Integer> demotedBrokers,
@@ -1350,6 +1353,7 @@ public class Executor {
       _replicationThrottle = replicationThrottle;
       _isTriggeredByUserRequest = isTriggeredByUserRequest;
       _lastSlowTaskReportingTimeMs = -1L;
+      _replicasWithRecordedLogdirs = new HashSet<>();
       if (_removedBrokers != null && !_removedBrokers.isEmpty()) {
         _executionTimerInvolveBrokerRemovalOrDemotion = _proposalExecutionTimerInvolveBrokerRemoval;
       } else if (_demotedBrokers != null && !_demotedBrokers.isEmpty()) {
@@ -1624,7 +1628,7 @@ public class Executor {
           throttleHelper.setThrottles(tasksToExecute.stream().map(ExecutionTask::proposal).collect(Collectors.toList()));
           // Execute the tasks.
           _executionTaskManager.markTasksInProgress(tasksToExecute);
-          setLogdirsOfReplicasToAdd(tasksToExecute, _adminClient, _config);
+          _replicasWithRecordedLogdirs.addAll(setLogdirsOfReplicasToAdd(tasksToExecute, _adminClient, _config));
           result = ExecutionUtils.submitReplicaReassignmentTasks(_adminClient, tasksToExecute);
         }
         // Wait indefinitely for partition movements to finish.

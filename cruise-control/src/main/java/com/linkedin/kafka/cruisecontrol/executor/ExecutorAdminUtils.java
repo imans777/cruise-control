@@ -124,13 +124,18 @@ public final class ExecutorAdminUtils {
    * This is a best-effort operation: if the logdir of a replica cannot be recorded, the destination broker picks the logdir
    * to create the replica in.
    *
+   * A replica that its destination broker already hosts (e.g. because the cluster changed after the proposals were generated)
+   * is skipped: requesting a logdir for an existing replica would start moving it to that logdir, which no execution task
+   * tracks.
+   *
    * @param tasks Inter-broker replica movement tasks.
-   * @param adminClient The adminClient to send alterReplicaLogDirs request.
+   * @param adminClient The adminClient to send describeReplicaLogDirs and alterReplicaLogDirs requests.
    * @param config The config object that holds all the Cruise Control related configs
+   * @return The replicas whose logdirs the destination brokers recorded.
    */
-  static void setLogdirsOfReplicasToAdd(Collection<ExecutionTask> tasks,
-                                        Admin adminClient,
-                                        KafkaCruiseControlConfig config) {
+  static Set<TopicPartitionReplica> setLogdirsOfReplicasToAdd(Collection<ExecutionTask> tasks,
+                                                              Admin adminClient,
+                                                              KafkaCruiseControlConfig config) {
     Map<TopicPartitionReplica, String> logdirByReplica = new HashMap<>();
     for (ExecutionTask task : tasks) {
       ExecutionProposal proposal = task.proposal();
@@ -141,15 +146,37 @@ public final class ExecutorAdminUtils {
         }
       }
     }
+    Set<TopicPartitionReplica> recordedReplicas = new HashSet<>();
     if (logdirByReplica.isEmpty()) {
-      return;
+      return recordedReplicas;
+    }
+    long timeoutMs = config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG);
+    for (Map.Entry<TopicPartitionReplica, KafkaFuture<ReplicaLogDirInfo>> entry
+        : adminClient.describeReplicaLogDirs(logdirByReplica.keySet()).values().entrySet()) {
+      try {
+        ReplicaLogDirInfo info = entry.getValue().get(timeoutMs, TimeUnit.MILLISECONDS);
+        if (info.getCurrentReplicaLogDir() != null) {
+          LOG.warn("Replica {} already exists in logdir {} of its destination broker, hence its logdir is not set to {}.",
+                   entry.getKey(), info.getCurrentReplicaLogDir(), logdirByReplica.remove(entry.getKey()));
+        }
+      } catch (InterruptedException | ExecutionException | TimeoutException e) {
+        LOG.warn("Failed to check whether replica {} exists on its destination broker, hence its logdir is not set to {}.",
+                 entry.getKey(), logdirByReplica.remove(entry.getKey()), e);
+      }
+    }
+    if (logdirByReplica.isEmpty()) {
+      return recordedReplicas;
     }
     for (Map.Entry<TopicPartitionReplica, KafkaFuture<Void>> entry: adminClient.alterReplicaLogDirs(logdirByReplica).values().entrySet()) {
       try {
-        entry.getValue().get(config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS);
+        entry.getValue().get(timeoutMs, TimeUnit.MILLISECONDS);
+        LOG.warn("Replica {} was created on its destination broker before its logdir was set to {}.", entry.getKey(),
+                 logdirByReplica.get(entry.getKey()));
       } catch (ExecutionException e) {
-        // The replica does not exist yet, hence the destination broker recorded the logdir to create it in.
-        if (!(e.getCause() instanceof ReplicaNotAvailableException)) {
+        if (e.getCause() instanceof ReplicaNotAvailableException) {
+          // The replica does not exist yet, hence the destination broker recorded the logdir to create it in.
+          recordedReplicas.add(entry.getKey());
+        } else {
           LOG.warn("Failed to set the logdir of replica {} to {}, the broker will pick the logdir.", entry.getKey(),
                    logdirByReplica.get(entry.getKey()), e.getCause());
         }
@@ -158,6 +185,7 @@ public final class ExecutorAdminUtils {
                  logdirByReplica.get(entry.getKey()), e);
       }
     }
+    return recordedReplicas;
   }
 
   /**
