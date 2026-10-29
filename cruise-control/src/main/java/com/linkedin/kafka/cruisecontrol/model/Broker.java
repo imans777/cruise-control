@@ -518,8 +518,9 @@ public class Broker implements Serializable, Comparable<Broker> {
   /**
    * Get the disk to host the given replica, which is relocated to this broker from another broker.
    * <ul>
-   *   <li>If this broker is the original broker of the replica, the original disk of the replica is returned -- i.e.
-   *   relocating a replica back to its original broker does not move it to another disk of the broker.</li>
+   *   <li>If this broker is the original broker of the replica and its original disk is alive, the original disk of the
+   *   replica is returned -- i.e. relocating a replica back to its original broker does not move it to another disk of the
+   *   broker.</li>
    *   <li>Otherwise, the alive disk that would have the lowest utilization percentage after hosting the replica is
    *   returned.</li>
    * </ul>
@@ -528,7 +529,7 @@ public class Broker implements Serializable, Comparable<Broker> {
    * @return The disk to host the given replica, or {@code null} if the broker has no alive disk with positive capacity.
    */
   Disk diskForRelocatedReplica(Replica replica) {
-    if (replica.originalBroker() == this && replica.originalDisk() != null) {
+    if (replica.originalBroker() == this && replica.originalDisk() != null && replica.originalDisk().isAlive()) {
       return replica.originalDisk();
     }
     double replicaUtilization = replica.load().expectedUtilizationFor(Resource.DISK);

@@ -149,6 +149,19 @@ public class JbodReplicaRelocationTest {
   }
 
   @Test
+  public void testRelocateReplicaBackToOriginalBrokerSkipsDeadOriginalDisk() {
+    ClusterModel cluster = jbodCluster();
+    // T0P1 originally resides in LOGDIR1 of broker 0, which is dead.
+    cluster.markDiskDead(0, LOGDIR1);
+    cluster.relocateReplica(T0P1, 0, 2);
+    cluster.relocateReplica(T0P1, 2, 0);
+
+    // Relocating the replica back to its original broker places it on an alive disk instead.
+    assertSame(cluster.broker(0).disk(LOGDIR0), cluster.broker(0).replica(T0P1).disk());
+    verifyDiskConsistency(cluster);
+  }
+
+  @Test
   public void testRelocateReplicaAcrossBrokersSkipsDeadDisks() {
     ClusterModel cluster = jbodCluster();
     // LOGDIR1 would be the least utilized disk of broker 1 after hosting T0P0, but it is dead.
