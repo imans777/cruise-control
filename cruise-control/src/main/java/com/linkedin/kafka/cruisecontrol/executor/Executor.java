@@ -29,6 +29,7 @@ import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorManager;
+import com.linkedin.kafka.cruisecontrol.exception.BrokerCapacityResolutionException;
 import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ConcurrencyAdjustingRecommendation;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ExecutionConcurrencyManager;
@@ -40,6 +41,7 @@ import com.linkedin.kafka.cruisecontrol.servlet.UserTaskManager;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -62,6 +64,7 @@ import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.clients.admin.ElectLeadersResult;
 import org.apache.kafka.clients.admin.PartitionReassignment;
 import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.TopicPartitionReplica;
 import org.apache.kafka.common.config.ConfigResource;
@@ -1309,6 +1312,9 @@ public class Executor {
     private final Collection<Integer> _demotedBrokers;
 
     private final Collection<Integer> _removedBrokers;
+    // Checks the space of the destination logdirs of an execution that creates new replicas in the logdirs picked by the
+    // optimization, null for other executions.
+    private LogdirSpaceCheck _logdirSpaceCheck;
     // Replicas to add whose logdirs their destination brokers recorded.
     private final Set<TopicPartitionReplica> _replicasWithRecordedLogdirs;
 
@@ -1353,6 +1359,7 @@ public class Executor {
       _replicationThrottle = replicationThrottle;
       _isTriggeredByUserRequest = isTriggeredByUserRequest;
       _lastSlowTaskReportingTimeMs = -1L;
+      _logdirSpaceCheck = null;
       _replicasWithRecordedLogdirs = new HashSet<>();
       if (_removedBrokers != null && !_removedBrokers.isEmpty()) {
         _executionTimerInvolveBrokerRemovalOrDemotion = _proposalExecutionTimerInvolveBrokerRemoval;
@@ -1447,6 +1454,7 @@ public class Executor {
         // Ensure that sampling mode is adjusted properly to avoid the loss of partition metric accuracy
         // and enable the collection of broker metric samples during an ongoing execution.
         adjustSamplingModeBeforeExecution();
+        _logdirSpaceCheck = maybeCreateLogdirSpaceCheck();
 
         // 1. Inter-broker move replicas if possible.
         if (_executorState.state() == STARTING_EXECUTION) {
@@ -1620,8 +1628,15 @@ public class Executor {
       // Exhaust all the pending partition movements.
       while ((partitionsToMove > 0 || !inExecutionTasks().isEmpty()) && _stopSignal.get() == NO_STOP_EXECUTION) {
         // Get tasks to execute.
-        List<ExecutionTask> tasksToExecute = _executionTaskManager.getInterBrokerReplicaMovementTasks();
+        maybeRefreshLogdirSpaceCheck();
+        List<ExecutionTask> tasksToExecute = _executionTaskManager.getInterBrokerReplicaMovementTasks(this::canStartReplicaMovement);
         LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
+        if (tasksToExecute.isEmpty() && partitionsToMove > 0 && inExecutionTasks().isEmpty() && isWaitingForLogdirSpace()) {
+          // Every remaining inter-broker partition movement waits for space on logdirs that no inter-broker partition movement
+          // can free.
+          moveReplicasOffBlockedLogdirs();
+          continue;
+        }
 
         AlterPartitionReassignmentsResult result = null;
         if (!tasksToExecute.isEmpty()) {
@@ -1690,8 +1705,14 @@ public class Executor {
       // Exhaust all the pending partition movements.
       while ((partitionsToMove > 0 || !inExecutionTasks().isEmpty()) && _stopSignal.get() == NO_STOP_EXECUTION) {
         // Get tasks to execute.
-        List<ExecutionTask> tasksToExecute = _executionTaskManager.getIntraBrokerReplicaMovementTasks();
+        maybeRefreshLogdirSpaceCheck();
+        List<ExecutionTask> tasksToExecute = _executionTaskManager.getIntraBrokerReplicaMovementTasks(this::canStartReplicaMovement);
         LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
+        if (tasksToExecute.isEmpty() && partitionsToMove > 0 && inExecutionTasks().isEmpty() && isWaitingForLogdirSpace()) {
+          throw new IllegalStateException(String.format("%d intra-broker partition movements wait for space on %s, which no "
+                                                        + "other movement of the execution can free.", partitionsToMove,
+                                                        _logdirSpaceCheck.describeBlockedLogdirs()));
+        }
 
         if (!tasksToExecute.isEmpty()) {
           // Execute the tasks.
@@ -1738,6 +1759,119 @@ public class Executor {
                  executionTasksSummary.remainingIntraBrokerDataToMoveInMB(),
                  executionTasksSummary.taskStat().get(LEADER_ACTION).get(ExecutionTaskState.PENDING));
       }
+    }
+
+    /**
+     * @return A check of the space of the destination logdirs of the replica movements if the execution creates new replicas
+     * in the logdirs picked by the optimization, {@code null} otherwise.
+     */
+    private LogdirSpaceCheck maybeCreateLogdirSpaceCheck() {
+      Set<ExecutionTask> replicaMovementTasks = new HashSet<>();
+      _executionTaskManager.getExecutionTasksSummary(Set.of(INTER_BROKER_REPLICA_ACTION, INTRA_BROKER_REPLICA_ACTION))
+                           .filteredTasksByState().values()
+                           .forEach(tasksByState -> tasksByState.values().forEach(replicaMovementTasks::addAll));
+      if (!LogdirSpaceCheck.hasPlannedLogdirs(replicaMovementTasks)) {
+        return null;
+      }
+      Set<Integer> brokers = new HashSet<>();
+      for (ExecutionTask task : replicaMovementTasks) {
+        task.proposal().oldReplicas().forEach(replica -> brokers.add(replica.brokerId()));
+        task.proposal().newReplicas().forEach(replica -> brokers.add(replica.brokerId()));
+      }
+      Map<Integer, Map<String, Double>> capacityInMbByLogdirByBroker = new HashMap<>();
+      Cluster cluster = _metadataClient.cluster();
+      for (int brokerId : brokers) {
+        Node node = cluster.nodeById(brokerId);
+        if (node == null) {
+          continue;
+        }
+        try {
+          Map<String, Double> capacityInMbByLogdir = _loadMonitor.brokerCapacity(node).diskCapacityByLogDir();
+          if (capacityInMbByLogdir != null) {
+            capacityInMbByLogdirByBroker.put(brokerId, capacityInMbByLogdir);
+          }
+        } catch (TimeoutException | BrokerCapacityResolutionException e) {
+          LOG.warn("User task {}: Failed to get the capacity of broker {}, hence its logdirs are checked against the usable bytes "
+                   + "that the broker reports only.", _uuid, brokerId, e);
+        }
+      }
+      LOG.info("User task {}: The execution creates new replicas in the logdirs picked by the optimization, hence each replica "
+               + "movement starts only once its destination logdir can hold a full copy of the replica.", _uuid);
+      return new LogdirSpaceCheck(_adminClient, _config, brokers, capacityInMbByLogdirByBroker);
+    }
+
+    private void maybeRefreshLogdirSpaceCheck() {
+      if (_logdirSpaceCheck != null) {
+        _logdirSpaceCheck.refresh(inExecutionTasks(), _replicasWithRecordedLogdirs);
+      }
+    }
+
+    private boolean canStartReplicaMovement(ExecutionTask task) {
+      return _logdirSpaceCheck == null || _logdirSpaceCheck.tryReserve(task);
+    }
+
+    private boolean isWaitingForLogdirSpace() {
+      return _logdirSpaceCheck != null && _logdirSpaceCheck.hasBlockedLogdirs();
+    }
+
+    /**
+     * Executes the pending intra-broker replica movements that move replicas off the logdirs that the remaining inter-broker
+     * replica movements wait for, and waits for them to finish. This is called if no inter-broker replica movement is in
+     * progress and none can start, since an execution otherwise runs its intra-broker replica movements only after all its
+     * inter-broker replica movements.
+     *
+     * @throws IllegalStateException If none of these intra-broker replica movements can start.
+     */
+    private void moveReplicasOffBlockedLogdirs() {
+      Map<Integer, Set<String>> blockedLogdirsByBroker = _logdirSpaceCheck.blockedLogdirs();
+      String blockedLogdirs = _logdirSpaceCheck.describeBlockedLogdirs();
+      int numRemainingInterBrokerPartitionMovements = _executionTaskManager.numRemainingInterBrokerPartitionMovements();
+      LOG.info("User task {}: {} inter-broker partition movements wait for space on {}. Moving replicas off these logdirs first.",
+               _uuid, numRemainingInterBrokerPartitionMovements, blockedLogdirs);
+      _executorState = operationInProgressState(INTRA_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS, INTRA_BROKER_REPLICA_ACTION);
+      int numStartedPartitionMovements = 0;
+      while (_stopSignal.get() == NO_STOP_EXECUTION) {
+        maybeRefreshLogdirSpaceCheck();
+        List<ExecutionTask> tasksToExecute = _executionTaskManager.getIntraBrokerReplicaMovementTasks(
+            task -> blockedLogdirsByBroker.getOrDefault(task.brokerId(), Collections.emptySet())
+                                          .contains(LogdirSpaceCheck.sourceLogdir(task))
+                    && canStartReplicaMovement(task));
+        if (!tasksToExecute.isEmpty()) {
+          LOG.info("User task {}: Executor will execute {} intra-broker task(s) to free logdirs.", _uuid, tasksToExecute.size());
+          _executionTaskManager.markTasksInProgress(tasksToExecute);
+          executeIntraBrokerReplicaMovements(tasksToExecute, _adminClient, _executionTaskManager, _config);
+          numStartedPartitionMovements += tasksToExecute.size();
+        } else if (inExecutionTasks().isEmpty()) {
+          break;
+        }
+        waitForIntraBrokerReplicaTasksToFinish();
+      }
+      while (!inExecutionTasks().isEmpty()) {
+        waitForIntraBrokerReplicaTasksToFinish();
+      }
+      if (_stopSignal.get() != NO_STOP_EXECUTION) {
+        updateOngoingExecutionState();
+        return;
+      }
+      if (numStartedPartitionMovements == 0) {
+        throw new IllegalStateException(String.format("%d inter-broker partition movements wait for space on %s, which no other "
+                                                      + "movement of the execution can free.",
+                                                      numRemainingInterBrokerPartitionMovements, blockedLogdirs));
+      }
+      LOG.info("User task {}: Moved {} replicas off the logdirs that inter-broker partition movements wait for. Resuming "
+               + "inter-broker partition movements.", _uuid, numStartedPartitionMovements);
+      _executorState = operationInProgressState(INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS, INTER_BROKER_REPLICA_ACTION);
+    }
+
+    private ExecutorState operationInProgressState(ExecutorState.State state, ExecutionTask.TaskType taskType) {
+      return ExecutorState.operationInProgress(state,
+                                               _executionTaskManager.getExecutionTasksSummary(Collections.singleton(taskType)),
+                                               _executionTaskManager.getExecutionConcurrencyManager().getExecutionConcurrencySummary(),
+                                               _uuid,
+                                               _reasonSupplier.get(),
+                                               _recentlyDemotedBrokers,
+                                               _recentlyRemovedBrokers,
+                                               _isTriggeredByUserRequest);
     }
 
     /**

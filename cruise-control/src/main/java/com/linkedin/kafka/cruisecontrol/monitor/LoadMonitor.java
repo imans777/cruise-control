@@ -597,6 +597,17 @@ public class LoadMonitor {
   }
 
   /**
+   * @param node The broker to get the capacity of.
+   * @return The capacity of the given broker from the broker capacity config resolver, without capacity estimation.
+   * @throws TimeoutException if the resolver is unable to resolve the broker capacity in time.
+   * @throws BrokerCapacityResolutionException if the resolver fails to resolve the broker capacity.
+   */
+  public BrokerCapacityInfo brokerCapacity(Node node) throws TimeoutException, BrokerCapacityResolutionException {
+    return _brokerCapacityConfigResolver.capacityForBroker(getRackHandleNull(node), node.host(), node.id(),
+                                                           BROKER_CAPACITY_FETCH_TIMEOUT_MS, false);
+  }
+
+  /**
    * @return The current cluster model generation. This is useful to avoid unnecessary cluster model creation which is
    * expensive.
    */

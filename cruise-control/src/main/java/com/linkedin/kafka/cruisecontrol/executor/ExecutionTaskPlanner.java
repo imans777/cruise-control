@@ -27,6 +27,7 @@ import java.util.TreeSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.common.Cluster;
@@ -342,6 +343,26 @@ public class ExecutionTaskPlanner {
   public List<ExecutionTask> getInterBrokerReplicaMovementTasks(Map<Integer, Integer> readyBrokers,
                                                                 Set<TopicPartition> inProgressPartitions,
                                                                 int maxInterBrokerPartitionMovements) {
+    return getInterBrokerReplicaMovementTasks(readyBrokers, inProgressPartitions, maxInterBrokerPartitionMovements, task -> true);
+  }
+
+  /**
+   * Get a list of executable inter-broker replica movements that comply with the concurrency constraint, partitions in
+   * move constraint, and the given condition.
+   *
+   * @param readyBrokers The brokers that is ready to execute more movements.
+   * @param inProgressPartitions Topic partitions of replicas that are already in progress. This is needed because the
+   *                             controller does not allow updating the ongoing replica reassignment for a partition
+   *                             whose replica is being reassigned.
+   * @param maxInterBrokerPartitionMovements Maximum cap for number of partitions to move at any time
+   * @param canStart Condition for a movement that complies with the other constraints to start. It is tested last, and
+   *                 only once a movement is selected otherwise. A movement that fails it stays in the execution plan.
+   * @return A list of movements that is executable for the ready brokers.
+   */
+  public List<ExecutionTask> getInterBrokerReplicaMovementTasks(Map<Integer, Integer> readyBrokers,
+                                                                Set<TopicPartition> inProgressPartitions,
+                                                                int maxInterBrokerPartitionMovements,
+                                                                Predicate<ExecutionTask> canStart) {
     LOG.trace("Getting inter-broker replica movement tasks for brokers with concurrency {}", readyBrokers);
     List<ExecutionTask> executableReplicaMovements = new ArrayList<>();
     SortedSet<Integer> interPartMoveBrokerIds = new TreeSet<>(_interPartMoveBrokerComparator);
@@ -400,7 +421,8 @@ public class ExecutionTaskPlanner {
           // Check if the proposal is executable.
           if (isExecutableProposal(task.proposal(), readyBrokers)
               && !inProgressPartitions.contains(tp)
-              && !partitionsInvolved.contains(tp)) {
+              && !partitionsInvolved.contains(tp)
+              && canStart.test(task)) {
             partitionsInvolved.add(tp);
             executableReplicaMovements.add(task);
             // Record the brokers as involved in this round and stop involving them again in this round.
@@ -439,6 +461,23 @@ public class ExecutionTaskPlanner {
    * @return A list of movements that is executable for the ready brokers.
    */
   public List<ExecutionTask> getIntraBrokerReplicaMovementTasks(Map<Integer, Integer> readyBrokers) {
+    return getIntraBrokerReplicaMovementTasks(readyBrokers, Collections.emptySet(), task -> true);
+  }
+
+  /**
+   * Get a list of executable intra-broker replica movements that comply with the concurrency constraint and the given
+   * condition, and whose partitions have no inter-broker replica movement in progress. The latter is needed because a
+   * proposal may move replicas of the same partition both across brokers and across the disks of a broker.
+   *
+   * @param readyBrokers The brokers that is ready to execute more movements.
+   * @param partitionsWithInterBrokerMovementInProgress Topic partitions with an inter-broker replica movement in progress.
+   * @param canStart Condition for a movement that complies with the other constraints to start. It is tested last, and
+   *                 only once a movement is selected otherwise. A movement that fails it stays in the execution plan.
+   * @return A list of movements that is executable for the ready brokers.
+   */
+  public List<ExecutionTask> getIntraBrokerReplicaMovementTasks(Map<Integer, Integer> readyBrokers,
+                                                                Set<TopicPartition> partitionsWithInterBrokerMovementInProgress,
+                                                                Predicate<ExecutionTask> canStart) {
     LOG.trace("Getting intra-broker replica movement tasks for brokers with concurrency {}", readyBrokers);
     List<ExecutionTask> executableReplicaMovements = new ArrayList<>();
 
@@ -447,8 +486,12 @@ public class ExecutionTaskPlanner {
       int limit = brokerEntry.getValue();
       if (_intraPartMoveTasksByBrokerId.containsKey(brokerId)) {
         Iterator<ExecutionTask> tasksForBroker = _intraPartMoveTasksByBrokerId.get(brokerId).iterator();
-        while (limit-- > 0 && tasksForBroker.hasNext()) {
+        while (limit > 0 && tasksForBroker.hasNext()) {
           ExecutionTask task = tasksForBroker.next();
+          if (partitionsWithInterBrokerMovementInProgress.contains(task.proposal().topicPartition()) || !canStart.test(task)) {
+            continue;
+          }
+          limit--;
           executableReplicaMovements.add(task);
           // Remove the proposal from the execution plan.
           tasksForBroker.remove();
