@@ -129,7 +129,7 @@ RebalanceEndpoint:
           default: false
       - name: destination_broker_ids
         in: query
-        description: Specify the destination brokers for partitions to move replicas to.
+        description: Specify the destination brokers for partitions to move replicas to. With intra-broker goals in goals, the disks of all brokers are still balanced.
         schema:
           type: array
           items:
