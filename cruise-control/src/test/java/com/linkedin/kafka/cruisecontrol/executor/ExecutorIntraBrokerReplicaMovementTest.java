@@ -224,7 +224,7 @@ public class ExecutorIntraBrokerReplicaMovementTest {
                              mockAnomalyDetectorManager);
     _executor.setGeneratingProposalsForExecution(UUID, ExecutorIntraBrokerReplicaMovementTest.class::getSimpleName, false);
     _executor.executeProposals(proposals, Collections.emptySet(), null, mockLoadMonitor, null, null, intraBrokerConcurrency,
-                               null, null, null, null, null, false, UUID, false, false);
+                               null, null, null, null, null, null, false, UUID, false, false);
   }
 
   private void waitForExecutionToFinish() throws InterruptedException {

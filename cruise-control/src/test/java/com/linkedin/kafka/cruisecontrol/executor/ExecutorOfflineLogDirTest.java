@@ -81,6 +81,6 @@ public class ExecutorOfflineLogDirTest {
 
   private static void execute(Executor executor, Collection<ExecutionProposal> proposals) throws Exception {
     executor.executeProposals(proposals, Set.of(), null, EasyMock.mock(LoadMonitor.class), null, null, null, null, null, null, null,
-                              null, true, RANDOM_UUID, false, false, false);
+                              null, null, true, RANDOM_UUID, false, false, false);
   }
 }

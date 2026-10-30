@@ -370,6 +370,14 @@ public class LoadMonitorTest {
     assertEquals(1, clusterModel.broker(1).disk("/tmp/kafka-logs-2").replicas().size());
   }
 
+  @Test
+  public void testHasBrokerWithMultipleLogDirs() throws TimeoutException, BrokerCapacityResolutionException {
+    // Broker 0 has one logdir, and broker 1 has two logdirs.
+    assertTrue(prepareContext(NUM_WINDOWS, true).loadmonitor().hasBrokerWithMultipleLogDirs(true));
+    // The disk capacity of brokers is not specified by logdir.
+    assertFalse(prepareContext().loadmonitor().hasBrokerWithMultipleLogDirs(true));
+  }
+
   // Not enough snapshot windows and some partitions are missing from all snapshot windows.
   @Test
   public void testClusterModelWithInvalidPartitionAndInsufficientSnapshotWindows()

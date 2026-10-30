@@ -504,6 +504,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
                               null,
                               null,
                               null,
+                              null,
                               true,
                               RANDOM_UUID,
                               false,
@@ -539,6 +540,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
                                                  null,
                                                  null,
                                                  null,
+                                                 null,
                                                  true,
                                                  RANDOM_UUID,
                                                  false,
@@ -552,6 +554,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
                               null,
                               mockLoadMonitor,
                               null, null,
+                              null,
                               null,
                               null,
                               null,
@@ -715,7 +718,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
                                                            Collections.singletonList(new ReplicaPlacementInfo(BROKER_ID_2)));
     executor.setGeneratingProposalsForExecution(RANDOM_UUID, ExecutorTest.class::getSimpleName, true);
     executor.executeProposals(Arrays.asList(slowMovement, fastMovement), Collections.emptySet(), null, mockLoadMonitor, null, null,
-                              null, null, null, null, null, SLOW_MOVEMENT_REPLICATION_THROTTLE, true, RANDOM_UUID, false, false);
+                              null, null, null, null, null, SLOW_MOVEMENT_REPLICATION_THROTTLE, null, true, RANDOM_UUID, false, false);
     return executor;
   }
 
@@ -965,7 +968,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
     executor.setGeneratingProposalsForExecution(RANDOM_UUID, ExecutorTest.class::getSimpleName, isTriggeredByUserRequest);
     executor.executeProposals(proposalsToExecute, Collections.emptySet(), null, mockLoadMonitor, null, null,
                               null, null, null, null, null,
-                              replicationThrottle, isTriggeredByUserRequest, RANDOM_UUID, false, false);
+                              replicationThrottle, null, isTriggeredByUserRequest, RANDOM_UUID, false, false);
 
     if (verifyProgress) {
       verifyOngoingPartitionReassignments(Collections.singleton(TP0));

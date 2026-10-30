@@ -35,6 +35,7 @@ import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.ACCEPT;
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.REPLICA_REJECT;
 import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.aliveBrokersForIntraBrokerGoal;
 import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.averageDiskUtilizationPercentage;
+import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.computeResourceUtilizationBalanceThreshold;
 import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.diskUtilizationPercentage;
 import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.replicaSortName;
 import static java.lang.Math.abs;
@@ -99,7 +100,13 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
   }
 
   /**
-   * Initialize the utilization thresholds (see {@link #balancePercentageWithMargin(BalancingConstraint)}).
+   * Initialize the utilization thresholds of each broker around the average utilization of its disks.
+   * To avoid churns, we add a balance margin to the user specified rebalance threshold. e.g. when user sets the
+   * threshold to be resourceBalancePercentage, we use (resourceBalancePercentage-1)*balanceMargin instead.
+   * As the inter-broker resource distribution goals do, the threshold is (1) multiplied by the goal violation distribution
+   * threshold multiplier if the optimization is triggered by goal violation, and (2) more lenient for brokers whose average
+   * disk utilization is not above the low utilization threshold. See
+   * {@link GoalUtils#computeResourceUtilizationBalanceThreshold(double, Resource, BalancingConstraint, boolean, double, boolean)}.
    * @param clusterModel The state of the cluster.
    * @param optimizationOptions Options to take into account during optimization.
    */
@@ -108,14 +115,17 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
     _requestedBrokerIds = optimizationOptions.requestedDestinationBrokerIds();
     // Thresholds are per-request: a request limited to some brokers must not inherit entries left by an earlier,
     // wider one, because Broker#equals is on the broker id and stale keys would match. actionAcceptance() relies on
-    // the absence of a broker from these maps to mean that the broker is not balanced by this goal.
+    // the absence of a broker from these maps to mean that the broker is not balanced by this goal. The same goal instance
+    // may also be optimized multiple times (e.g. by the goal violation detector).
     _balanceUpperThresholdByBroker.clear();
     _balanceLowerThresholdByBroker.clear();
-    double balancePercentageWithMargin = balancePercentageWithMargin(_balancingConstraint);
+    boolean isTriggeredByGoalViolation = optimizationOptions.isTriggeredByGoalViolation();
     for (Broker broker : brokersToBalance(clusterModel)) {
       double averageDiskUtilization = averageDiskUtilizationPercentage(broker);
-      _balanceUpperThresholdByBroker.put(broker, averageDiskUtilization * (1 + balancePercentageWithMargin));
-      _balanceLowerThresholdByBroker.put(broker, averageDiskUtilization * Math.max(0, (1 - balancePercentageWithMargin)));
+      _balanceUpperThresholdByBroker.put(broker, computeResourceUtilizationBalanceThreshold(
+          averageDiskUtilization, RESOURCE, _balancingConstraint, isTriggeredByGoalViolation, BALANCE_MARGIN, false));
+      _balanceLowerThresholdByBroker.put(broker, computeResourceUtilizationBalanceThreshold(
+          averageDiskUtilization, RESOURCE, _balancingConstraint, isTriggeredByGoalViolation, BALANCE_MARGIN, true));
     }
 
     // Sort all the replicas for each disk based on disk utilization.
