@@ -65,6 +65,7 @@ public final class PersistedExecutionState {
   private final Long _replicationThrottle;
   private final boolean _kafkaAssignerMode;
   private final boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+  private final boolean _replicationThrottleAdjustmentDisabled;
   private final boolean _replicationThrottleAdjusted;
   private final boolean _cleanupOnly;
   private final ReplicaPlacementFingerprint _outsideExecutionFingerprint;
@@ -95,6 +96,7 @@ public final class PersistedExecutionState {
     _replicationThrottle = builder._replicationThrottle;
     _kafkaAssignerMode = builder._kafkaAssignerMode;
     _skipInterBrokerReplicaConcurrencyAdjustment = builder._skipInterBrokerReplicaConcurrencyAdjustment;
+    _replicationThrottleAdjustmentDisabled = builder._replicationThrottleAdjustmentDisabled;
     _replicationThrottleAdjusted = builder._replicationThrottleAdjusted;
     _cleanupOnly = builder._cleanupOnly;
     _outsideExecutionFingerprint = builder._outsideExecutionFingerprint;
@@ -138,6 +140,7 @@ public final class PersistedExecutionState {
         .replicationThrottle(_replicationThrottle)
         .kafkaAssignerMode(_kafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(_skipInterBrokerReplicaConcurrencyAdjustment)
+        .replicationThrottleAdjustmentDisabled(_replicationThrottleAdjustmentDisabled)
         .replicationThrottleAdjusted(_replicationThrottleAdjusted)
         .cleanupOnly(_cleanupOnly)
         .outsideExecutionFingerprint(_outsideExecutionFingerprint)
@@ -245,6 +248,14 @@ public final class PersistedExecutionState {
   }
 
   /**
+   * @return whether replication throttle adjustment was disabled during the execution (decision D2): a resumed execution
+   * disables it again, so that the replication throttle of the execution holds.
+   */
+  public boolean replicationThrottleAdjustmentDisabled() {
+    return _replicationThrottleAdjustmentDisabled;
+  }
+
+  /**
    * @return whether the concurrency adjuster managed the replication throttle of the execution (per-broker rates that differ
    * from the replication throttle, or a throttle without one), see PR #13.
    */
@@ -323,6 +334,7 @@ public final class PersistedExecutionState {
     private Long _replicationThrottle;
     private boolean _kafkaAssignerMode;
     private boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+    private boolean _replicationThrottleAdjustmentDisabled;
     private boolean _replicationThrottleAdjusted;
     private boolean _cleanupOnly;
     private ReplicaPlacementFingerprint _outsideExecutionFingerprint;
@@ -512,6 +524,16 @@ public final class PersistedExecutionState {
      */
     public Builder skipInterBrokerReplicaConcurrencyAdjustment(boolean skip) {
       _skipInterBrokerReplicaConcurrencyAdjustment = skip;
+      return this;
+    }
+
+    /**
+     * @param replicationThrottleAdjustmentDisabled Whether replication throttle adjustment was disabled during the execution
+     * (decision D2): a resumed execution disables it again, so that the replication throttle of the execution holds.
+     * @return This builder.
+     */
+    public Builder replicationThrottleAdjustmentDisabled(boolean replicationThrottleAdjustmentDisabled) {
+      _replicationThrottleAdjustmentDisabled = replicationThrottleAdjustmentDisabled;
       return this;
     }
 

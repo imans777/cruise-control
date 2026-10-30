@@ -756,6 +756,60 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
   }
 
   @Test
+  public void testRuntimeThrottleChangesArePersisted() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    // Stale metadata keeps the movement in progress for the executor, so that the execution lasts until it is stopped.
+    Node[] nodes = {new Node(0, "h0", 9092), new Node(1, "h1", 9092), new Node(2, "h2", 9092)};
+    Cluster staleCluster = new Cluster("cluster", Arrays.asList(nodes),
+                                       Collections.singleton(new PartitionInfo(TOPIC, 0, nodes[0], new Node[]{nodes[0], nodes[1]},
+                                                                               new Node[]{nodes[0], nodes[1]})),
+                                       Collections.emptySet(), Collections.emptySet());
+    MetadataAdminClient staleMetadataClient = EasyMock.mock(MetadataAdminClient.class);
+    EasyMock.expect(staleMetadataClient.cluster()).andReturn(staleCluster).anyTimes();
+    EasyMock.replay(staleMetadataClient);
+    Executor executor = newExecutor(false, staleMetadataClient, new RecordingNotifier(), mockAnomalyDetectorManager(true));
+    executor.setGeneratingProposalsForExecution(UUID, () -> REASON, false);
+    executor.executeProposals(List.of(proposal(TP0, List.of(0, 1), List.of(0, 2))), Collections.emptySet(), null, mockLoadMonitor(),
+                              null, null, null, null, null, null, null, 100_000L, null, false, UUID, false, false);
+    waitUntilTrue(() -> _store.state() != null && onlyTask(_store.state()).state() == ExecutionTaskState.IN_PROGRESS,
+                  "The task is not persisted as in progress", WAIT_TIME_MS, 100L);
+    assertEquals(Long.valueOf(100_000L), _store.state().replicationThrottle());
+
+    // A replication throttle changed by an admin request (PR #17) is what a resumed execution uses.
+    assertTrue(executor.updateOngoingExecutionReplicationThrottle(200_000L));
+    assertEquals(Long.valueOf(200_000L), _store.state().replicationThrottle());
+    // Switching the adjustment off during the execution (decision D2) is persisted too, as is switching it on.
+    boolean adjusterEnabled = executor.setReplicationThrottleAdjusterEnabled(false);
+    assertTrue(_store.state().replicationThrottleAdjustmentDisabled());
+    executor.setReplicationThrottleAdjusterEnabled(true);
+    assertFalse(_store.state().replicationThrottleAdjustmentDisabled());
+    assertTrue(_store.state().replicationThrottleAdjusted());
+    executor.setReplicationThrottleAdjusterEnabled(adjusterEnabled);
+
+    executor.userTriggeredStopExecution(false);
+    waitForExecutionToFinish(executor);
+    assertNull(_store.state());
+  }
+
+  @Test
+  public void testResumeDisablesReplicationThrottleAdjustmentAgain() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal pending = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    // The operator switched the adjustment off during the interrupted execution, so that its replication throttle holds (D2).
+    _store.save(interruptedExecutionState(100_000L, List.of(pending)).toBuilder().replicationThrottleAdjustmentDisabled(true).build());
+
+    Properties overrides = new Properties();
+    overrides.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_CONFIG, "true");
+    Executor executor = newExecutor(true, null, new RecordingNotifier(), mockAnomalyDetectorManager(null), overrides);
+    assertTrue(executor.isReplicationThrottleAdjusterEnabled());
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitForExecutionToFinish(executor);
+    // The restart reverted the switch to the config; the resumed execution switched it off again.
+    assertFalse(executor.isReplicationThrottleAdjusterEnabled());
+    assertEquals(List.of(0, 2), currentReplicas(0));
+  }
+
+  @Test
   public void testResumeIsRefusedIfReplicasOutsideTheExecutionMoved() throws Exception {
     createTopic(Map.of(0, List.of(0, 1), 1, List.of(2, 1)));
     ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));

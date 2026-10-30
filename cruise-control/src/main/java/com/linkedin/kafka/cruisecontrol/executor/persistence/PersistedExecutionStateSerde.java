@@ -56,6 +56,7 @@ public final class PersistedExecutionStateSerde {
   static final String REPLICATION_THROTTLE = "replicationThrottle";
   static final String KAFKA_ASSIGNER_MODE = "kafkaAssignerMode";
   static final String SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT = "skipInterBrokerReplicaConcurrencyAdjustment";
+  static final String REPLICATION_THROTTLE_ADJUSTMENT_DISABLED = "replicationThrottleAdjustmentDisabled";
   static final String REPLICATION_THROTTLE_ADJUSTED = "replicationThrottleAdjusted";
   static final String PROPOSALS = "proposals";
   static final String TOPIC = "topic";
@@ -132,6 +133,7 @@ public final class PersistedExecutionStateSerde {
     json.name(REPLICATION_THROTTLE).value(state.replicationThrottle());
     json.name(KAFKA_ASSIGNER_MODE).value(state.kafkaAssignerMode());
     json.name(SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).value(state.skipInterBrokerReplicaConcurrencyAdjustment());
+    json.name(REPLICATION_THROTTLE_ADJUSTMENT_DISABLED).value(state.replicationThrottleAdjustmentDisabled());
     json.name(REPLICATION_THROTTLE_ADJUSTED).value(state.replicationThrottleAdjusted());
     json.endObject();
 
@@ -219,6 +221,7 @@ public final class PersistedExecutionStateSerde {
              .replicationThrottle(optionalLong(parameters, REPLICATION_THROTTLE))
              .kafkaAssignerMode(required(parameters, KAFKA_ASSIGNER_MODE).getAsBoolean())
              .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean())
+             .replicationThrottleAdjustmentDisabled(optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTMENT_DISABLED))
              .replicationThrottleAdjusted(optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTED));
       // Fields added in version 2 are optional, so that a version 1 state can still be recovered (but not resumed).
       JsonElement cleanupOnly = optional(root, CLEANUP_ONLY);

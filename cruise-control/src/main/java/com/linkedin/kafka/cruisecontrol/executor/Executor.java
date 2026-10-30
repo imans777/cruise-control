@@ -1624,6 +1624,15 @@ public class Executor {
   public boolean setReplicationThrottleAdjusterEnabled(boolean isReplicationThrottleAdjusterEnabled) {
     boolean oldValue = _replicationThrottleAdjusterEnabled;
     _replicationThrottleAdjusterEnabled = isReplicationThrottleAdjusterEnabled;
+    if (_hasOngoingExecution) {
+      // A resumed execution switches the adjustment off again (D2); once the adjuster has managed the throttle, the per-broker rates
+      // no longer match a single value (see (Integration PR#15 -> PR#13)).
+      persistExecutionParameterChange(state -> state.toBuilder()
+                                                    .replicationThrottleAdjustmentDisabled(!isReplicationThrottleAdjusterEnabled)
+                                                    .replicationThrottleAdjusted(state.replicationThrottleAdjusted()
+                                                                                 || isReplicationThrottleAdjusterEnabled)
+                                                    .build());
+    }
     if (!isReplicationThrottleAdjusterEnabled) {
       // The concurrency adjuster checks this flag under the update lock before applying updates, so once the lock is available, no
       // update is in progress and none will be applied.
@@ -1988,6 +1997,7 @@ public class Executor {
     }
     LOG.info("Replication throttle of the ongoing execution is updated to {} bytes/sec.", newThrottleRate);
     _operatorReplicationThrottle = newThrottleRate;
+    persistExecutionParameterChange(state -> state.toBuilder().replicationThrottle(newThrottleRate).build());
     return true;
   }
 
@@ -2025,6 +2035,7 @@ public class Executor {
     _operatorReplicationThrottle = null;
     if (removed) {
       LOG.info("Replication throttle of the ongoing execution is removed.");
+      persistExecutionParameterChange(state -> state.toBuilder().replicationThrottle(null).build());
       return DynamicThrottleResult.REMOVED;
     }
     return DynamicThrottleResult.NOT_THROTTLED;
@@ -2241,6 +2252,25 @@ public class Executor {
         }
       }
     }
+  }
+
+  /**
+   * Persist a change of the parameters of the ongoing execution right away -- e.g. a replication throttle changed by an admin
+   * request (PR #17) -- so that an execution resumed after a restart uses it rather than the value the execution started with.
+   *
+   * @param change Applies the change to the persisted state of the ongoing execution.
+   */
+  private void persistExecutionParameterChange(Function<PersistedExecutionState, PersistedExecutionState> change) {
+    synchronized (_executionStateStoreLock) {
+      PersistedExecutionState executionStateToPersist = _executionStateToPersist;
+      if (executionStateToPersist == null) {
+        return;
+      }
+      _executionStateToPersist = change.apply(executionStateToPersist);
+      // Persist even if no task has changed since the last checkpoint.
+      _lastPersistedTaskStateVersion = -1L;
+    }
+    checkpointExecutionState();
   }
 
   /**
@@ -2807,6 +2837,13 @@ public class Executor {
                                                                            adoptedProposals));
     }
 
+    if (state.replicationThrottleAdjustmentDisabled() && _replicationThrottleAdjusterEnabled) {
+      // Decision D2: the operator switched the adjustment off during the execution, so that its replication throttle holds. A restart
+      // reverts the switch to the config; the resumed execution switches it off again (it stays off until switched on).
+      LOG.info("Interrupted execution {}: Replication throttle adjustment was disabled during the execution -- disabling it again, so "
+               + "that the replication throttle of the execution ({} bytes/sec) holds.", state.uuid(), state.replicationThrottle());
+      setReplicationThrottleAdjusterEnabled(false);
+    }
     setGeneratingProposalsForExecution(state.uuid(), () -> ExecutionRecoveryUtils.resumedReason(state.reason()), false);
     _recoveryPlanToResume = recoveryPlan;
     try {
