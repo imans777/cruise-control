@@ -908,6 +908,31 @@ public class Executor {
     }
 
     /**
+     * Get what a throttle-aware replica movement strategy needs to admit inter-broker replica movements while replication throttle
+     * adjustment is enabled: the throttle that a new replica of each partition needs, including the escalation of movements that made
+     * no progress at it, and the throttle that the in-progress movements need on each broker -- the floor of its throttles, which also
+     * covers the replicas they keep that fell out of the ISR (see {@link ExecutionUtils#neededReplicationThrottles}). Movements are
+     * admitted against the live throttle of each broker: the adjuster raises a throttle only while the movements through it fill it,
+     * and charging each movement its need keeps the need floor from making room for more movements.
+     *
+     * @param neededThrottleByPartition A map to populate with the throttle (bytes/sec) that a new replica of each partition needs.
+     * @param neededLeaderThrottleByBroker A map to populate with the leader throttle (bytes/sec) needed by the in-progress movements of
+     *                                     each broker.
+     * @param neededFollowerThrottleByBroker A map to populate with the follower throttle (bytes/sec) needed by the in-progress movements
+     *                                       of each broker.
+     */
+    synchronized void admissionInputs(Map<TopicPartition, Double> neededThrottleByPartition,
+                                      Map<Integer, Long> neededLeaderThrottleByBroker,
+                                      Map<Integer, Long> neededFollowerThrottleByBroker) {
+      Map<TopicPartition, Double> writeRateKBpsByPartition = partitionWriteRatesKBps(_loadMonitor.currentPartitionMetricValues(),
+                                                                                     _lastKnownWriteRateKBpsByPartition);
+      Map<TopicPartition, Long> escalatedNeedByPartition = escalatedNeeds();
+      neededThrottleByPartition.putAll(neededReplicationThrottleByPartition(writeRateKBpsByPartition, escalatedNeedByPartition));
+      neededReplicationThrottles(inExecutionTasks(), writeRateKBpsByPartition, _metadataClient.cluster(), escalatedNeedByPartition,
+                                 neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+    }
+
+    /**
      * @return The escalated throttle (bytes/sec) needed for each new replica, by partition of the escalated movements.
      */
     private Map<TopicPartition, Long> escalatedNeeds() {
@@ -2611,16 +2636,41 @@ public class Executor {
     /**
      * Get the replication throttle budget of brokers based on the inter-broker replica movements in progress and the current
      * write rate of partitions, which is used if the replica movement strategy contains
-     * ThrottleAwareReplicaMovementStrategy.
+     * ThrottleAwareReplicaMovementStrategy. Each broker side is budgeted at its current replication throttle (which the concurrency adjuster may
+     * change during the execution). While replication throttle adjustment is enabled, each
+     * movement is charged the throttle that the adjuster gives it, and the in-progress movements the throttle the adjuster keeps for
+     * them -- see {@link ConcurrencyAdjuster#admissionInputs(Map, Map, Map)}; otherwise, each movement is charged the write rate of
+     * its partition with {@link ExecutorConfig#REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG}.
      *
-     * @return The replication throttle budget of brokers, or {@code null} if the execution has no replication throttle or its
-     * replica movement strategy is not throttle-aware.
+     * @return The replication throttle budget of brokers, or {@code null} if the execution has no replication throttle (and
+     * replication throttle adjustment is disabled) or its replica movement strategy is not throttle-aware.
      */
     private ReplicationThrottleBudget replicationThrottleBudget() {
-      if (_replicationThrottle == null || !_executionTaskManager.isThrottleAware()) {
+      if (!_executionTaskManager.isThrottleAware()) {
         return null;
       }
       Cluster cluster = _metadataClient.cluster();
+      ReplicationThrottleHelper throttleHelper = _replicationThrottleHelper;
+      if (_replicationThrottleAdjusterEnabled && throttleHelper != null && throttleHelper.throttlingEnabled()) {
+        // Admit movements against the live throttle of each broker: the adjuster starts it at a fraction of the network headroom, and
+        // raises it only while the movements through it fill it. Charge each movement the need the adjuster will give it, and reserve
+        // the need of the in-progress movements, which the adjuster keeps as a floor.
+        Map<TopicPartition, Double> neededThrottleByPartition = new HashMap<>();
+        Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
+        Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
+        _concurrencyAdjuster.admissionInputs(neededThrottleByPartition, neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+        ReplicationThrottleBudget budget = new ReplicationThrottleBudget(Collections.emptyList(), neededThrottleByPartition,
+                                                                         task -> currentLeader(cluster, task),
+                                                                         throttleHelper::leaderThrottleRate,
+                                                                         throttleHelper::followerThrottleRate, 0.0);
+        budget.reserve(neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+        LOG.debug("Admitting inter-broker replica movements against the replication throttles of brokers, with the in-progress "
+                  + "movements needing (leader: {}, follower: {} bytes/sec).", neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+        return budget;
+      }
+      if (_replicationThrottle == null) {
+        return null;
+      }
       return new ReplicationThrottleBudget(_executionTaskManager.inExecutionTasks(Collections.singleton(INTER_BROKER_REPLICA_ACTION)),
                                            _partitionWriteRateCache.writeRatesInBytesPerSec(), task -> currentLeader(cluster, task),
                                            brokerId -> _replicationThrottle, brokerId -> _replicationThrottle,

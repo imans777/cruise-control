@@ -126,6 +126,23 @@ public class ReplicationThrottleBudgetTest {
   }
 
   @Test
+  public void testReserveRatesByBroker() {
+    // The concurrency adjuster keeps 70 on the leader side of broker 0 and 60 on the follower side of broker 2 for the in-progress
+    // movements -- e.g. including a replica they keep that fell out of the ISR, which no task adds.
+    ReplicationThrottleBudget budget = budget(Collections.emptyList(), 0.0);
+    budget.reserve(Map.of(0, 70L), Map.of(2, 60L));
+    // 70 + 40 > 100 on the leader side of broker 0.
+    assertFalse(budget.fits(task(40.0, _r0, List.of(_r0), List.of(_r0, _r1))));
+    // 70 + 30 <= 100 on the leader side of broker 0.
+    assertTrue(budget.fits(task(30.0, _r0, List.of(_r0), List.of(_r0, _r1))));
+    // 60 + 50 > 100 on the follower side of broker 2, and the side is not idle: no exception for idle broker sides.
+    assertFalse(budget.fits(task(50.0, _r1, List.of(_r1), List.of(_r1, _r2)), true));
+    // The rates add up with reserved tasks.
+    budget.reserve(task(30.0, _r0, List.of(_r0), List.of(_r0, _r1)));
+    assertFalse(budget.fits(task(1.0, _r0, List.of(_r0), List.of(_r0, _r3))));
+  }
+
+  @Test
   public void testPartitionWithoutWriteRate() {
     ExecutionTask inProgress = inProgress(task(80.0, _r0, List.of(_r0), List.of(_r0, _r1)));
     ReplicationThrottleBudget budget = budget(List.of(inProgress), 0.2);
