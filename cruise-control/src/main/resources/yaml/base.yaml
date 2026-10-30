@@ -60,6 +60,8 @@ paths:
     $ref: 'endpoints/userTasks.yaml#/UserTasksEndpoint'
   /remove_disks:
     $ref: 'endpoints/removeDisks.yaml#/RemoveDisksEndpoint'
+  /reassign_partitions:
+    $ref: 'endpoints/reassignPartitions.yaml#/ReassignPartitionsEndpoint'
 components:
   securitySchemes:
     basicAuth:

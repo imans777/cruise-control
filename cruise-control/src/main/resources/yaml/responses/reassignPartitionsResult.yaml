@@ -1,0 +1,197 @@
+ReassignPartitionsResult:
+  type: object
+  required:
+    - dryRun
+    - executionStarted
+    - summary
+    - partitions
+    - impactAnalysis
+    - version
+  properties:
+    dryRun:
+      type: boolean
+    executionStarted:
+      type: boolean
+    summary:
+      $ref: '#/ReassignPartitionsSummary'
+    partitions:
+      type: array
+      items:
+        $ref: '#/PartitionReassignmentDetails'
+    impactAnalysis:
+      $ref: '#/ReassignmentImpact'
+    version:
+      type: integer
+      format: int32
+
+ReassignPartitionsSummary:
+  type: object
+  required:
+    - numPartitionsRequested
+    - numPartitionsUnchanged
+    - numInterBrokerReplicaMovements
+    - numReplicaOrderChanges
+    - numIntraBrokerReplicaMovements
+    - numLeaderMovements
+    - numReplicationFactorChanges
+    - interBrokerDataToMoveMB
+    - intraBrokerDataToMoveMB
+  properties:
+    numPartitionsRequested:
+      type: integer
+      format: int32
+    numPartitionsUnchanged:
+      type: integer
+      format: int32
+    numInterBrokerReplicaMovements:
+      type: integer
+      format: int32
+    numReplicaOrderChanges:
+      type: integer
+      format: int32
+    numIntraBrokerReplicaMovements:
+      type: integer
+      format: int32
+    numLeaderMovements:
+      type: integer
+      format: int32
+    numReplicationFactorChanges:
+      type: integer
+      format: int32
+    interBrokerDataToMoveMB:
+      type: integer
+      format: int64
+    intraBrokerDataToMoveMB:
+      type: integer
+      format: int64
+
+PartitionReassignmentDetails:
+  type: object
+  required:
+    - topic
+    - partition
+    - currentReplicas
+    - currentLeader
+    - currentLogDirs
+    - newReplicas
+    - newLeader
+    - newLogDirs
+    - actions
+    - dataToMoveMB
+  properties:
+    topic:
+      type: string
+    partition:
+      type: integer
+      format: int32
+    currentReplicas:
+      type: array
+      items:
+        type: integer
+        format: int32
+    currentLeader:
+      type: integer
+      format: int32
+    currentLogDirs:
+      type: array
+      items:
+        type: string
+    newReplicas:
+      type: array
+      items:
+        type: integer
+        format: int32
+    newLeader:
+      type: integer
+      format: int32
+    newLogDirs:
+      type: array
+      items:
+        type: string
+    actions:
+      type: array
+      items:
+        type: string
+        enum:
+          - "NO_CHANGE"
+          - "REPLICA_SET_CHANGE"
+          - "REPLICATION_FACTOR_CHANGE"
+          - "REPLICA_ORDER_CHANGE"
+          - "INTRA_BROKER_REPLICA_MOVEMENT"
+          - "LEADERSHIP_MOVEMENT"
+    dataToMoveMB:
+      type: integer
+      format: int64
+    warnings:
+      type: array
+      items:
+        type: string
+
+ReassignmentImpact:
+  type: object
+  required:
+    - status
+  properties:
+    status:
+      type: string
+      enum:
+        - "COMPLETED"
+        - "UNAVAILABLE"
+        - "NOT_NEEDED"
+    reason:
+      type: string
+    notes:
+      type: array
+      items:
+        type: string
+    goals:
+      type: array
+      items:
+        type: string
+    onDemandBalancednessScoreBefore:
+      type: number
+      format: double
+    onDemandBalancednessScoreAfter:
+      type: number
+      format: double
+    goalSummary:
+      type: array
+      items:
+        $ref: '#/GoalImpact'
+    clusterModelStatsBefore:
+      $ref: './clusterModelStats.yaml#/ClusterModelStats'
+    clusterModelStatsAfter:
+      $ref: './clusterModelStats.yaml#/ClusterModelStats'
+    loadBeforeReassignment:
+      $ref: './brokerStats.yaml#/BrokerStats'
+    loadAfterReassignment:
+      $ref: './brokerStats.yaml#/BrokerStats'
+    partitionsNotModeled:
+      type: array
+      items:
+        type: string
+
+GoalImpact:
+  type: object
+  required:
+    - goal
+    - hardGoal
+    - violatedBefore
+    - violatedAfter
+    - status
+  properties:
+    goal:
+      type: string
+    hardGoal:
+      type: boolean
+    violatedBefore:
+      type: boolean
+    violatedAfter:
+      type: boolean
+    status:
+      type: string
+      enum:
+        - "OK"
+        - "VIOLATION_INTRODUCED"
+        - "VIOLATION_FIXED"
+        - "STILL_VIOLATED"

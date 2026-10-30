@@ -131,6 +131,20 @@ public class OptimizerResult {
   }
 
   /**
+   * @return On-demand balancedness score before the optimization -- i.e. the balancedness score of the original cluster model.
+   */
+  public double onDemandBalancednessScoreBefore() {
+    return _onDemandBalancednessScoreBefore;
+  }
+
+  /**
+   * @return On-demand balancedness score after the optimization.
+   */
+  public double onDemandBalancednessScoreAfter() {
+    return _onDemandBalancednessScoreAfter;
+  }
+
+  /**
    * @return Cluster model stats comparator by goal names.
    */
   public Map<String, Goal.ClusterModelStatsComparator> clusterModelStatsComparatorByGoalName() {
