@@ -109,14 +109,15 @@ a batch of tasks is submitted to Kafka (so that every task that Kafka may be exe
 finishes, and at least every `executor.state.checkpoint.interval.ms` while nothing changes. The state is deleted once the execution
 finishes (i.e. completes, is stopped, or fails), and retained if Cruise Control is shut down or crashes during the execution. With
 `resume.interrupted.execution.on.startup` enabled, a graceful shutdown leaves the in-flight movements and their throttles to Kafka, as
-a crash would, so that the restart adopts them. The state also carries runtime changes made with the `admin` endpoint and the user
-task that started the execution.
+a crash would, so that the restart adopts them. The state also carries what the concurrency adjuster changed (per-broker replication
+throttles and concurrency), runtime changes made with the `admin` endpoint, and the user task that started the execution.
 
 Upon startup, Cruise Control reconciles the persisted state (if any) with the current state of the cluster -- e.g. a task that was in
 progress is checked for whether Kafka is still executing it, has completed it, or has not started it. Then, it either resumes the
 remaining tasks of the interrupted execution (see `resume.interrupted.execution.on.startup`) -- monitoring the tasks that Kafka is still
-executing rather than submitting them again, and reported under the same user task -- or cleans it up: it waits for the in-flight
-tasks to finish and removes the replication throttles left behind by the interrupted execution.
+executing rather than submitting them again, continuing from the throttles and the concurrency in force before the restart, and reported
+under the same user task -- or cleans it up: it waits for the in-flight tasks to finish and removes the replication throttles left
+behind by the interrupted execution.
 
 An interrupted execution is resumed only if the cluster is as the execution left it. It is cleaned up instead if it was last checkpointed
 longer ago than `resume.interrupted.execution.max.age.ms`, if it was resumed `resume.interrupted.execution.max.count` times in a row

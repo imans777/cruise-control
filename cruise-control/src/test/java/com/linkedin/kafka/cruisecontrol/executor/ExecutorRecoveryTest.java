@@ -16,6 +16,7 @@ import com.linkedin.kafka.cruisecontrol.config.constants.MonitorConfig;
 import com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorManager;
 import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.ExecutionStateStore;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedAdjusterState;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedExecutionState;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedExecutionStateSerde;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedTask;
@@ -743,6 +744,28 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
   }
 
   @Test
+  public void testRecoveryRemovesThrottlesSetByTheConcurrencyAdjuster() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    // An execution without a replication throttle, which the concurrency adjuster throttled with per-broker rates (PR #13).
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, 100_000L);
+    throttleHelper.setThrottles(List.of(proposal));
+    throttleHelper.updateThrottleRates(1, 200_000L, 300_000L);
+    assertTrue(hasThrottles());
+    _store.save(interruptedExecutionState(null, List.of(proposal)).toBuilder().replicationThrottleAdjusted(true).build());
+
+    AnomalyDetectorManager anomalyDetectorManager = mockAnomalyDetectorManager(null);
+    Executor executor = newExecutor(false, null, new RecordingNotifier(), anomalyDetectorManager);
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitUntilTrue(() -> _store.state() == null, "The interrupted execution is not cleaned up", WAIT_TIME_MS, 100L);
+    waitForExecutionToFinish(executor);
+    // No replication throttle was persisted, but the execution was throttled: its rates -- whatever their per-broker values -- and
+    // its throttled replicas are removed.
+    assertFalse(hasThrottles());
+    EasyMock.verify(anomalyDetectorManager);
+  }
+
+  @Test
   public void testResumeIsRefusedIfReplicasOutsideTheExecutionMoved() throws Exception {
     createTopic(Map.of(0, List.of(0, 1), 1, List.of(2, 1)));
     ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
@@ -868,6 +891,35 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
   }
 
   /**
+   * @return A load monitor mock for executions whose replication throttle the concurrency adjuster adjusts: broker capacities are not
+   * available, so the brokers start at the default throttle of the adjuster.
+   */
+  private static LoadMonitor mockLoadMonitorForAdjuster() throws Exception {
+    LoadMonitor loadMonitor = EasyMock.mock(LoadMonitor.class);
+    EasyMock.expect(loadMonitor.samplingMode()).andReturn(ALL).anyTimes();
+    EasyMock.expect(loadMonitor.deadBrokersWithReplicas(anyLong())).andReturn(new HashSet<>()).anyTimes();
+    EasyMock.expect(loadMonitor.brokersWithReplicas(anyLong())).andReturn(Set.of(0, 1, 2)).anyTimes();
+    EasyMock.expect(loadMonitor.clusterCapacity()).andThrow(new java.util.concurrent.TimeoutException("no capacity")).anyTimes();
+    loadMonitor.pauseMetricSampling(isA(String.class), EasyMock.anyBoolean());
+    expectLastCall().anyTimes();
+    loadMonitor.setSamplingMode(ONGOING_EXECUTION);
+    expectLastCall().anyTimes();
+    loadMonitor.resumeMetricSampling(isA(String.class));
+    expectLastCall().anyTimes();
+    loadMonitor.setSamplingMode(ALL);
+    expectLastCall().anyTimes();
+    EasyMock.replay(loadMonitor);
+    return loadMonitor;
+  }
+
+  private static Properties adjusterOverrides() {
+    Properties overrides = new Properties();
+    overrides.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_CONFIG, "true");
+    overrides.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG, "false");
+    return overrides;
+  }
+
+  /**
    * Let the in-flight reassignment of {@link #TP0} complete by removing its throttles (an execution re-applies them as it moves
    * replicas), and wait for the given executor to finish its execution.
    *
@@ -972,6 +1024,44 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
   }
 
   @Test
+  public void testResumeContinuesFromTheAdjustedThrottlesAndConcurrency() throws Exception {
+    long throttle = 10_000L;
+    ExecutionProposal proposal = startThrottledReassignment(throttle);
+    // The adjuster (PR #13) had set per-broker rates and lowered the concurrency of broker 0 before the restart.
+    PersistedAdjusterState adjusterState = new PersistedAdjusterState(Map.of(0, 12_000L, 2, 13_000L), Map.of(0, 14_000L, 2, 15_000L),
+                                                                      Set.of(0), Set.of(2), Map.of(0, 1));
+    _store.save(interruptedExecutionState(null, List.of(proposal)).toBuilder()
+        .replicationThrottleAdjusted(true)
+        .adjusterState(adjusterState)
+                                                                     .build());
+    int numSavedStatesBeforeResume = _store.savedStates().size();
+    Executor executor = newExecutor(true, null, new RecordingNotifier(), mockAnomalyDetectorManager(null), adjusterOverrides());
+    executor.recoverInterruptedExecution(mockLoadMonitorForAdjuster());
+    assertEquals("RESUMED", recovery(executor).get("status"));
+    // The adopted movement is throttled at the rates from before the restart, not at the adjuster's start.
+    waitUntilTrue(() -> {
+      try {
+        return "12000".equals(brokerRate(0, ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG))
+               && "15000".equals(brokerRate(2, ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG));
+      } catch (Exception e) {
+        return false;
+      }
+    }, "The throttles from before the restart are not restored", WAIT_TIME_MS, 100L);
+    // The resumed execution persists them again, with the concurrency and the slow start from before.
+    PersistedAdjusterState resumedAdjusterState = _store.savedStates().get(numSavedStatesBeforeResume).adjusterState();
+    assertEquals(Map.of(0, 1), resumedAdjusterState.interBrokerConcurrencyByBroker());
+    assertEquals(Set.of(0), resumedAdjusterState.leaderSlowStartEndedBrokers());
+    assertEquals(Set.of(2), resumedAdjusterState.followerSlowStartEndedBrokers());
+    assertEquals(Long.valueOf(12_000L), resumedAdjusterState.leaderThrottleByBroker().get(0));
+    // Removing the throttles under the execution would race the verification of the ones it sets: stop it instead (rolls it back).
+    executor.userTriggeredStopExecution(false);
+    waitForExecutionToFinish(executor);
+    assertEquals(List.of(0, 1), currentReplicas(0));
+    assertNull(_store.state());
+    assertFalse(hasThrottles());
+  }
+
+  @Test
   public void testRuntimeConcurrencyChangesArePersisted() throws Exception {
     createTopic(Map.of(0, List.of(0, 1)));
     Executor executor = newExecutor(false, staleMetadataClient(), new RecordingNotifier(), mockAnomalyDetectorManager(true));
@@ -995,6 +1085,8 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     assertEquals(Integer.valueOf(4), state.brokerLeadershipMovementConcurrency());
     assertEquals(Integer.valueOf(20), state.maxInterBrokerPartitionMovements());
     assertEquals(Long.valueOf(5_000L), state.executionProgressCheckIntervalMs());
+    // All brokers are at the requested concurrency, so no per-broker concurrency is persisted.
+    assertTrue(state.adjusterState() == null || state.adjusterState().interBrokerConcurrencyByBroker().isEmpty());
     executor.setRequestedExecutionProgressCheckIntervalMs(null);
     executor.userTriggeredStopExecution(false);
     waitForExecutionToFinish(executor);

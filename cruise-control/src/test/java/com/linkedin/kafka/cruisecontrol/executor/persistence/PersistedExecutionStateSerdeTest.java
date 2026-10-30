@@ -62,6 +62,8 @@ public class PersistedExecutionStateSerdeTest {
         .replicaMovementStrategy("PostponeUrpReplicaMovementStrategy,BaseReplicaMovementStrategy")
         .replicationThrottle(1000000L)
         .skipInterBrokerReplicaConcurrencyAdjustment(true)
+        .replicationThrottleAdjusted(true)
+        .adjusterState(new PersistedAdjusterState(Map.of(0, 300L, 1, 400L), Map.of(1, 500L), Set.of(1), Set.of(0, 1), Map.of(2, 3)))
         .userTask(new PersistedUserTask("REBALANCE", "POST /kafkacruisecontrol/rebalance?dryrun=false", "127.0.0.1", 900L))
         .cleanupOnly(true)
         .outsideExecutionFingerprint(new ReplicaPlacementFingerprint(-42L, 7, Map.of(0, 5, 1, 9)))
@@ -110,6 +112,8 @@ public class PersistedExecutionStateSerdeTest {
     assertEquals(expected.replicationThrottle(), actual.replicationThrottle());
     assertEquals(expected.kafkaAssignerMode(), actual.kafkaAssignerMode());
     assertEquals(expected.skipInterBrokerReplicaConcurrencyAdjustment(), actual.skipInterBrokerReplicaConcurrencyAdjustment());
+    assertEquals(expected.replicationThrottleAdjusted(), actual.replicationThrottleAdjusted());
+    assertEquals(expected.adjusterState(), actual.adjusterState());
     assertEquals(expected.userTask(), actual.userTask());
     assertEquals(expected.cleanupOnly(), actual.cleanupOnly());
     assertEquals(expected.outsideExecutionFingerprint(), actual.outsideExecutionFingerprint());
@@ -157,6 +161,7 @@ public class PersistedExecutionStateSerdeTest {
     assertFalse(deserialized.cleanupOnly());
     assertNull(deserialized.outsideExecutionFingerprint());
     assertNull(deserialized.logDirFingerprintByBroker());
+    assertNull(deserialized.adjusterState());
     assertNull(deserialized.userTask());
   }
 

@@ -20,9 +20,11 @@ import java.io.UncheckedIOException;
 import java.io.Writer;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import org.apache.kafka.common.TopicPartition;
 
 
@@ -56,6 +58,13 @@ public final class PersistedExecutionStateSerde {
   static final String REPLICATION_THROTTLE = "replicationThrottle";
   static final String KAFKA_ASSIGNER_MODE = "kafkaAssignerMode";
   static final String SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT = "skipInterBrokerReplicaConcurrencyAdjustment";
+  static final String REPLICATION_THROTTLE_ADJUSTED = "replicationThrottleAdjusted";
+  static final String ADJUSTER = "adjuster";
+  static final String LEADER_THROTTLE_BY_BROKER = "leaderThrottleByBroker";
+  static final String FOLLOWER_THROTTLE_BY_BROKER = "followerThrottleByBroker";
+  static final String LEADER_SLOW_START_ENDED_BROKERS = "leaderSlowStartEndedBrokers";
+  static final String FOLLOWER_SLOW_START_ENDED_BROKERS = "followerSlowStartEndedBrokers";
+  static final String INTER_BROKER_CONCURRENCY_BY_BROKER = "interBrokerConcurrencyByBroker";
   static final String USER_TASK = "userTask";
   static final String END_POINT = "endPoint";
   static final String REQUEST = "request";
@@ -136,8 +145,23 @@ public final class PersistedExecutionStateSerde {
     json.name(REPLICATION_THROTTLE).value(state.replicationThrottle());
     json.name(KAFKA_ASSIGNER_MODE).value(state.kafkaAssignerMode());
     json.name(SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).value(state.skipInterBrokerReplicaConcurrencyAdjustment());
+    json.name(REPLICATION_THROTTLE_ADJUSTED).value(state.replicationThrottleAdjusted());
     json.endObject();
 
+    PersistedAdjusterState adjusterState = state.adjusterState();
+    if (adjusterState != null) {
+      json.name(ADJUSTER).beginObject();
+      writeLongs(json, LEADER_THROTTLE_BY_BROKER, adjusterState.leaderThrottleByBroker());
+      writeLongs(json, FOLLOWER_THROTTLE_BY_BROKER, adjusterState.followerThrottleByBroker());
+      writeIntegers(json, LEADER_SLOW_START_ENDED_BROKERS, adjusterState.leaderSlowStartEndedBrokers());
+      writeIntegers(json, FOLLOWER_SLOW_START_ENDED_BROKERS, adjusterState.followerSlowStartEndedBrokers());
+      json.name(INTER_BROKER_CONCURRENCY_BY_BROKER).beginObject();
+      for (Map.Entry<Integer, Integer> entry : adjusterState.interBrokerConcurrencyByBroker().entrySet()) {
+        json.name(String.valueOf(entry.getKey())).value(entry.getValue());
+      }
+      json.endObject();
+      json.endObject();
+    }
     PersistedUserTask userTask = state.userTask();
     if (userTask != null) {
       json.name(USER_TASK).beginObject();
@@ -234,7 +258,22 @@ public final class PersistedExecutionStateSerde {
              .replicaMovementStrategy(optionalString(parameters, REPLICA_MOVEMENT_STRATEGY))
              .replicationThrottle(optionalLong(parameters, REPLICATION_THROTTLE))
              .kafkaAssignerMode(required(parameters, KAFKA_ASSIGNER_MODE).getAsBoolean())
-             .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean());
+             .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean())
+             .replicationThrottleAdjusted(optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTED));
+      JsonElement adjuster = optional(root, ADJUSTER);
+      if (adjuster != null) {
+        JsonObject a = adjuster.getAsJsonObject();
+        Map<Integer, Integer> concurrencyByBroker = new TreeMap<>();
+        JsonElement concurrency = optional(a, INTER_BROKER_CONCURRENCY_BY_BROKER);
+        if (concurrency != null) {
+          concurrency.getAsJsonObject().entrySet().forEach(e -> concurrencyByBroker.put(Integer.parseInt(e.getKey()), e.getValue().getAsInt()));
+        }
+        builder.adjusterState(new PersistedAdjusterState(optionalLongs(a, LEADER_THROTTLE_BY_BROKER),
+                                                         optionalLongs(a, FOLLOWER_THROTTLE_BY_BROKER),
+                                                         new TreeSet<>(optionalIntegersOrEmpty(a, LEADER_SLOW_START_ENDED_BROKERS)),
+                                                         new TreeSet<>(optionalIntegersOrEmpty(a, FOLLOWER_SLOW_START_ENDED_BROKERS)),
+                                                         concurrencyByBroker));
+      }
       JsonElement userTask = optional(root, USER_TASK);
       if (userTask != null) {
         JsonObject u = userTask.getAsJsonObject();
@@ -423,6 +462,28 @@ public final class PersistedExecutionStateSerde {
     return replicas;
   }
 
+  private static void writeLongs(JsonWriter json, String name, Map<Integer, Long> valueByBroker) throws IOException {
+    json.name(name).beginObject();
+    for (Map.Entry<Integer, Long> entry : valueByBroker.entrySet()) {
+      json.name(String.valueOf(entry.getKey())).value(entry.getValue());
+    }
+    json.endObject();
+  }
+
+  private static Map<Integer, Long> optionalLongs(JsonObject json, String name) {
+    Map<Integer, Long> valueByBroker = new TreeMap<>();
+    JsonElement element = optional(json, name);
+    if (element != null) {
+      element.getAsJsonObject().entrySet().forEach(e -> valueByBroker.put(Integer.parseInt(e.getKey()), e.getValue().getAsLong()));
+    }
+    return valueByBroker;
+  }
+
+  private static List<Integer> optionalIntegersOrEmpty(JsonObject json, String name) {
+    List<Integer> values = optionalIntegers(json, name);
+    return values == null ? Collections.emptyList() : values;
+  }
+
   private static JsonElement required(JsonObject json, String name) {
     JsonElement element = json.get(name);
     if (element == null || element.isJsonNull()) {
@@ -444,6 +505,11 @@ public final class PersistedExecutionStateSerde {
   private static Integer optionalInteger(JsonObject json, String name) {
     JsonElement element = optional(json, name);
     return element == null ? null : element.getAsInt();
+  }
+
+  private static boolean optionalBoolean(JsonObject json, String name) {
+    JsonElement element = optional(json, name);
+    return element != null && element.getAsBoolean();
   }
 
   private static Long optionalLong(JsonObject json, String name) {

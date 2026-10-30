@@ -1166,6 +1166,22 @@ class ReplicationThrottleHelper {
   }
 
   /**
+   * @return The leader throttle rate (bytes/sec) set (or to set) per broker -- e.g. by the concurrency adjuster -- by broker id; brokers
+   * at the default rate of this helper are omitted.
+   */
+  SortedMap<Integer, Long> leaderThrottleRateByBroker() {
+    return new TreeMap<>(_leaderThrottleRateByBroker);
+  }
+
+  /**
+   * @return The follower throttle rate (bytes/sec) set (or to set) per broker, by broker id; brokers at the default rate of this helper
+   * are omitted.
+   */
+  SortedMap<Integer, Long> followerThrottleRateByBroker() {
+    return new TreeMap<>(_followerThrottleRateByBroker);
+  }
+
+  /**
    * @param brokerId Broker id.
    * @return The leader throttle rate (bytes/sec) that is (or will be) set on the given broker, or {@code null} if throttling is disabled.
    */

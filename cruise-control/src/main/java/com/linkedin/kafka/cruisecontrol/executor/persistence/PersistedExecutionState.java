@@ -65,6 +65,8 @@ public final class PersistedExecutionState {
   private final Long _replicationThrottle;
   private final boolean _kafkaAssignerMode;
   private final boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+  private final boolean _replicationThrottleAdjusted;
+  private final PersistedAdjusterState _adjusterState;
   private final PersistedUserTask _userTask;
   private final boolean _cleanupOnly;
   private final ReplicaPlacementFingerprint _outsideExecutionFingerprint;
@@ -95,6 +97,8 @@ public final class PersistedExecutionState {
     _replicationThrottle = builder._replicationThrottle;
     _kafkaAssignerMode = builder._kafkaAssignerMode;
     _skipInterBrokerReplicaConcurrencyAdjustment = builder._skipInterBrokerReplicaConcurrencyAdjustment;
+    _replicationThrottleAdjusted = builder._replicationThrottleAdjusted;
+    _adjusterState = builder._adjusterState;
     _userTask = builder._userTask;
     _cleanupOnly = builder._cleanupOnly;
     _outsideExecutionFingerprint = builder._outsideExecutionFingerprint;
@@ -138,6 +142,8 @@ public final class PersistedExecutionState {
         .replicationThrottle(_replicationThrottle)
         .kafkaAssignerMode(_kafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(_skipInterBrokerReplicaConcurrencyAdjustment)
+        .replicationThrottleAdjusted(_replicationThrottleAdjusted)
+        .adjusterState(_adjusterState)
         .userTask(_userTask)
         .cleanupOnly(_cleanupOnly)
         .outsideExecutionFingerprint(_outsideExecutionFingerprint)
@@ -245,6 +251,22 @@ public final class PersistedExecutionState {
   }
 
   /**
+   * @return whether the concurrency adjuster managed the replication throttle of the execution (per-broker rates that differ
+   * from the replication throttle, or a throttle without one), see PR #13.
+   */
+  public boolean replicationThrottleAdjusted() {
+    return _replicationThrottleAdjusted;
+  }
+
+  /**
+   * @return The state of the concurrency adjuster as of the latest checkpoint (per-broker replication throttles and concurrency), for
+   * a resumed execution to continue from, or {@code null} if the adjuster has not changed anything.
+   */
+  public PersistedAdjusterState adjusterState() {
+    return _adjusterState;
+  }
+
+  /**
    * @return The user task that started the execution, to report the resumed execution under it, or {@code null} if the execution was
    * not started by a user request (or it is not known).
    */
@@ -323,6 +345,8 @@ public final class PersistedExecutionState {
     private Long _replicationThrottle;
     private boolean _kafkaAssignerMode;
     private boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+    private boolean _replicationThrottleAdjusted;
+    private PersistedAdjusterState _adjusterState;
     private PersistedUserTask _userTask;
     private boolean _cleanupOnly;
     private ReplicaPlacementFingerprint _outsideExecutionFingerprint;
@@ -512,6 +536,25 @@ public final class PersistedExecutionState {
      */
     public Builder skipInterBrokerReplicaConcurrencyAdjustment(boolean skip) {
       _skipInterBrokerReplicaConcurrencyAdjustment = skip;
+      return this;
+    }
+
+    /**
+     * @param replicationThrottleAdjusted Whether the concurrency adjuster managed the replication throttle of the execution
+     * (per-broker rates that differ from the replication throttle, or a throttle without one), see PR #13.
+     * @return This builder.
+     */
+    public Builder replicationThrottleAdjusted(boolean replicationThrottleAdjusted) {
+      _replicationThrottleAdjusted = replicationThrottleAdjusted;
+      return this;
+    }
+
+    /**
+     * @param adjusterState The state of the concurrency adjuster, or {@code null} if it has not changed anything.
+     * @return This builder.
+     */
+    public Builder adjusterState(PersistedAdjusterState adjusterState) {
+      _adjusterState = adjusterState;
       return this;
     }
 
