@@ -20,6 +20,8 @@ import java.io.UncheckedIOException;
 import java.io.Writer;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -56,6 +58,7 @@ public final class PersistedExecutionStateSerde {
   static final String REPLICATION_THROTTLE = "replicationThrottle";
   static final String KAFKA_ASSIGNER_MODE = "kafkaAssignerMode";
   static final String SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT = "skipInterBrokerReplicaConcurrencyAdjustment";
+  static final String LOG_DIR_THROTTLE = "logDirThrottle";
   static final String REPLICATION_THROTTLE_ADJUSTMENT_DISABLED = "replicationThrottleAdjustmentDisabled";
   static final String REPLICATION_THROTTLE_ADJUSTED = "replicationThrottleAdjusted";
   static final String PROPOSALS = "proposals";
@@ -78,6 +81,9 @@ public final class PersistedExecutionStateSerde {
   static final String NUM_REPLICAS_BY_BROKER = "numReplicasByBroker";
   static final String LOGDIR_FINGERPRINT_BY_BROKER = "logDirFingerprintByBroker";
   static final String BROKERS = "brokers";
+  static final String LOG_DIR_THROTTLES = "logDirThrottles";
+  static final String ORIGINAL = "original";
+  static final String APPLIED = "applied";
 
   private PersistedExecutionStateSerde() {
   }
@@ -133,6 +139,7 @@ public final class PersistedExecutionStateSerde {
     json.name(REPLICATION_THROTTLE).value(state.replicationThrottle());
     json.name(KAFKA_ASSIGNER_MODE).value(state.kafkaAssignerMode());
     json.name(SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).value(state.skipInterBrokerReplicaConcurrencyAdjustment());
+    json.name(LOG_DIR_THROTTLE).value(state.logDirThrottle());
     json.name(REPLICATION_THROTTLE_ADJUSTMENT_DISABLED).value(state.replicationThrottleAdjustmentDisabled());
     json.name(REPLICATION_THROTTLE_ADJUSTED).value(state.replicationThrottleAdjusted());
     json.endObject();
@@ -221,6 +228,7 @@ public final class PersistedExecutionStateSerde {
              .replicationThrottle(optionalLong(parameters, REPLICATION_THROTTLE))
              .kafkaAssignerMode(required(parameters, KAFKA_ASSIGNER_MODE).getAsBoolean())
              .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean())
+             .logDirThrottle(optionalLong(parameters, LOG_DIR_THROTTLE))
              .replicationThrottleAdjustmentDisabled(optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTMENT_DISABLED))
              .replicationThrottleAdjusted(optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTED));
       // Fields added in version 2 are optional, so that a version 1 state can still be recovered (but not resumed).
@@ -276,6 +284,20 @@ public final class PersistedExecutionStateSerde {
    * @return JSON representation of the given retained replication throttles.
    */
   public static String retainedThrottlesToJson(Collection<Integer> brokers, Collection<ExecutionProposal> proposals) {
+    return retainedThrottlesToJson(brokers, proposals, Collections.emptyMap(), Collections.emptyMap());
+  }
+
+  /**
+   * @param brokers Brokers whose replication throttled rate has been set, but not removed yet.
+   * @param proposals Inter-broker replica movements whose replicas have been throttled, but not unthrottled yet.
+   * @param originalLogDirThrottleByBroker Brokers whose log dir throttle has been set, but not restored yet, mapped to their
+   *                                       original per-broker value (null if they had none) -- see PR #26.
+   * @param appliedLogDirThrottleByBroker The log dir throttle that was applied to each of these brokers, if known.
+   * @return JSON representation of the given retained throttles.
+   */
+  public static String retainedThrottlesToJson(Collection<Integer> brokers, Collection<ExecutionProposal> proposals,
+                                               Map<Integer, String> originalLogDirThrottleByBroker,
+                                               Map<Integer, String> appliedLogDirThrottleByBroker) {
     StringWriter writer = new StringWriter();
     try {
       JsonWriter json = new JsonWriter(writer);
@@ -287,6 +309,23 @@ public final class PersistedExecutionStateSerde {
         writeProposal(json, proposal);
       }
       json.endArray();
+      if (!originalLogDirThrottleByBroker.isEmpty()) {
+        json.name(LOG_DIR_THROTTLES).beginArray();
+        for (Map.Entry<Integer, String> entry : new TreeMap<>(originalLogDirThrottleByBroker).entrySet()) {
+          json.beginObject();
+          json.name(BROKER_ID).value(entry.getKey());
+          // A broker without an original per-broker value has no "original" field.
+          if (entry.getValue() != null) {
+            json.name(ORIGINAL).value(entry.getValue());
+          }
+          String applied = appliedLogDirThrottleByBroker.get(entry.getKey());
+          if (applied != null) {
+            json.name(APPLIED).value(applied);
+          }
+          json.endObject();
+        }
+        json.endArray();
+      }
       json.endObject();
       json.flush();
     } catch (IOException e) {
@@ -312,7 +351,21 @@ public final class PersistedExecutionStateSerde {
       for (JsonElement element : required(root, PROPOSALS).getAsJsonArray()) {
         proposals.add(proposalFromJson(element.getAsJsonObject()));
       }
-      return new RetainedThrottles(optionalIntegers(root, BROKERS), proposals);
+      Map<Integer, String> originalLogDirThrottleByBroker = new HashMap<>();
+      Map<Integer, String> appliedLogDirThrottleByBroker = new HashMap<>();
+      JsonElement logDirThrottles = optional(root, LOG_DIR_THROTTLES);
+      if (logDirThrottles != null) {
+        for (JsonElement element : logDirThrottles.getAsJsonArray()) {
+          JsonObject t = element.getAsJsonObject();
+          int brokerId = required(t, BROKER_ID).getAsInt();
+          originalLogDirThrottleByBroker.put(brokerId, optionalString(t, ORIGINAL));
+          String applied = optionalString(t, APPLIED);
+          if (applied != null) {
+            appliedLogDirThrottleByBroker.put(brokerId, applied);
+          }
+        }
+      }
+      return new RetainedThrottles(optionalIntegers(root, BROKERS), proposals, originalLogDirThrottleByBroker, appliedLogDirThrottleByBroker);
     } catch (IllegalArgumentException e) {
       throw e;
     } catch (RuntimeException e) {
@@ -326,10 +379,30 @@ public final class PersistedExecutionStateSerde {
   public static final class RetainedThrottles {
     private final List<Integer> _brokers;
     private final List<ExecutionProposal> _proposals;
+    private final Map<Integer, String> _originalLogDirThrottleByBroker;
+    private final Map<Integer, String> _appliedLogDirThrottleByBroker;
 
-    RetainedThrottles(List<Integer> brokers, List<ExecutionProposal> proposals) {
+    RetainedThrottles(List<Integer> brokers, List<ExecutionProposal> proposals, Map<Integer, String> originalLogDirThrottleByBroker,
+                      Map<Integer, String> appliedLogDirThrottleByBroker) {
       _brokers = brokers == null ? List.of() : brokers;
       _proposals = proposals;
+      _originalLogDirThrottleByBroker = originalLogDirThrottleByBroker;
+      _appliedLogDirThrottleByBroker = appliedLogDirThrottleByBroker;
+    }
+
+    /**
+     * @return Brokers whose log dir throttle has been set, but not restored yet, mapped to their original per-broker value (null if
+     * they had none).
+     */
+    public Map<Integer, String> originalLogDirThrottleByBroker() {
+      return _originalLogDirThrottleByBroker;
+    }
+
+    /**
+     * @return The log dir throttle that was applied to the brokers in {@link #originalLogDirThrottleByBroker()}, where known.
+     */
+    public Map<Integer, String> appliedLogDirThrottleByBroker() {
+      return _appliedLogDirThrottleByBroker;
     }
 
     public List<Integer> brokers() {

@@ -14,6 +14,7 @@ import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import java.io.IOException;
 import java.io.StringWriter;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -62,6 +63,7 @@ public class PersistedExecutionStateSerdeTest {
         .replicaMovementStrategy("PostponeUrpReplicaMovementStrategy,BaseReplicaMovementStrategy")
         .replicationThrottle(1000000L)
         .skipInterBrokerReplicaConcurrencyAdjustment(true)
+        .logDirThrottle(2000000L)
         .replicationThrottleAdjustmentDisabled(true)
         .replicationThrottleAdjusted(true)
         .cleanupOnly(true)
@@ -111,6 +113,7 @@ public class PersistedExecutionStateSerdeTest {
     assertEquals(expected.replicationThrottle(), actual.replicationThrottle());
     assertEquals(expected.kafkaAssignerMode(), actual.kafkaAssignerMode());
     assertEquals(expected.skipInterBrokerReplicaConcurrencyAdjustment(), actual.skipInterBrokerReplicaConcurrencyAdjustment());
+    assertEquals(expected.logDirThrottle(), actual.logDirThrottle());
     assertEquals(expected.replicationThrottleAdjustmentDisabled(), actual.replicationThrottleAdjustmentDisabled());
     assertEquals(expected.replicationThrottleAdjusted(), actual.replicationThrottleAdjusted());
     assertEquals(expected.cleanupOnly(), actual.cleanupOnly());
@@ -140,6 +143,20 @@ public class PersistedExecutionStateSerdeTest {
     assertThrows(IllegalArgumentException.class, () -> PersistedExecutionStateSerde.retainedThrottlesFromJson("{\"version\": 1}"));
     String futureVersion = "{\"version\": 99, \"proposals\": []}";
     assertThrows(IllegalArgumentException.class, () -> PersistedExecutionStateSerde.retainedThrottlesFromJson(futureVersion));
+  }
+
+  @Test
+  public void testRetainedLogDirThrottlesRoundTrip() {
+    Map<Integer, String> originals = new HashMap<>();
+    originals.put(1, "777");
+    originals.put(2, null);
+    PersistedExecutionStateSerde.RetainedThrottles retained = PersistedExecutionStateSerde.retainedThrottlesFromJson(
+        PersistedExecutionStateSerde.retainedThrottlesToJson(List.of(), List.of(), originals, Map.of(1, "1000")));
+    assertEquals(originals, retained.originalLogDirThrottleByBroker());
+    assertEquals(Map.of(1, "1000"), retained.appliedLogDirThrottleByBroker());
+    // Documents without log dir throttles (e.g. written before them) read as none.
+    assertEquals(Map.of(), PersistedExecutionStateSerde.retainedThrottlesFromJson(
+        PersistedExecutionStateSerde.retainedThrottlesToJson(List.of(3), List.of())).originalLogDirThrottleByBroker());
   }
 
   @Test

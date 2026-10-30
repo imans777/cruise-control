@@ -186,6 +186,11 @@ public class Executor {
   private final ScheduledExecutorService _leftoverReplicationThrottleCleanerExecutor;
   // Log dir throttles that executions have set, but not removed yet (see #removeLeftoverLogDirThrottles).
   private final LogDirThrottleHelper.AppliedThrottles _appliedLogDirThrottles;
+  // The log dir throttle that the last execution applied to the brokers whose throttle it could not restore -- persisted with the
+  // record above, so that a throttle recovered after a restart is restored only if the broker still carries it.
+  private final Map<Integer, String> _lastAppliedLogDirThrottleByBroker = new ConcurrentHashMap<>();
+  // Brokers of the log dir throttles recovered from before a restart, mapped to the value applied to them before the restart.
+  private final Map<Integer, String> _recoveredAppliedLogDirThrottleByBroker = new ConcurrentHashMap<>();
   private final AtomicBoolean _leftoverLogDirThrottleRemovalQueued;
   private final ScheduledExecutorService _leftoverLogDirThrottleCleanerExecutor;
   private UserTaskManager _userTaskManager;
@@ -243,6 +248,8 @@ public class Executor {
   // The last persisted retained replication throttles (null: none), to skip rewriting an unchanged document. Guarded by
   // _executionStateStoreLock.
   private String _lastPersistedRetainedThrottles;
+  // The replication part of the persisted retained throttles: the record as of the last time it held no ongoing execution's throttles.
+  private volatile RetainedReplicationThrottles _persistedRetainedReplicationThrottles = RetainedReplicationThrottles.NONE;
   // Set upon shutdown to retain the persisted state of an execution interrupted by the shutdown -- i.e. to recover it upon restart.
   private volatile boolean _shutdownRequested;
   // The parameters of the ongoing execution to persist, or null if the state of the ongoing execution is not persisted.
@@ -619,18 +626,29 @@ public class Executor {
    * <p>Called only while there is no ongoing execution, and from the proposal executor thread, so that it cannot interfere
    * with an execution's own throttling.</p>
    *
-   * <p>This cannot recover from a hard kill of the process: the record of what was borrowed is in memory. Such a leftover
-   * has to be removed by hand (or by whatever persists the execution state).</p>
+   * <p>The record of what was borrowed is persisted with the retained replication throttles (Integration PR#15 -> PR#26), so it
+   * survives a hard kill of the process too; the throttles recovered after a restart are restored only if the broker still carries
+   * the value applied before the restart (see {@link #restoreRecoveredLogDirThrottles()}).</p>
    */
   private void removeLeftoverLogDirThrottles() {
     if (_hasOngoingExecution || _appliedLogDirThrottles.isEmpty()) {
       return;
     }
-    LOG.info("Removing leftover log dir throttles of brokers {}.", _appliedLogDirThrottles.originalThrottleByBroker().keySet());
-    // The applied rate is not checked here: this runs after the execution that set it has finished, so a current value that
-    // differs from the original is restored rather than left alone.
-    LogDirThrottleHelper.removeThrottles(_adminClient, _appliedLogDirThrottles.originalThrottleByBroker(), null,
-                                         LEFTOVER_LOG_DIR_THROTTLE_REMOVAL_RETRIES);
+    restoreRecoveredLogDirThrottles();
+    Map<Integer, String> originals = _appliedLogDirThrottles.originalThrottleByBroker();
+    Map<Integer, String> leftovers = new HashMap<>(originals);
+    leftovers.keySet().removeAll(_recoveredAppliedLogDirThrottleByBroker.keySet());
+    if (!leftovers.isEmpty()) {
+      LOG.info("Removing leftover log dir throttles of brokers {}.", leftovers.keySet());
+      Set<Integer> brokers = new HashSet<>(leftovers.keySet());
+      // The applied rate is not checked here: this runs after the execution that set it has finished, so a current value that
+      // differs from the original is restored rather than left alone.
+      LogDirThrottleHelper.removeThrottles(_adminClient, leftovers, null, LEFTOVER_LOG_DIR_THROTTLE_REMOVAL_RETRIES);
+      brokers.removeAll(leftovers.keySet());
+      originals.keySet().removeAll(brokers);
+    }
+    _lastAppliedLogDirThrottleByBroker.keySet().retainAll(originals.keySet());
+    persistRetainedReplicationThrottles();
   }
 
   /**
@@ -733,9 +751,34 @@ public class Executor {
    * startup by {@link #recoverInterruptedExecution(LoadMonitor)}.
    */
   private void persistRetainedReplicationThrottles() {
-    String json = _appliedReplicationThrottles.isEmpty()
-                  ? null : PersistedExecutionStateSerde.retainedThrottlesToJson(new TreeSet<>(_appliedReplicationThrottles.brokers()),
-                                                                                _appliedReplicationThrottles.proposals());
+    // Called only while the record holds no throttle of an ongoing execution -- after a sweep, or when an interrupted execution
+    // hands its throttles over. During an execution the record also holds the throttles the execution is using: those are the
+    // persisted execution state's, and recovering them from here too would remove them without matching their values (e.g. an
+    // operator's rate set while Cruise Control was down).
+    _persistedRetainedReplicationThrottles = new RetainedReplicationThrottles(_appliedReplicationThrottles);
+    persistRetainedThrottles();
+  }
+
+  /**
+   * Persist the retained throttles: the replication throttles as of the last {@link #persistRetainedReplicationThrottles()}, and the
+   * current record of the log dir throttles. Called at every checkpoint of an execution too, as the original log dir throttles that
+   * the execution borrows (PR #26) are known only in memory.
+   */
+  private void persistRetainedThrottles() {
+    String json;
+    try {
+      RetainedReplicationThrottles replicationThrottles = _persistedRetainedReplicationThrottles;
+      Set<Integer> brokers = replicationThrottles.brokers();
+      List<ExecutionProposal> proposals = replicationThrottles.proposals();
+      Map<Integer, String> originalLogDirThrottleByBroker = new HashMap<>(_appliedLogDirThrottles.originalThrottleByBroker());
+      json = brokers.isEmpty() && proposals.isEmpty() && originalLogDirThrottleByBroker.isEmpty()
+             ? null : PersistedExecutionStateSerde.retainedThrottlesToJson(brokers, proposals, originalLogDirThrottleByBroker,
+                                                                           appliedLogDirThrottleByBroker());
+    } catch (RuntimeException e) {
+      // E.g. the log dir record changed while being copied: the next call persists it.
+      LOG.debug("Failed to snapshot the retained throttles.", e);
+      return;
+    }
     synchronized (_executionStateStoreLock) {
       if (Objects.equals(json, _lastPersistedRetainedThrottles)) {
         return;
@@ -750,8 +793,81 @@ public class Executor {
   }
 
   /**
+   * A snapshot of the record of the replication throttles that executions set, but could not remove yet.
+   */
+  private static final class RetainedReplicationThrottles {
+    private static final RetainedReplicationThrottles NONE = new RetainedReplicationThrottles(Collections.emptySet(), Collections.emptyList());
+    private final Set<Integer> _brokers;
+    private final List<ExecutionProposal> _proposals;
+
+    RetainedReplicationThrottles(Collection<Integer> brokers, Collection<ExecutionProposal> proposals) {
+      _brokers = Collections.unmodifiableSet(new TreeSet<>(brokers));
+      _proposals = List.copyOf(proposals);
+    }
+
+    RetainedReplicationThrottles(ReplicationThrottleHelper.AppliedThrottles appliedThrottles) {
+      this(appliedThrottles.brokers(), appliedThrottles.proposals());
+    }
+
+    Set<Integer> brokers() {
+      return _brokers;
+    }
+
+    List<ExecutionProposal> proposals() {
+      return _proposals;
+    }
+  }
+
+  /**
+   * @return The log dir throttle applied to each broker of {@link #_appliedLogDirThrottles}, where known: by the ongoing execution,
+   * by the last execution (for the brokers whose throttle it could not restore), or before a restart.
+   */
+  private Map<Integer, String> appliedLogDirThrottleByBroker() {
+    Map<Integer, String> applied = new HashMap<>(_recoveredAppliedLogDirThrottleByBroker);
+    applied.putAll(_lastAppliedLogDirThrottleByBroker);
+    LogDirThrottleHelper logDirThrottleHelper = _ongoingExecutionLogDirThrottleHelper;
+    if (logDirThrottleHelper != null) {
+      applied.putAll(logDirThrottleHelper.appliedThrottleByBroker());
+    }
+    return applied;
+  }
+
+  /**
+   * Restore the log dir throttles recovered from before a restart (see {@link #loadRetainedReplicationThrottles()}): the original
+   * per-broker value of a broker is put back only if the broker still carries the value applied before the restart -- a different
+   * value was set by someone else in the meantime, and is left alone. Must be called while no execution throttles these brokers.
+   */
+  private void restoreRecoveredLogDirThrottles() {
+    if (_recoveredAppliedLogDirThrottleByBroker.isEmpty()) {
+      return;
+    }
+    Map<Integer, String> originals = _appliedLogDirThrottles.originalThrottleByBroker();
+    Map<Integer, String> recovered = new HashMap<>();
+    for (Integer broker : new ArrayList<>(_recoveredAppliedLogDirThrottleByBroker.keySet())) {
+      if (originals.containsKey(broker)) {
+        recovered.put(broker, originals.get(broker));
+      } else {
+        _recoveredAppliedLogDirThrottleByBroker.remove(broker);
+      }
+    }
+    if (!recovered.isEmpty()) {
+      LOG.info("Restoring the log dir throttles of brokers {} that an execution set before the restart.", recovered.keySet());
+      Set<Integer> brokers = new HashSet<>(recovered.keySet());
+      // Drops a broker from the given map once its throttle is restored, or left alone because somebody else changed it.
+      LogDirThrottleHelper.removeThrottles(_adminClient, recovered, new HashMap<>(_recoveredAppliedLogDirThrottleByBroker),
+                                           LEFTOVER_LOG_DIR_THROTTLE_REMOVAL_RETRIES);
+      brokers.removeAll(recovered.keySet());
+      originals.keySet().removeAll(brokers);
+      _recoveredAppliedLogDirThrottleByBroker.keySet().removeAll(brokers);
+    }
+    persistRetainedReplicationThrottles();
+  }
+
+  /**
    * Load the replication throttles that were retained before a restart (see {@link #persistRetainedReplicationThrottles()}), so that
    * {@link LeftoverReplicationThrottleCleaner} removes them once their partition movements finish and their brokers are available.
+   * The log dir throttles retained before the restart are loaded too (PR #26), and {@link LeftoverLogDirThrottleCleaner} restores
+   * them (see {@link #restoreRecoveredLogDirThrottles()}).
    */
   private void loadRetainedReplicationThrottles() {
     synchronized (_executionStateStoreLock) {
@@ -760,9 +876,13 @@ public class Executor {
         if (json.isPresent()) {
           PersistedExecutionStateSerde.RetainedThrottles retained = PersistedExecutionStateSerde.retainedThrottlesFromJson(json.get());
           _appliedReplicationThrottles.add(retained.brokers(), retained.proposals());
+          _persistedRetainedReplicationThrottles = new RetainedReplicationThrottles(retained.brokers(), retained.proposals());
+          _appliedLogDirThrottles.originalThrottleByBroker().putAll(retained.originalLogDirThrottleByBroker());
+          _recoveredAppliedLogDirThrottleByBroker.putAll(retained.appliedLogDirThrottleByBroker());
           _lastPersistedRetainedThrottles = json.get();
-          LOG.info("Recovered the replication throttles retained before the restart: brokers {} and {} partition movement(s).",
-                   retained.brokers(), retained.proposals().size());
+          LOG.info("Recovered the throttles retained before the restart: replication throttles of brokers {} and {} partition "
+                   + "movement(s), log dir throttles of brokers {}.", retained.brokers(), retained.proposals().size(),
+                   retained.originalLogDirThrottleByBroker().keySet());
         }
       } catch (IOException | RuntimeException e) {
         LOG.error("Failed to load the replication throttles retained before the restart.", e);
@@ -1778,6 +1898,7 @@ public class Executor {
         .replicaMovementStrategy(replicaMovementStrategy == null ? null : replicaMovementStrategy.name())
         .replicationThrottle(replicationThrottle)
         .replicationThrottleAdjusted(_replicationThrottleAdjusterEnabled)
+        .logDirThrottle(logDirThrottle)
         .kafkaAssignerMode(isKafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(skipInterBrokerReplicaConcurrencyAdjustment)
         .build();
@@ -2058,6 +2179,7 @@ public class Executor {
     }
     if (logDirThrottleHelper.removeThrottleRate()) {
       LOG.info("Log dir throttle of the ongoing execution is removed.");
+      persistExecutionParameterChange(state -> state.toBuilder().logDirThrottle(null).build());
       return DynamicThrottleResult.REMOVED;
     }
     return DynamicThrottleResult.NOT_THROTTLED;
@@ -2089,6 +2211,7 @@ public class Executor {
     boolean updated = logDirThrottleHelper.updateThrottleRate(newThrottleRate, inProgressTasks);
     if (updated) {
       LOG.info("Log dir throttle of the ongoing execution is updated to {} bytes/sec.", newThrottleRate);
+      persistExecutionParameterChange(state -> state.toBuilder().logDirThrottle(newThrottleRate).build());
     }
     return updated;
   }
@@ -2243,6 +2366,9 @@ public class Executor {
         _executionStateStore.save(state);
         _lastPersistedTaskStateVersion = taskStateVersion;
         _lastPersistedExecutorState = executorState;
+        // The original log dir throttles that the execution has borrowed (PR #26) are known only in memory: a crash would leave the
+        // execution's rate on the brokers for good, and the next execution would take it for the original.
+        persistRetainedThrottles();
       } catch (IOException | RuntimeException e) {
         LOG.warn("User task {}: Failed to persist the execution state.", state.uuid(), e);
         if (!_executionStatePersistenceFailureReported) {
@@ -2837,6 +2963,10 @@ public class Executor {
                                                                            adoptedProposals));
     }
 
+    if (!_recoveredAppliedLogDirThrottleByBroker.isEmpty()) {
+      // The resumed execution reads the current log dir throttle of a broker as its original: restore the original first.
+      _proposalExecutor.execute(this::restoreRecoveredLogDirThrottles);
+    }
     if (state.replicationThrottleAdjustmentDisabled() && _replicationThrottleAdjusterEnabled) {
       // Decision D2: the operator switched the adjustment off during the execution, so that its replication throttle holds. A restart
       // reverts the switch to the config; the resumed execution switches it off again (it stays off until switched on).
@@ -2872,7 +3002,7 @@ public class Executor {
                          state.executionProgressCheckIntervalMs(),
                          replicaMovementStrategy,
                          state.replicationThrottle(),
-                         null,
+                         state.logDirThrottle(),
                          false,
                          state.uuid(),
                          state.kafkaAssignerMode(),
@@ -3476,6 +3606,9 @@ public class Executor {
         }
         // Restore the log dir throttles (if any) on all exit paths, before the execution is reported as finished.
         _logDirThrottleHelper.clearAllThrottles();
+        // What could not be restored is retained, and persisted so that it outlives a restart (Integration PR#15 -> PR#26).
+        _lastAppliedLogDirThrottleByBroker.putAll(_logDirThrottleHelper.appliedThrottleByBroker());
+        persistRetainedReplicationThrottles();
         notifyFinishedTask(userTaskInfo);
       }
     }
