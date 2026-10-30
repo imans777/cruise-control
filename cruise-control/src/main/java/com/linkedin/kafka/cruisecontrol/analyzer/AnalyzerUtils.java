@@ -179,6 +179,19 @@ public final class AnalyzerUtils {
   }
 
   /**
+   * Check whether the given goal is an intra-broker goal -- i.e. a goal configured in
+   * {@link AnalyzerConfig#INTRA_BROKER_GOALS_CONFIG}. Intra-broker goals move replicas between the disks of the same broker.
+   * Hence, optimizing them requires the replica placement over disks to be populated in the cluster model.
+   *
+   * @param goal Goal to check.
+   * @param config The configurations for Cruise Control.
+   * @return {@code true} if the given goal is an intra-broker goal, {@code false} otherwise.
+   */
+  public static boolean isIntraBrokerGoal(Goal goal, KafkaCruiseControlConfig config) {
+    return config.getList(AnalyzerConfig.INTRA_BROKER_GOALS_CONFIG).contains(goal.getClass().getName());
+  }
+
+  /**
    * Compare the given values. Return 1 if first &gt; second, -1 if first &lt; second, 0 otherwise.
    *
    * @param d1 The first {@code double} to compare.

@@ -30,6 +30,11 @@ ExecutorState:
       items:
         type: integer
         format: int32
+    executionPhases:
+      description: The progress of each phase of the ongoing execution that has movements to execute, in execution order.
+      type: array
+      items:
+        $ref: '#/ExecutionPhase'
     # leadership information
     numTotalLeadershipMovements:
       type: integer
@@ -222,3 +227,43 @@ ExecutionTask:
     brokerId:
       type: integer
       format: int32
+
+ExecutionPhase:
+  type: object
+  required:
+    - phase
+    - status
+    - numFinishedMovements
+    - numTotalMovements
+  properties:
+    phase:
+      description: The type of the movements of the phase. Phases run in this order.
+      type: string
+      enum:
+        - INTER_BROKER_REPLICA_ACTION
+        - INTRA_BROKER_REPLICA_ACTION
+        - LEADER_ACTION
+    status:
+      description: >-
+        FINISHED if all movements of the phase are finished, CANCELLED if the execution is being stopped and none of them is in
+        progress, IN_PROGRESS if the execution is in this phase or any of its movements has started, PENDING otherwise.
+      type: string
+      enum:
+        - PENDING
+        - IN_PROGRESS
+        - FINISHED
+        - CANCELLED
+    numFinishedMovements:
+      type: integer
+      format: int32
+    numTotalMovements:
+      type: integer
+      format: int32
+    finishedDataMovement:
+      description: Finished data movement in MB (replica movement phases only).
+      type: integer
+      format: int64
+    totalDataToMove:
+      description: Total data to move in MB (replica movement phases only).
+      type: integer
+      format: int64

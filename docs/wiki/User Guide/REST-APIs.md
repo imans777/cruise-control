@@ -118,6 +118,12 @@ The returned state contains the following information:
   * Inter-broker replica movement progress (if state is `INTER_BROKER_REPLICA_MOVEMENT_IN_PROGRESS`)
   * Intra-broker replica movement progress (if state is `INTRA_BROKER_REPLICA_MOVEMENT_IN_PROGRESS`)
   * Leadership movement progress (if state is `LEADERSHIP_MOVEMENT`)
+  * Progress of each phase of the execution (`executionPhases`, while an execution is in progress): an execution moves replicas
+    across brokers, then across the disks of each broker, then moves leadership, and reports the phase it is in as its state.
+    The progress above covers the current phase only, so a phase reaching 100% does not mean that the execution is over:
+    `executionPhases` lists every phase with movements (`INTER_BROKER_REPLICA_ACTION`, `INTRA_BROKER_REPLICA_ACTION`,
+    `LEADER_ACTION`), its status (`PENDING`, `IN_PROGRESS`, `FINISHED` or `CANCELLED`), and its finished and total movements
+    (and MB). The execution is over once the state is `NO_TASK_IN_PROGRESS`.
   * movement concurrency
   * UUID triggers the execution
 * **Analyzer State**:
@@ -256,7 +262,7 @@ Users can only specify either `valid_windows` or `valid_partitions`, but not bot
 
 Cruise Control tries to precompute the optimization proposal in the background and caches the best proposal to serve when user queries. If users want to have a fresh proposal without reading it from the proposal cache, set the `ignore_proposal_cache` flag to true. The precomputing always uses available valid partitions to generate the proposals.
 
-By default the proposal will be returned from the cache where all the pre-defined goals are used. Detailed information about the reliability of the proposals will also be returned. If users want to run with a different set of goals, they can specify the `goals` parameter with the goal names (simple class name).
+By default the proposal will be returned from the cache where all the pre-defined goals are used. Detailed information about the reliability of the proposals will also be returned. If users want to run with a different set of goals, they can specify the `goals` parameter with the goal names (simple class name). Intra-broker goals can be listed after the inter-broker goals to also balance the disks of each broker (see [Trigger a workload balance](#trigger-a-workload-balance)).
 
 If `verbose` is turned on, Cruise Control will return all the generated proposals. Otherwise a summary of the proposals will be returned.
 
@@ -359,6 +365,14 @@ Supported parameters are:
 Similar to the [GET interface for getting proposals](https://github.com/cruise-control-for-kafka/cruise-control/wiki/REST-APIs#get-optimization-proposals), the rebalance can also be based on available valid windows or available valid partitions.
 
 User can specify goals to use for rebalance via `goals` parameter. When `goals` is provided, the cached proposals will be ignored.
+
+To balance both the brokers and the disks of each broker (requires JBOD Kafka deployment) in a single rebalance, list intra-broker goals (i.e. goals in `intra.broker.goals`, such as `IntraBrokerDiskCapacityGoal` and `IntraBrokerDiskUsageDistributionGoal`) after all the inter-broker goals in `goals` (or in `default.goals`), e.g.:
+
+    POST /kafkacruisecontrol/rebalance?dryrun=false&goals=RackAwareGoal,MinTopicLeadersPerBrokerGoal,ReplicaCapacityGoal,DiskCapacityGoal,NetworkInboundCapacityGoal,NetworkOutboundCapacityGoal,CpuCapacityGoal,DiskUsageDistributionGoal,IntraBrokerDiskCapacityGoal,IntraBrokerDiskUsageDistributionGoal
+
+Cruise Control optimizes the inter-broker goals first, then balances the disks of each broker -- including the replicas moved to the broker -- with the intra-broker goals, and executes the resulting proposals in a single execution: replicas are moved across brokers (each new replica is created in the disk picked by the optimization), then across the disks of the same broker (gated by `concurrent_intra_broker_partition_movements`), and finally leadership is moved. Unlike `rebalance_disk=true`, which only uses intra-broker goals, the hard goal check still applies (see `skip_hard_goal_check`), and the cached proposals are not used. `destination_broker_ids` restricts the replica movements across brokers only: the intra-broker goals balance the disks of all brokers.
+
+Since a disk may receive new replicas before the replicas that leave it have moved to other disks of the broker, each replica movement of such an execution starts only once its destination disk can hold a full copy of the replica. The free space of a disk is the smaller of its capacity in the broker capacity config minus the bytes on it, and the usable bytes that the broker reports, minus the bytes that the movements in progress have yet to write to it. If no replica movement across brokers is in progress and none can start for want of space, the execution first moves replicas off the disks they wait for to other disks of the same broker, then resumes moving replicas across brokers. If no movement can free those disks, the execution stops with an error. Executions without intra-broker goals (including `rebalance_disk=true`) are not checked.
 
 When rebalancing a cluster, all the brokers in the cluster(except recently removed/demoted brokers if `exclude_recently_removed_brokers`/`exclude_recently_demoted_brokers` set to `true`) are eligible to give / receive replicas. All the brokers will be throttled during the partition movement. The throttling can be set in two ways.
 

@@ -19,14 +19,18 @@ package com.linkedin.kafka.cruisecontrol.executor;
 import com.codahale.metrics.MetricRegistry;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils;
 import com.linkedin.kafka.cruisecontrol.common.MetadataAdminClient;
+import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.common.TestConstants;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityConfigFileResolver;
+import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.MonitorConfig;
 import com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorManager;
+import com.linkedin.kafka.cruisecontrol.exception.BrokerCapacityResolutionException;
 import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
+import com.linkedin.kafka.cruisecontrol.metricsreporter.utils.CCContainerizedKraftCluster;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.utils.CCKafkaClientsIntegrationTestHarness;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import com.linkedin.kafka.cruisecontrol.monitor.LoadMonitor;
@@ -55,7 +59,9 @@ import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.AlterPartitionReassignmentsResult;
 import org.apache.kafka.clients.admin.ElectLeadersResult;
+import org.apache.kafka.clients.admin.LogDirDescription;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.ReplicaInfo;
 import org.apache.kafka.clients.admin.TopicDescription;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -65,6 +71,7 @@ import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.TopicPartitionInfo;
+import org.apache.kafka.common.TopicPartitionReplica;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
@@ -80,6 +87,7 @@ import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.*;
 import static com.linkedin.kafka.cruisecontrol.monitor.sampling.MetricSampler.SamplingMode.*;
 import static org.easymock.EasyMock.*;
 import static org.junit.Assert.*;
+import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.ReplicaLogDirInfo;
 
 
 public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
@@ -93,6 +101,11 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
   private static final Random RANDOM = new Random(0xDEADBEEF);
   private static final int MOCK_BROKER_ID_TO_DROP = 1;
   private static final long MOCK_CURRENT_TIME = 1596842708000L;
+  private static final int BROKER_ID_2 = 2;
+  private static final String LOG_DIRS_CONFIG = "log.dirs";
+  private static final String JBOD_LOGDIR_0 = "/tmp/kafka-jbod-logs-0";
+  private static final String JBOD_LOGDIR_1 = "/tmp/kafka-jbod-logs-1";
+  private static final String PADDING_TOPIC = "padding-topic";
 
   /**
    * Setup the unit test.
@@ -561,6 +574,266 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
     EasyMock.verify(mockMetadataClient, mockLoadMonitor, mockAnomalyDetectorManager, mockUserTaskInfo, mockUserTaskManager);
   }
 
+  @Test
+  public void testInterBrokerAndIntraBrokerReplicaMovementsWithLogdirs() throws Exception {
+    restartClusterWithJbodBrokers();
+    // TOPIC0 has a replica on broker 0. TOPIC1 has replicas on broker 0 (i.e. the leader) and broker 1.
+    createTopics(0);
+    // Put more partitions on JBOD_LOGDIR_0 of broker 1 than on JBOD_LOGDIR_1, so that broker 1 would create a new replica
+    // on JBOD_LOGDIR_1 (i.e. the logdir with the fewest partitions) unless requested otherwise.
+    createPartitionsOnLogdir(PADDING_TOPIC, 6, BROKER_ID_1, JBOD_LOGDIR_0);
+    Map<String, Integer> numReplicasByLogdir = numReplicasByLogdir(BROKER_ID_1);
+    assertTrue("Unexpected number of replicas by logdir " + numReplicasByLogdir,
+               numReplicasByLogdir.get(JBOD_LOGDIR_0) > numReplicasByLogdir.get(JBOD_LOGDIR_1));
+
+    String tp0LogdirOnBroker0 = currentLogdir(TP0, BROKER_ID_0);
+    String tp1LogdirOnBroker0 = currentLogdir(TP1, BROKER_ID_0);
+    String tp1LogdirOnBroker1 = currentLogdir(TP1, BROKER_ID_1);
+    String newTp1LogdirOnBroker1 = JBOD_LOGDIR_0.equals(tp1LogdirOnBroker1) ? JBOD_LOGDIR_1 : JBOD_LOGDIR_0;
+    // Move the replica of TOPIC0 to JBOD_LOGDIR_0 of broker 1.
+    ExecutionProposal interBrokerReplicaMovement =
+        new ExecutionProposal(TP0, 0, new ReplicaPlacementInfo(BROKER_ID_0, tp0LogdirOnBroker0),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_0, tp0LogdirOnBroker0)),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_1, JBOD_LOGDIR_0)));
+    // Move the replica of TOPIC1 on broker 0 to JBOD_LOGDIR_1 of broker 2, and the replica of TOPIC1 on broker 1 to its other logdir.
+    ExecutionProposal interAndIntraBrokerReplicaMovements =
+        new ExecutionProposal(TP1, 0, new ReplicaPlacementInfo(BROKER_ID_0, tp1LogdirOnBroker0),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_0, tp1LogdirOnBroker0),
+                                      new ReplicaPlacementInfo(BROKER_ID_1, tp1LogdirOnBroker1)),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_1, newTp1LogdirOnBroker1),
+                                      new ReplicaPlacementInfo(BROKER_ID_2, JBOD_LOGDIR_1)));
+    List<ExecutionProposal> proposals = List.of(interBrokerReplicaMovement, interAndIntraBrokerReplicaMovements);
+    executeAndVerifyProposals(proposals, proposals, false, null, false, true);
+
+    // A single execution moves the replicas both across brokers (i.e. to the requested logdirs) and across logdirs of the same broker.
+    assertEquals(JBOD_LOGDIR_0, currentLogdir(TP0, BROKER_ID_1));
+    assertEquals(newTp1LogdirOnBroker1, currentLogdir(TP1, BROKER_ID_1));
+    assertEquals(JBOD_LOGDIR_1, currentLogdir(TP1, BROKER_ID_2));
+  }
+
+  @Test
+  public void testInterBrokerReplicaMovementWaitsForIntraBrokerReplicaMovementOffItsLogdir() throws Exception {
+    restartClusterWithJbodBrokers();
+    // TOPIC0 has a replica on broker 0. TOPIC1 has replicas on broker 0 (i.e. the leader) and broker 1.
+    createTopics(0);
+    for (int i = 0; i < 4; i++) {
+      produceRandomDataToTopic(TOPIC0, (int) PRODUCE_SIZE_IN_BYTES);
+      produceRandomDataToTopic(TOPIC1, (int) PRODUCE_SIZE_IN_BYTES);
+    }
+    // Keep the replica of TOPIC1 on broker 1 in a logdir without other replicas (e.g. of the metrics topic), so that the bytes on
+    // the logdir do not change during the execution.
+    String logdir = numReplicasByLogdir(BROKER_ID_1).keySet().stream()
+                                                    .filter(l -> partitionsOnLogdir(BROKER_ID_1, l).stream().allMatch(TP1::equals))
+                                                    .findFirst().orElseThrow();
+    String otherLogdir = JBOD_LOGDIR_0.equals(logdir) ? JBOD_LOGDIR_1 : JBOD_LOGDIR_0;
+    TopicPartitionReplica tp1OnBroker1 = new TopicPartitionReplica(TP1.topic(), TP1.partition(), BROKER_ID_1);
+    _cluster.adminClient().alterReplicaLogDirs(Map.of(tp1OnBroker1, logdir)).all().get();
+    long tp0Bytes = replicaBytes(TP0, BROKER_ID_0);
+    waitUntilTrue(() -> {
+      ReplicaLogDirInfo info = replicaLogDirInfo(tp1OnBroker1);
+      return info != null && logdir.equals(info.getCurrentReplicaLogDir()) && info.getFutureReplicaLogDir() == null
+             && replicaBytes(TP1, BROKER_ID_1) == replicaBytes(TP1, BROKER_ID_0);
+    },
+                  "Failed to move the replica of " + TP1 + " on broker 1 to logdir " + logdir, EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
+    long tp1Bytes = replicaBytes(TP1, BROKER_ID_1);
+    assertTrue("Unexpected replica sizes " + tp0Bytes + " and " + tp1Bytes, tp0Bytes > 0 && tp1Bytes >= tp0Bytes / 2);
+
+    String tp0LogdirOnBroker0 = currentLogdir(TP0, BROKER_ID_0);
+    String tp1LogdirOnBroker0 = currentLogdir(TP1, BROKER_ID_0);
+    // Move the replica of TOPIC0 to the logdir of broker 1, and the replica of TOPIC1 on broker 1 off that logdir.
+    ExecutionProposal interBrokerReplicaMovement =
+        new ExecutionProposal(TP0, 0, new ReplicaPlacementInfo(BROKER_ID_0, tp0LogdirOnBroker0),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_0, tp0LogdirOnBroker0)),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_1, logdir)));
+    ExecutionProposal intraBrokerReplicaMovement =
+        new ExecutionProposal(TP1, 0, new ReplicaPlacementInfo(BROKER_ID_0, tp1LogdirOnBroker0),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_0, tp1LogdirOnBroker0), new ReplicaPlacementInfo(BROKER_ID_1, logdir)),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_0, tp1LogdirOnBroker0), new ReplicaPlacementInfo(BROKER_ID_1, otherLogdir)));
+    // The logdir can hold the replica of TOPIC0 only once the replica of TOPIC1 has left it.
+    double logdirCapacityInMb = (tp1Bytes + tp0Bytes / 2.0) / (1024 * 1024);
+    List<ExecutorState.State> states = executeWithLogdirCapacities(List.of(interBrokerReplicaMovement, intraBrokerReplicaMovement),
+                                                                   Map.of(BROKER_ID_1, Map.of(logdir, logdirCapacityInMb, otherLogdir, 1000.0)),
+                                                                   false);
+
+    // The execution moved the replica of TOPIC1 off the logdir (i.e. an intra-broker phase), then resumed moving replicas across
+    // brokers.
+    int intraBrokerPhase = states.indexOf(ExecutorState.State.INTRA_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS);
+    assertTrue("Unexpected executor states " + states, intraBrokerPhase >= 0
+                                                       && states.subList(intraBrokerPhase, states.size())
+                                                                .contains(ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS));
+    assertEquals(otherLogdir, currentLogdir(TP1, BROKER_ID_1));
+    assertEquals(logdir, currentLogdir(TP0, BROKER_ID_1));
+  }
+
+  @Test
+  public void testInterBrokerReplicaMovementWithoutLogdirSpaceFailsExecution() throws Exception {
+    restartClusterWithJbodBrokers();
+    createTopics(0);
+    String tp0LogdirOnBroker0 = currentLogdir(TP0, BROKER_ID_0);
+    // A 1 MB replica of TOPIC0 moves to a logdir of broker 1 that cannot hold it, and no movement can free that logdir.
+    ExecutionProposal interBrokerReplicaMovement =
+        new ExecutionProposal(TP0, 1, new ReplicaPlacementInfo(BROKER_ID_0, tp0LogdirOnBroker0),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_0, tp0LogdirOnBroker0)),
+                              List.of(new ReplicaPlacementInfo(BROKER_ID_1, JBOD_LOGDIR_0)));
+    executeWithLogdirCapacities(List.of(interBrokerReplicaMovement), Map.of(BROKER_ID_1, Map.of(JBOD_LOGDIR_0, 0.5, JBOD_LOGDIR_1, 0.5)),
+                                true);
+
+    // The execution finished with an error without moving the replica.
+    assertEquals(List.of(BROKER_ID_0), _cluster.adminClient().describeTopics(Set.of(TOPIC0)).allTopicNames().get().get(TOPIC0)
+                                               .partitions().get(0).replicas().stream().map(Node::id).collect(Collectors.toList()));
+  }
+
+  /**
+   * Execute the given proposals as triggered by a user request, with the given logdir capacities in the broker capacity config.
+   *
+   * @param proposals Proposals to execute.
+   * @param capacityInMbByLogdirByBroker Disk capacity in MB of each logdir, by broker.
+   * @param completeWithError {@code true} if the execution is expected to finish with an error, {@code false} otherwise.
+   * @return The states of the executor during the execution, without consecutive duplicates.
+   */
+  private List<ExecutorState.State> executeWithLogdirCapacities(Collection<ExecutionProposal> proposals,
+                                                                Map<Integer, Map<String, Double>> capacityInMbByLogdirByBroker,
+                                                                boolean completeWithError) throws OngoingExecutionException {
+    KafkaCruiseControlConfig configs = new KafkaCruiseControlConfig(getExecutorProperties());
+    UserTaskManager.UserTaskInfo mockUserTaskInfo = getMockUserTaskInfo();
+    UserTaskManager mockUserTaskManager = getMockUserTaskManager(RANDOM_UUID, mockUserTaskInfo, Collections.singletonList(completeWithError));
+    ExecutorNotifier mockExecutorNotifier = EasyMock.mock(ExecutorNotifier.class);
+    if (completeWithError) {
+      mockExecutorNotifier.sendAlert(EasyMock.contains(RANDOM_UUID));
+    } else {
+      mockExecutorNotifier.sendNotification(EasyMock.contains(RANDOM_UUID));
+    }
+    LoadMonitor mockLoadMonitor = getMockLoadMonitor(capacityInMbByLogdirByBroker);
+    AnomalyDetectorManager mockAnomalyDetectorManager = getMockAnomalyDetector(RANDOM_UUID, completeWithError);
+    EasyMock.replay(mockUserTaskInfo, mockUserTaskManager, mockExecutorNotifier, mockLoadMonitor, mockAnomalyDetectorManager);
+
+    Executor executor = new Executor(configs, Time.SYSTEM, new MetricRegistry(), _cluster.adminClient(),
+                                     new MetadataAdminClient(_cluster.adminClient()), mockExecutorNotifier, mockAnomalyDetectorManager);
+    executor.setUserTaskManager(mockUserTaskManager);
+    executor.setGeneratingProposalsForExecution(RANDOM_UUID, ExecutorTest.class::getSimpleName, true);
+    executor.executeProposals(proposals, Collections.emptySet(), null, mockLoadMonitor, null, null,
+                              null, null, null, null, null,
+                              null, true, RANDOM_UUID, false, false);
+    List<ExecutorState.State> states = new ArrayList<>();
+    waitUntilTrue(() -> {
+      ExecutorState.State state = executor.state().state();
+      if (states.isEmpty() || states.get(states.size() - 1) != state) {
+        states.add(state);
+      }
+      return !executor.hasOngoingExecution() && state == ExecutorState.State.NO_TASK_IN_PROGRESS;
+    }, "Proposal execution did not finish within the time limit", EXECUTION_DEADLINE_MS, EXECUTION_SHORT_CHECK_MS);
+    EasyMock.verify(mockUserTaskInfo, mockUserTaskManager, mockExecutorNotifier, mockAnomalyDetectorManager);
+    return states;
+  }
+
+  /**
+   * @param brokerId Broker to query.
+   * @param logdir Logdir of the broker.
+   * @return Partitions with a replica in the given logdir of the given broker.
+   */
+  private Set<TopicPartition> partitionsOnLogdir(int brokerId, String logdir) {
+    try {
+      return _cluster.adminClient().describeLogDirs(Collections.singleton(brokerId)).allDescriptions().get().get(brokerId).get(logdir)
+                     .replicaInfos().keySet();
+    } catch (InterruptedException | ExecutionException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  /**
+   * @param tp Partition to query.
+   * @param brokerId Broker to query.
+   * @return The bytes of the (current) replica of the given partition on the given broker, or -1 if it does not exist.
+   */
+  private long replicaBytes(TopicPartition tp, int brokerId) {
+    try {
+      for (LogDirDescription description : _cluster.adminClient().describeLogDirs(Collections.singleton(brokerId)).allDescriptions().get()
+                                                   .get(brokerId).values()) {
+        ReplicaInfo replicaInfo = description.replicaInfos().get(tp);
+        if (replicaInfo != null && !replicaInfo.isFuture()) {
+          return replicaInfo.size();
+        }
+      }
+      return -1L;
+    } catch (InterruptedException | ExecutionException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  /**
+   * Restart the cluster with brokers using two logdirs (i.e. {@link #JBOD_LOGDIR_0} and {@link #JBOD_LOGDIR_1}).
+   */
+  private void restartClusterWithJbodBrokers() {
+    tearDown();
+    List<Map<Object, Object>> brokerConfigs = buildBrokerConfigs();
+    brokerConfigs.forEach(brokerConfig -> brokerConfig.put(LOG_DIRS_CONFIG, String.join(",", JBOD_LOGDIR_0, JBOD_LOGDIR_1)));
+    Properties adminClientProps = new Properties();
+    adminClientProps.setProperty(AdminClientConfig.METADATA_MAX_AGE_CONFIG, "0");
+    setSecurityConfigs(adminClientProps, "admin");
+
+    _brokerConfigs = brokerConfigs;
+    _cluster = new CCContainerizedKraftCluster(clusterSize(), brokerConfigs, adminClientProps);
+    _cluster.start();
+    _bootstrapUrl = _cluster.getExternalBootstrapAddress();
+  }
+
+  /**
+   * Create a topic with the given number of single-replica partitions on the given logdir of the given broker.
+   *
+   * @param topic Topic to create.
+   * @param numPartitions Number of partitions of the topic.
+   * @param brokerId Broker to host the replicas.
+   * @param logdir Logdir of the broker to host the replicas.
+   */
+  private void createPartitionsOnLogdir(String topic, int numPartitions, int brokerId, String logdir)
+      throws InterruptedException, ExecutionException {
+    Map<Integer, List<Integer>> replicasByPartition = new HashMap<>();
+    Map<TopicPartitionReplica, String> logdirByReplica = new HashMap<>();
+    for (int partition = 0; partition < numPartitions; partition++) {
+      replicasByPartition.put(partition, Collections.singletonList(brokerId));
+      logdirByReplica.put(new TopicPartitionReplica(topic, partition, brokerId), logdir);
+    }
+    _cluster.adminClient().createTopics(Collections.singleton(new NewTopic(topic, replicasByPartition))).all().get();
+    _cluster.waitForTopicMetadata(List.of(topic), Duration.ofSeconds(15), Duration.ofSeconds(60),
+                                  topicDescription -> topicDescription.partitions().size() == numPartitions
+                                                      && topicDescription.partitions().stream().allMatch(p -> p.leader() != null));
+    // The broker may create the replicas after the topic metadata shows their leaders. Requesting to move a replica that
+    // the broker does not host yet fails with ReplicaNotAvailableException, hence wait for the broker to host the replicas.
+    waitUntilTrue(() -> logdirByReplica.keySet().stream().allMatch(replica -> {
+      ReplicaLogDirInfo info = replicaLogDirInfo(replica);
+      return info != null && info.getCurrentReplicaLogDir() != null;
+    }), "Failed to create replicas of " + topic + " on broker " + brokerId, EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
+    _cluster.adminClient().alterReplicaLogDirs(logdirByReplica).all().get();
+    waitUntilTrue(() -> logdirByReplica.keySet().stream().allMatch(replica -> {
+      ReplicaLogDirInfo info = replicaLogDirInfo(replica);
+      return info != null && logdir.equals(info.getCurrentReplicaLogDir()) && info.getFutureReplicaLogDir() == null;
+    }), "Failed to move replicas of " + topic + " to logdir " + logdir, EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
+  }
+
+  /**
+   * @param replica Replica to query.
+   * @return Log dir information of the given replica, or {@code null} if it cannot be retrieved.
+   */
+  private ReplicaLogDirInfo replicaLogDirInfo(TopicPartitionReplica replica) {
+    try {
+      return _cluster.adminClient().describeReplicaLogDirs(Collections.singleton(replica)).all().get().get(replica);
+    } catch (InterruptedException | ExecutionException e) {
+      return null;
+    }
+  }
+
+  private Map<String, Integer> numReplicasByLogdir(int brokerId) throws InterruptedException, ExecutionException {
+    Map<String, Integer> numReplicasByLogdir = new HashMap<>();
+    _cluster.adminClient().describeLogDirs(Collections.singleton(brokerId)).allDescriptions().get().get(brokerId)
+                .forEach((logdir, description) -> numReplicasByLogdir.put(logdir, description.replicaInfos().size()));
+    return numReplicasByLogdir;
+  }
+
+  private String currentLogdir(TopicPartition tp, int brokerId) throws InterruptedException, ExecutionException {
+    TopicPartitionReplica replica = new TopicPartitionReplica(tp.topic(), tp.partition(), brokerId);
+    return _cluster.adminClient().describeReplicaLogDirs(Collections.singleton(replica)).all().get().get(replica).getCurrentReplicaLogDir();
+  }
+
   /**
    * Proposal#1: [TPO] move from original broker to the other one -- e.g. 0 -> 1
    * Proposal#2: [TP1] change order and leader -- e.g. [0, 1] -> [1, 0]
@@ -685,7 +958,24 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
   }
 
   private static LoadMonitor getMockLoadMonitor() {
+    return getMockLoadMonitor(Collections.emptyMap());
+  }
+
+  /**
+   * @param capacityInMbByLogdirByBroker Disk capacity in MB of each logdir, by broker. Other brokers have no logdir capacity.
+   * @return A mock load monitor.
+   */
+  private static LoadMonitor getMockLoadMonitor(Map<Integer, Map<String, Double>> capacityInMbByLogdirByBroker) {
     LoadMonitor mockLoadMonitor = EasyMock.mock(LoadMonitor.class);
+    try {
+      EasyMock.expect(mockLoadMonitor.brokerCapacity(anyObject(Node.class))).andAnswer(() -> {
+        Node node = (Node) EasyMock.getCurrentArguments()[0];
+        return new BrokerCapacityInfo(Resource.cachedValues().stream().collect(Collectors.toMap(r -> r, r -> 1.0)),
+                                      capacityInMbByLogdirByBroker.get(node.id()), 1.0);
+      }).anyTimes();
+    } catch (TimeoutException | BrokerCapacityResolutionException e) {
+      throw new IllegalStateException(e);
+    }
     EasyMock.expect(mockLoadMonitor.taskRunnerState())
             .andReturn(LoadMonitorTaskRunner.LoadMonitorTaskRunnerState.RUNNING)
             .anyTimes();
