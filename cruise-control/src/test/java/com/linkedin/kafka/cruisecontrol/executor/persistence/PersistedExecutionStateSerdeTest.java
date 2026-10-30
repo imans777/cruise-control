@@ -62,7 +62,7 @@ public class PersistedExecutionStateSerdeTest {
         .replicaMovementStrategy("PostponeUrpReplicaMovementStrategy,BaseReplicaMovementStrategy")
         .replicationThrottle(1000000L)
         .skipInterBrokerReplicaConcurrencyAdjustment(true)
-        .replicationThrottleAdjusted(true)
+        .replicationThrottleAdjuster(PersistedExecutionState.ReplicationThrottleAdjuster.TURNED_OFF)
         .adjusterState(new PersistedAdjusterState(Map.of(0, 300L, 1, 400L), Map.of(1, 500L), Set.of(1), Set.of(0, 1), Map.of(2, 3)))
         .userTask(new PersistedUserTask("REBALANCE", "POST /kafkacruisecontrol/rebalance?dryrun=false", "127.0.0.1", 900L))
         .cleanupOnly(true)
@@ -112,6 +112,7 @@ public class PersistedExecutionStateSerdeTest {
     assertEquals(expected.replicationThrottle(), actual.replicationThrottle());
     assertEquals(expected.kafkaAssignerMode(), actual.kafkaAssignerMode());
     assertEquals(expected.skipInterBrokerReplicaConcurrencyAdjustment(), actual.skipInterBrokerReplicaConcurrencyAdjustment());
+    assertEquals(expected.replicationThrottleAdjuster(), actual.replicationThrottleAdjuster());
     assertEquals(expected.replicationThrottleAdjusted(), actual.replicationThrottleAdjusted());
     assertEquals(expected.adjusterState(), actual.adjusterState());
     assertEquals(expected.userTask(), actual.userTask());
@@ -161,8 +162,30 @@ public class PersistedExecutionStateSerdeTest {
     assertFalse(deserialized.cleanupOnly());
     assertNull(deserialized.outsideExecutionFingerprint());
     assertNull(deserialized.logDirFingerprintByBroker());
+    assertEquals(PersistedExecutionState.ReplicationThrottleAdjuster.OFF, deserialized.replicationThrottleAdjuster());
     assertNull(deserialized.adjusterState());
     assertNull(deserialized.userTask());
+  }
+
+  @Test
+  public void testReplicationThrottleAdjusterIsReadFromThePairItReplaced() {
+    // States persisted before the one field carry the two booleans it replaced.
+    for (boolean adjusted : new boolean[]{false, true}) {
+      for (boolean disabled : new boolean[]{false, true}) {
+        JsonObject json = JsonParser.parseString(PersistedExecutionStateSerde.toJson(sampleState())).getAsJsonObject();
+        JsonObject parameters = json.getAsJsonObject(PersistedExecutionStateSerde.PARAMETERS);
+        parameters.remove(PersistedExecutionStateSerde.REPLICATION_THROTTLE_ADJUSTER);
+        parameters.addProperty(PersistedExecutionStateSerde.REPLICATION_THROTTLE_ADJUSTED, adjusted);
+        parameters.addProperty(PersistedExecutionStateSerde.REPLICATION_THROTTLE_ADJUSTMENT_DISABLED, disabled);
+        PersistedExecutionState.ReplicationThrottleAdjuster expected = !adjusted ? PersistedExecutionState.ReplicationThrottleAdjuster.OFF
+            : disabled ? PersistedExecutionState.ReplicationThrottleAdjuster.TURNED_OFF : PersistedExecutionState.ReplicationThrottleAdjuster.ON;
+        assertEquals(expected, PersistedExecutionStateSerde.fromJson(json.toString()).replicationThrottleAdjuster());
+      }
+    }
+    // Only the one field is written.
+    String json = PersistedExecutionStateSerde.toJson(sampleState());
+    assertFalse(json.contains(PersistedExecutionStateSerde.REPLICATION_THROTTLE_ADJUSTED + "\""));
+    assertFalse(json.contains(PersistedExecutionStateSerde.REPLICATION_THROTTLE_ADJUSTMENT_DISABLED));
   }
 
   @Test

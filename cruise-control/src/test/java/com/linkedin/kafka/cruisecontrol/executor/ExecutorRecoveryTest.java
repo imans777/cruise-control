@@ -752,7 +752,9 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     throttleHelper.setThrottles(List.of(proposal));
     throttleHelper.updateThrottleRates(1, 200_000L, 300_000L);
     assertTrue(hasThrottles());
-    _store.save(interruptedExecutionState(null, List.of(proposal)).toBuilder().replicationThrottleAdjusted(true).build());
+    _store.save(interruptedExecutionState(null, List.of(proposal)).toBuilder()
+        .replicationThrottleAdjuster(PersistedExecutionState.ReplicationThrottleAdjuster.ON)
+        .build());
 
     AnomalyDetectorManager anomalyDetectorManager = mockAnomalyDetectorManager(null);
     Executor executor = newExecutor(false, null, new RecordingNotifier(), anomalyDetectorManager);
@@ -763,6 +765,66 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     // its throttled replicas are removed.
     assertFalse(hasThrottles());
     EasyMock.verify(anomalyDetectorManager);
+  }
+
+  @Test
+  public void testRuntimeThrottleChangesArePersisted() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    // Stale metadata keeps the movement in progress for the executor, so that the execution lasts until it is stopped.
+    Node[] nodes = {new Node(0, "h0", 9092), new Node(1, "h1", 9092), new Node(2, "h2", 9092)};
+    Cluster staleCluster = new Cluster("cluster", Arrays.asList(nodes),
+                                       Collections.singleton(new PartitionInfo(TOPIC, 0, nodes[0], new Node[]{nodes[0], nodes[1]},
+                                                                               new Node[]{nodes[0], nodes[1]})),
+                                       Collections.emptySet(), Collections.emptySet());
+    MetadataAdminClient staleMetadataClient = EasyMock.mock(MetadataAdminClient.class);
+    EasyMock.expect(staleMetadataClient.cluster()).andReturn(staleCluster).anyTimes();
+    EasyMock.replay(staleMetadataClient);
+    Executor executor = newExecutor(false, staleMetadataClient, new RecordingNotifier(), mockAnomalyDetectorManager(true));
+    executor.setGeneratingProposalsForExecution(UUID, () -> REASON, false);
+    executor.executeProposals(List.of(proposal(TP0, List.of(0, 1), List.of(0, 2))), Collections.emptySet(), null, mockLoadMonitor(),
+                              null, null, null, null, null, null, null, 100_000L, null, false, UUID, false, false);
+    waitUntilTrue(() -> _store.state() != null && onlyTask(_store.state()).state() == ExecutionTaskState.IN_PROGRESS,
+                  "The task is not persisted as in progress", WAIT_TIME_MS, 100L);
+    assertEquals(Long.valueOf(100_000L), _store.state().replicationThrottle());
+
+    // A replication throttle changed by an admin request (PR #17) is what a resumed execution uses.
+    assertTrue(executor.updateOngoingExecutionReplicationThrottle(200_000L));
+    assertEquals(Long.valueOf(200_000L), _store.state().replicationThrottle());
+    // The switch is persisted from the start (off here), and switching the adjustment on and off during the execution (decision D2)
+    // is persisted too: once on, the execution stays adjusted.
+    assertEquals(PersistedExecutionState.ReplicationThrottleAdjuster.OFF, _store.state().replicationThrottleAdjuster());
+    boolean adjusterEnabled = executor.setReplicationThrottleAdjusterEnabled(false);
+    assertEquals(PersistedExecutionState.ReplicationThrottleAdjuster.OFF, _store.state().replicationThrottleAdjuster());
+    executor.setReplicationThrottleAdjusterEnabled(true);
+    assertEquals(PersistedExecutionState.ReplicationThrottleAdjuster.ON, _store.state().replicationThrottleAdjuster());
+    executor.setReplicationThrottleAdjusterEnabled(false);
+    assertEquals(PersistedExecutionState.ReplicationThrottleAdjuster.TURNED_OFF, _store.state().replicationThrottleAdjuster());
+    assertTrue(_store.state().replicationThrottleAdjusted());
+    executor.setReplicationThrottleAdjusterEnabled(adjusterEnabled);
+
+    executor.userTriggeredStopExecution(false);
+    waitForExecutionToFinish(executor);
+    assertNull(_store.state());
+  }
+
+  @Test
+  public void testResumeDisablesReplicationThrottleAdjustmentAgain() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal pending = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    // The operator switched the adjustment off during the interrupted execution, so that its replication throttle holds (D2).
+    _store.save(interruptedExecutionState(100_000L, List.of(pending)).toBuilder()
+        .replicationThrottleAdjuster(PersistedExecutionState.ReplicationThrottleAdjuster.TURNED_OFF)
+        .build());
+
+    Properties overrides = new Properties();
+    overrides.setProperty(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_CONFIG, "true");
+    Executor executor = newExecutor(true, null, new RecordingNotifier(), mockAnomalyDetectorManager(null), overrides);
+    assertTrue(executor.isReplicationThrottleAdjusterEnabled());
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitForExecutionToFinish(executor);
+    // The restart reverted the switch to the config; the resumed execution switched it off again.
+    assertFalse(executor.isReplicationThrottleAdjusterEnabled());
+    assertEquals(List.of(0, 2), currentReplicas(0));
   }
 
   @Test
@@ -1031,7 +1093,7 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     PersistedAdjusterState adjusterState = new PersistedAdjusterState(Map.of(0, 12_000L, 2, 13_000L), Map.of(0, 14_000L, 2, 15_000L),
                                                                       Set.of(0), Set.of(2), Map.of(0, 1));
     _store.save(interruptedExecutionState(null, List.of(proposal)).toBuilder()
-        .replicationThrottleAdjusted(true)
+        .replicationThrottleAdjuster(PersistedExecutionState.ReplicationThrottleAdjuster.ON)
         .adjusterState(adjusterState)
                                                                      .build());
     int numSavedStatesBeforeResume = _store.savedStates().size();
@@ -1090,6 +1152,36 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     executor.setRequestedExecutionProgressCheckIntervalMs(null);
     executor.userTriggeredStopExecution(false);
     waitForExecutionToFinish(executor);
+  }
+
+  @Test
+  public void testResumeKeepsAdjustmentOffIfItWasOffForTheWholeExecution() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal pending = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    // The operator had switched the adjustment off before the execution started, so that its replication throttle holds (bug 2).
+    _store.save(interruptedExecutionState(100_000L, List.of(pending)).toBuilder()
+        .replicationThrottleAdjuster(PersistedExecutionState.ReplicationThrottleAdjuster.OFF)
+        .build());
+    Executor executor = newExecutor(true, null, new RecordingNotifier(), mockAnomalyDetectorManager(null), adjusterOverrides());
+    assertTrue(executor.isReplicationThrottleAdjusterEnabled());
+    executor.recoverInterruptedExecution(mockLoadMonitorForAdjuster());
+    waitForExecutionToFinish(executor);
+    assertFalse(executor.isReplicationThrottleAdjusterEnabled());
+    assertEquals(List.of(0, 2), currentReplicas(0));
+  }
+
+  @Test
+  public void testResumeKeepsAdjustmentOnIfItWasOn() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal pending = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    _store.save(interruptedExecutionState(null, List.of(pending)).toBuilder()
+        .replicationThrottleAdjuster(PersistedExecutionState.ReplicationThrottleAdjuster.ON)
+        .build());
+    Executor executor = newExecutor(true, null, new RecordingNotifier(), mockAnomalyDetectorManager(null), adjusterOverrides());
+    executor.recoverInterruptedExecution(mockLoadMonitorForAdjuster());
+    waitForExecutionToFinish(executor);
+    assertTrue(executor.isReplicationThrottleAdjusterEnabled());
+    assertEquals(List.of(0, 2), currentReplicas(0));
   }
 
   @Test

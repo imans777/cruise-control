@@ -58,7 +58,10 @@ public final class PersistedExecutionStateSerde {
   static final String REPLICATION_THROTTLE = "replicationThrottle";
   static final String KAFKA_ASSIGNER_MODE = "kafkaAssignerMode";
   static final String SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT = "skipInterBrokerReplicaConcurrencyAdjustment";
+  // Replaced by REPLICATION_THROTTLE_ADJUSTER; still read, as states persisted before carry them.
+  static final String REPLICATION_THROTTLE_ADJUSTMENT_DISABLED = "replicationThrottleAdjustmentDisabled";
   static final String REPLICATION_THROTTLE_ADJUSTED = "replicationThrottleAdjusted";
+  static final String REPLICATION_THROTTLE_ADJUSTER = "replicationThrottleAdjuster";
   static final String ADJUSTER = "adjuster";
   static final String LEADER_THROTTLE_BY_BROKER = "leaderThrottleByBroker";
   static final String FOLLOWER_THROTTLE_BY_BROKER = "followerThrottleByBroker";
@@ -145,7 +148,7 @@ public final class PersistedExecutionStateSerde {
     json.name(REPLICATION_THROTTLE).value(state.replicationThrottle());
     json.name(KAFKA_ASSIGNER_MODE).value(state.kafkaAssignerMode());
     json.name(SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).value(state.skipInterBrokerReplicaConcurrencyAdjustment());
-    json.name(REPLICATION_THROTTLE_ADJUSTED).value(state.replicationThrottleAdjusted());
+    json.name(REPLICATION_THROTTLE_ADJUSTER).value(state.replicationThrottleAdjuster().name());
     json.endObject();
 
     PersistedAdjusterState adjusterState = state.adjusterState();
@@ -259,7 +262,7 @@ public final class PersistedExecutionStateSerde {
              .replicationThrottle(optionalLong(parameters, REPLICATION_THROTTLE))
              .kafkaAssignerMode(required(parameters, KAFKA_ASSIGNER_MODE).getAsBoolean())
              .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean())
-             .replicationThrottleAdjusted(optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTED));
+             .replicationThrottleAdjuster(replicationThrottleAdjusterFromJson(parameters));
       JsonElement adjuster = optional(root, ADJUSTER);
       if (adjuster != null) {
         JsonObject a = adjuster.getAsJsonObject();
@@ -460,6 +463,23 @@ public final class PersistedExecutionStateSerde {
     List<ReplicaPlacementInfo> replicas = new ArrayList<>(array.size());
     array.forEach(e -> replicas.add(replicaFromJson(e.getAsJsonObject())));
     return replicas;
+  }
+
+  /**
+   * @param parameters The persisted parameters of an execution.
+   * @return Whether replication throttle adjustment was on during the execution: the field, or the two booleans it replaced (as
+   * persisted by earlier versions) -- adjusted and disabled: TURNED_OFF, adjusted only: ON, neither: OFF.
+   */
+  private static PersistedExecutionState.ReplicationThrottleAdjuster replicationThrottleAdjusterFromJson(JsonObject parameters) {
+    String adjuster = optionalString(parameters, REPLICATION_THROTTLE_ADJUSTER);
+    if (adjuster != null) {
+      return PersistedExecutionState.ReplicationThrottleAdjuster.valueOf(adjuster);
+    }
+    if (!optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTED)) {
+      return PersistedExecutionState.ReplicationThrottleAdjuster.OFF;
+    }
+    return optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTMENT_DISABLED) ? PersistedExecutionState.ReplicationThrottleAdjuster.TURNED_OFF
+                                                                                 : PersistedExecutionState.ReplicationThrottleAdjuster.ON;
   }
 
   private static void writeLongs(JsonWriter json, String name, Map<Integer, Long> valueByBroker) throws IOException {

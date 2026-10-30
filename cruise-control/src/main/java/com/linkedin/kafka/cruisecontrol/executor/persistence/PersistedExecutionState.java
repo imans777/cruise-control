@@ -43,6 +43,28 @@ public final class PersistedExecutionState {
     EXECUTE_PROPOSALS, DEMOTE_BROKERS
   }
 
+  /**
+   * Whether replication throttle adjustment by the concurrency adjuster (PR #13) was on during the execution -- one field, as the
+   * switch can be turned off (decision D2) but an adjusted throttle stays adjusted.
+   */
+  public enum ReplicationThrottleAdjuster {
+    /** The switch was on at the last checkpoint: the brokers may carry per-broker rates. On resume, the config decides. */
+    ON,
+    /** The switch was on at some point and the operator turned it off: per-broker rates may remain, the operator's throttle holds.
+     * On resume, the switch is turned off again. */
+    TURNED_OFF,
+    /** The switch was never on during the execution. On resume, the switch is turned off again. */
+    OFF;
+
+    /**
+     * @return {@code true} if the adjuster managed the replication throttle at some point -- i.e. the brokers may carry per-broker
+     * rates that no single value matches.
+     */
+    public boolean wasOn() {
+      return this != OFF;
+    }
+  }
+
   private final int _version;
   private final String _uuid;
   private final String _reason;
@@ -65,7 +87,7 @@ public final class PersistedExecutionState {
   private final Long _replicationThrottle;
   private final boolean _kafkaAssignerMode;
   private final boolean _skipInterBrokerReplicaConcurrencyAdjustment;
-  private final boolean _replicationThrottleAdjusted;
+  private final ReplicationThrottleAdjuster _replicationThrottleAdjuster;
   private final PersistedAdjusterState _adjusterState;
   private final PersistedUserTask _userTask;
   private final boolean _cleanupOnly;
@@ -97,7 +119,8 @@ public final class PersistedExecutionState {
     _replicationThrottle = builder._replicationThrottle;
     _kafkaAssignerMode = builder._kafkaAssignerMode;
     _skipInterBrokerReplicaConcurrencyAdjustment = builder._skipInterBrokerReplicaConcurrencyAdjustment;
-    _replicationThrottleAdjusted = builder._replicationThrottleAdjusted;
+    _replicationThrottleAdjuster = builder._replicationThrottleAdjuster == null ? ReplicationThrottleAdjuster.OFF
+                                                                                : builder._replicationThrottleAdjuster;
     _adjusterState = builder._adjusterState;
     _userTask = builder._userTask;
     _cleanupOnly = builder._cleanupOnly;
@@ -142,7 +165,7 @@ public final class PersistedExecutionState {
         .replicationThrottle(_replicationThrottle)
         .kafkaAssignerMode(_kafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(_skipInterBrokerReplicaConcurrencyAdjustment)
-        .replicationThrottleAdjusted(_replicationThrottleAdjusted)
+        .replicationThrottleAdjuster(_replicationThrottleAdjuster)
         .adjusterState(_adjusterState)
         .userTask(_userTask)
         .cleanupOnly(_cleanupOnly)
@@ -251,11 +274,18 @@ public final class PersistedExecutionState {
   }
 
   /**
-   * @return whether the concurrency adjuster managed the replication throttle of the execution (per-broker rates that differ
-   * from the replication throttle, or a throttle without one), see PR #13.
+   * @return Whether replication throttle adjustment was on during the execution -- see {@link ReplicationThrottleAdjuster}.
+   */
+  public ReplicationThrottleAdjuster replicationThrottleAdjuster() {
+    return _replicationThrottleAdjuster;
+  }
+
+  /**
+   * @return whether the concurrency adjuster managed the replication throttle of the execution at some point (per-broker rates that
+   * differ from the replication throttle, or a throttle without one), see PR #13.
    */
   public boolean replicationThrottleAdjusted() {
-    return _replicationThrottleAdjusted;
+    return _replicationThrottleAdjuster.wasOn();
   }
 
   /**
@@ -345,7 +375,7 @@ public final class PersistedExecutionState {
     private Long _replicationThrottle;
     private boolean _kafkaAssignerMode;
     private boolean _skipInterBrokerReplicaConcurrencyAdjustment;
-    private boolean _replicationThrottleAdjusted;
+    private ReplicationThrottleAdjuster _replicationThrottleAdjuster;
     private PersistedAdjusterState _adjusterState;
     private PersistedUserTask _userTask;
     private boolean _cleanupOnly;
@@ -540,12 +570,12 @@ public final class PersistedExecutionState {
     }
 
     /**
-     * @param replicationThrottleAdjusted Whether the concurrency adjuster managed the replication throttle of the execution
-     * (per-broker rates that differ from the replication throttle, or a throttle without one), see PR #13.
+     * @param replicationThrottleAdjuster Whether replication throttle adjustment was on during the execution -- see
+     * {@link ReplicationThrottleAdjuster}.
      * @return This builder.
      */
-    public Builder replicationThrottleAdjusted(boolean replicationThrottleAdjusted) {
-      _replicationThrottleAdjusted = replicationThrottleAdjusted;
+    public Builder replicationThrottleAdjuster(ReplicationThrottleAdjuster replicationThrottleAdjuster) {
+      _replicationThrottleAdjuster = replicationThrottleAdjuster;
       return this;
     }
 
