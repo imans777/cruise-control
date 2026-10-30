@@ -254,10 +254,13 @@ public class ExecutionTaskTracker {
     } else if (task.state() == ExecutionTaskState.ABORTED
                || task.state() == ExecutionTaskState.DEAD
                || task.state() == ExecutionTaskState.COMPLETED) {
-      // Mark the data movement of the task that has not been marked while it was in progress.
-      Long meteredDataMovementInBytes = _meteredDataMovementInBytesByTask.remove(task);
-      markDataMovement(dataToMove * BYTES_IN_MB - (meteredDataMovementInBytes == null ? 0L : meteredDataMovementInBytes));
       boolean isCompleted = task.state() == ExecutionTaskState.COMPLETED;
+      Long meteredDataMovementInBytes = _meteredDataMovementInBytesByTask.remove(task);
+      if (isCompleted) {
+        // Mark the data movement of the task that has not been marked while it was in progress. A dead or aborted task (e.g. an
+        // in-progress movement rolled back when the execution is stopped) has not moved the rest of its data.
+        markDataMovement(dataToMove * BYTES_IN_MB - (meteredDataMovementInBytes == null ? 0L : meteredDataMovementInBytes));
+      }
       if (task.type() == TaskType.INTRA_BROKER_REPLICA_ACTION) {
         _inExecutionIntraBrokerDataMovementInMB -= dataToMove;
         _finishedIntraBrokerDataMovementInMB += dataToMove;
@@ -417,6 +420,20 @@ public class ExecutionTaskTracker {
 
   public long finishedInterBrokerDataMovementInMB() {
     return _finishedInterBrokerDataMovementInMB;
+  }
+
+  /**
+   * @return Completed inter broker data movement in MB, which excludes the data of dead and aborted tasks.
+   */
+  public long completedInterBrokerDataMovementInMB() {
+    return _completedInterBrokerDataMovementInMB;
+  }
+
+  /**
+   * @return Completed intra broker data movement in MB, which excludes the data of dead and aborted tasks.
+   */
+  public long completedIntraBrokerDataMovementInMB() {
+    return _completedIntraBrokerDataMovementInMB;
   }
 
   /**

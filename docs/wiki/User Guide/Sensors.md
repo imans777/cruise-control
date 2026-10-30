@@ -85,7 +85,8 @@ moved as still to move, and divides by the average rate of the whole phase.
 With partition movement progress tracking enabled (`partition.movement.progress.tracking.enabled`, the default), the data that
 in-progress partition movements have moved so far -- measured as the growth of their new replicas -- is marked in
 `partition-data-movement-rate-MB` as it is observed and included in `partition-movement-MB-per-second`, rather than only the data of
-finished partition movements. With it disabled, both count finished partition movements only.
+finished partition movements. With it disabled, both count finished partition movements only. Neither counts the data that a
+dead or aborted partition movement (e.g. one rolled back when the execution is stopped) did not move.
 
 
 ### LoadMonitor Sensors
