@@ -41,8 +41,10 @@ import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC0;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.EXECUTION_ALERTING_THRESHOLD_MS;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.EXECUTION_DEADLINE_MS;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.EXECUTION_SHORT_CHECK_MS;
+import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.readWhileLocked;
 import static com.linkedin.kafka.cruisecontrol.executor.LogDirThrottleHelper.LOG_DIR_THROTTLE_CONFIG;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -141,6 +143,16 @@ public class LogDirThrottleHelperTest extends CCKafkaIntegrationTestHarness {
   }
 
   @Test
+  public void testAppliedThrottleByBrokerDoesNotWaitForTheLockOfTheHelper() throws Exception {
+    // The executor state reads the applied throttles while setting, updating or restoring them holds the lock of the helper for
+    // as long as it takes to alter and verify the configs.
+    LogDirThrottleHelper throttleHelper = new LogDirThrottleHelper(_adminClient, THROTTLE_RATE, new LogDirThrottleHelper.AppliedThrottles());
+    throttleHelper.setThrottles(Collections.singletonList(intraBrokerTask(0, 0)));
+    assertEquals(Collections.singletonMap(0, THROTTLE_RATE_STRING), readWhileLocked(throttleHelper, throttleHelper::appliedThrottleByBroker));
+    throttleHelper.clearAllThrottles();
+  }
+
+  @Test
   public void testKeepThrottleChangedDuringExecution() throws Exception {
     LogDirThrottleHelper throttleHelper = new LogDirThrottleHelper(_adminClient, THROTTLE_RATE, new LogDirThrottleHelper.AppliedThrottles());
     throttleHelper.setThrottles(Arrays.asList(intraBrokerTask(0, 0), intraBrokerTask(1, 1)));
@@ -153,6 +165,93 @@ public class LogDirThrottleHelperTest extends CCKafkaIntegrationTestHarness {
     throttleHelper.clearAllThrottles();
     assertPerBrokerThrottle(0, changedThrottle);
     assertPerBrokerThrottle(1, null);
+  }
+
+  @Test
+  public void testUpdateThrottleRate() throws Exception {
+    String preExistingThrottle = "500";
+    setThrottleConfig("0", preExistingThrottle);
+    waitForThrottle(0, preExistingThrottle, ConfigEntry.ConfigSource.DYNAMIC_BROKER_CONFIG);
+
+    LogDirThrottleHelper throttleHelper = new LogDirThrottleHelper(_adminClient, THROTTLE_RATE, new LogDirThrottleHelper.AppliedThrottles());
+    throttleHelper.setThrottles(Arrays.asList(intraBrokerTask(0, 0), intraBrokerTask(1, 1)));
+    assertPerBrokerThrottle(0, THROTTLE_RATE_STRING);
+    assertPerBrokerThrottle(1, THROTTLE_RATE_STRING);
+
+    // The new rate is applied to the throttled brokers and to broker 2, which has a newly in-progress intra-broker task.
+    long newThrottleRate = 200L;
+    String newThrottleRateString = String.valueOf(newThrottleRate);
+    assertTrue(throttleHelper.updateThrottleRate(newThrottleRate, Arrays.asList(intraBrokerTask(1, 1), intraBrokerTask(2, 2))));
+    for (int brokerId = 0; brokerId < clusterSize(); brokerId++) {
+      assertPerBrokerThrottle(brokerId, newThrottleRateString);
+    }
+    assertEquals(Set.of(0, 1, 2), throttleHelper.throttledBrokers());
+
+    // Brokers of upcoming tasks are throttled with the new rate.
+    throttleHelper.setThrottles(Collections.singletonList(intraBrokerTask(3, 2)));
+    assertPerBrokerThrottle(2, newThrottleRateString);
+
+    throttleHelper.clearAllThrottles();
+    assertPerBrokerThrottle(0, preExistingThrottle);
+    assertPerBrokerThrottle(1, null);
+    assertPerBrokerThrottle(2, null);
+
+    // Once the throttles are restored, an update is refused and throttles no broker.
+    assertFalse(throttleHelper.updateThrottleRate(300L, Collections.singletonList(intraBrokerTask(4, 1))));
+    assertPerBrokerThrottle(0, preExistingThrottle);
+    assertPerBrokerThrottle(1, null);
+    assertTrue(throttleHelper.throttledBrokers().isEmpty());
+  }
+
+  @Test
+  public void testUpdateThrottleRateWithoutInitialThrottle() throws Exception {
+    LogDirThrottleHelper throttleHelper = new LogDirThrottleHelper(_adminClient, null, new LogDirThrottleHelper.AppliedThrottles());
+    throttleHelper.setThrottles(Collections.singletonList(intraBrokerTask(0, 0)));
+    assertPerBrokerThrottle(0, null);
+
+    // An execution started without a log dir throttle gets throttled by the update.
+    assertTrue(throttleHelper.updateThrottleRate(THROTTLE_RATE, Collections.singletonList(intraBrokerTask(0, 0))));
+    assertPerBrokerThrottle(0, THROTTLE_RATE_STRING);
+    throttleHelper.setThrottles(Collections.singletonList(intraBrokerTask(1, 1)));
+    assertPerBrokerThrottle(1, THROTTLE_RATE_STRING);
+
+    throttleHelper.clearAllThrottles();
+    assertPerBrokerThrottle(0, null);
+    assertPerBrokerThrottle(1, null);
+  }
+
+  @Test
+  public void testRemoveThrottleRate() throws Exception {
+    String preExistingThrottle = "500";
+    setThrottleConfig("0", preExistingThrottle);
+    waitForThrottle(0, preExistingThrottle, ConfigEntry.ConfigSource.DYNAMIC_BROKER_CONFIG);
+
+    LogDirThrottleHelper throttleHelper = new LogDirThrottleHelper(_adminClient, THROTTLE_RATE,
+                                                                   new LogDirThrottleHelper.AppliedThrottles());
+    throttleHelper.setThrottles(Arrays.asList(intraBrokerTask(0, 0), intraBrokerTask(1, 1)));
+    assertPerBrokerThrottle(0, THROTTLE_RATE_STRING);
+    assertPerBrokerThrottle(1, THROTTLE_RATE_STRING);
+
+    // Removing the throttle restores what each broker had, with the movements still in progress.
+    assertTrue(throttleHelper.removeThrottleRate());
+    assertPerBrokerThrottle(0, preExistingThrottle);
+    assertPerBrokerThrottle(1, null);
+    assertTrue(throttleHelper.throttledBrokers().isEmpty());
+
+    // Upcoming tasks are not throttled, and a second removal is a no-op.
+    throttleHelper.setThrottles(Collections.singletonList(intraBrokerTask(2, 2)));
+    assertPerBrokerThrottle(2, null);
+    assertFalse(throttleHelper.removeThrottleRate());
+
+    // Unlike clearAllThrottles, the removal leaves the helper open: the same execution can be throttled again.
+    assertTrue(throttleHelper.updateThrottleRate(THROTTLE_RATE, Collections.singletonList(intraBrokerTask(3, 1))));
+    assertPerBrokerThrottle(1, THROTTLE_RATE_STRING);
+
+    throttleHelper.clearAllThrottles();
+    assertPerBrokerThrottle(0, preExistingThrottle);
+    assertPerBrokerThrottle(1, null);
+    // Once the throttles are restored the helper is closed, so a removal is refused like an update.
+    assertFalse(throttleHelper.removeThrottleRate());
   }
 
   @Test
@@ -286,6 +385,49 @@ public class LogDirThrottleHelperTest extends CCKafkaIntegrationTestHarness {
     // The operator's own value comes back -- a leftover must not be swept into nothing.
     assertEquals(Map.of("1", "4242"), cluster.perBrokerThrottles());
     assertTrue(appliedThrottles.isEmpty());
+  }
+
+  @Test
+  public void testBatchAdminRequestsForUpdatingThrottleRate() {
+    FakeCluster cluster = new FakeCluster();
+    LogDirThrottleHelper throttleHelper = new LogDirThrottleHelper(cluster.adminClient(), THROTTLE_RATE,
+                                                                   new LogDirThrottleHelper.AppliedThrottles(),
+                                                                   RETRIES_FOR_FAKE_CLUSTER);
+    throttleHelper.setThrottles(Arrays.asList(intraBrokerTask(0, 0), intraBrokerTask(1, 1), intraBrokerTask(2, 2)));
+    assertEquals(List.of(3, 3), cluster.describeBatchSizes());
+    assertEquals(List.of(3), cluster.alterBatchSizes());
+
+    // A single request alters the throttles of all throttled brokers, and a single request verifies them.
+    String newThrottleRate = "200";
+    assertTrue(throttleHelper.updateThrottleRate(Long.parseLong(newThrottleRate),
+                                                 Arrays.asList(intraBrokerTask(0, 0), intraBrokerTask(1, 1))));
+    assertEquals(List.of(3, 3, 3), cluster.describeBatchSizes());
+    assertEquals(List.of(3, 3), cluster.alterBatchSizes());
+    assertEquals(Map.of("0", newThrottleRate, "1", newThrottleRate, "2", newThrottleRate), cluster.perBrokerThrottles());
+
+    throttleHelper.clearAllThrottles();
+    assertTrue(cluster.perBrokerThrottles().isEmpty());
+  }
+
+  @Test
+  public void testClearAllThrottlesAfterPartiallyFailedUpdate() {
+    FakeCluster cluster = new FakeCluster();
+    LogDirThrottleHelper throttleHelper = new LogDirThrottleHelper(cluster.adminClient(), THROTTLE_RATE,
+                                                                   new LogDirThrottleHelper.AppliedThrottles(),
+                                                                   RETRIES_FOR_FAKE_CLUSTER);
+    throttleHelper.setThrottles(Arrays.asList(intraBrokerTask(0, 0), intraBrokerTask(1, 1)));
+
+    // Updating the throttle of broker 1 fails.
+    cluster.failAlteringConfigsOf("1");
+    String newThrottleRate = "200";
+    assertThrows(IllegalStateException.class,
+                 () -> throttleHelper.updateThrottleRate(Long.parseLong(newThrottleRate), Collections.emptyList()));
+    assertEquals(Map.of("0", newThrottleRate, "1", THROTTLE_RATE_STRING), cluster.perBrokerThrottles());
+
+    // Both the updated and the non-updated throttles are restored.
+    cluster.stopFailing();
+    throttleHelper.clearAllThrottles();
+    assertTrue(cluster.perBrokerThrottles().isEmpty());
   }
 
   private static ExecutionTask intraBrokerTask(long executionId, int brokerId) {

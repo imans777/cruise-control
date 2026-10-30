@@ -37,11 +37,16 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
  * See https://kafka.apache.org/documentation/#rep-throttle
+ *
+ * <p>The throttle rate of an ongoing execution can be updated dynamically (see {@link #updateThrottleRate(long, Supplier)}).
+ * This class is thread safe: its methods synchronize on this helper, so a caller can also hold the lock of this helper to make
+ * a sequence of operations atomic with respect to a concurrent throttle rate update.</p>
  */
 class ReplicationThrottleHelper {
   private static final Logger LOG = LoggerFactory.getLogger(ReplicationThrottleHelper.class);
@@ -74,8 +79,9 @@ class ReplicationThrottleHelper {
   static final int THROTTLE_RATE_UPDATE_RETRIES = 5;
 
   private final Admin _adminClient;
-  // The initial throttle rate, which is used for brokers whose throttle rate has not been adjusted.
-  private final Long _throttleRate;
+  // The throttle rate (null if no throttling is applied), which is used for brokers whose throttle rate has not been adjusted.
+  // Written under the lock of this helper (it may be updated during the execution), volatile for the unsynchronized getters.
+  private volatile Long _throttleRate;
   private final int _retries;
   private final Set<Integer> _deadBrokers;
   private final AppliedThrottles _appliedThrottles;
@@ -113,6 +119,60 @@ class ReplicationThrottleHelper {
     this._leaderThrottleRateByBroker = new ConcurrentHashMap<>();
     this._followerThrottleRateByBroker = new ConcurrentHashMap<>();
     this._throttledBrokers = ConcurrentHashMap.newKeySet();
+  }
+
+  /**
+   * Update the throttle rate, and apply the new rate to the in-progress inter-broker replica movements right away. Upcoming
+   * inter-broker replica movements are throttled with the new rate as their throttles are set via {@link #setThrottles(List)}.
+   *
+   * <p>The in-progress replica movements are retrieved while holding the lock of this helper. Otherwise, the throttles of a
+   * movement that completes concurrently might be removed by {@link #clearThrottles(List, List)} and then set again by this
+   * update, which would leave them in place after the execution.</p>
+   *
+   * @param throttleRate The new replication throttle rate in bytes per second.
+   * @param inProgressProposals Supplies the proposals of the in-progress inter-broker replica movements.
+   */
+  synchronized void updateThrottleRate(long throttleRate, Supplier<List<ExecutionProposal>> inProgressProposals)
+  throws ExecutionException, InterruptedException, TimeoutException {
+    _throttleRate = throttleRate;
+    setThrottles(inProgressProposals.get());
+  }
+
+  /**
+   * Not synchronized: the executor state reads it while setting, clearing or updating the throttles may hold the lock of this
+   * helper for as long as it takes to alter and verify the configs.
+   *
+   * @return The throttle rate used for brokers whose throttle rate has not been adjusted, or {@code null} if throttling is disabled.
+   */
+  Long throttleRate() {
+    return _throttleRate;
+  }
+
+  /**
+   * Remove the throttle of an ongoing execution: stop throttling the in-progress inter-broker replica movements and let the
+   * upcoming ones run unthrottled. The in-progress proposals are retrieved while holding the lock of this helper, for the same
+   * reason as in {@link #updateThrottleRate(long, Supplier)}.
+   *
+   * <p>This is what an {@code admin} request asking for a {@code null} throttle means. It is deliberately not the same as a
+   * rate of 0, which Kafka reads as a quota of zero bytes per second -- i.e. a halt.</p>
+   *
+   * @param inProgressProposals Supplies the proposals of the in-progress inter-broker replica movements.
+   * @return {@code true} if a throttle was removed, {@code false} if the execution was not throttled to begin with.
+   */
+  synchronized boolean removeThrottleRate(Supplier<List<ExecutionProposal>> inProgressProposals) throws InterruptedException {
+    if (_throttleRate == null) {
+      LOG.info("Skip removing the replication throttle, since the ongoing execution is not throttled.");
+      return false;
+    }
+    // Clear the rate first, so that the upcoming task batches are not throttled even if the removal below fails midway.
+    _throttleRate = null;
+    List<ExecutionProposal> proposals = inProgressProposals.get();
+    Set<Integer> participatingBrokers = getParticipatingBrokers(proposals);
+    LOG.info("Removing the replication throttle of the ongoing execution from brokers {}.", participatingBrokers);
+    // Through the batched removal, so that the record of applied throttles (and of throttled brokers) stays in line: what fails
+    // to be removed stays recorded, and is removed later.
+    removeThrottles(participatingBrokers, proposals);
+    return true;
   }
 
   synchronized void setThrottles(List<ExecutionProposal> proposals)

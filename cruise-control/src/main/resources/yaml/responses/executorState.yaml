@@ -30,12 +30,21 @@ ExecutorState:
       items:
         type: integer
         format: int32
-    # the replication throttles in force for the ongoing inter-broker replica movements, absent when they are not throttled
+    # the throttles in force for the ongoing execution, absent when it is not throttled
+    ongoingReplicationThrottle:
+      type: integer
+      format: int64
+      description: Replication throttle (bytes/second) in force for the ongoing inter-broker replica movements.
     ongoingReplicationThrottleByBroker:
       type: object
       description: Leader and follower replication throttles (bytes/second) in force on each broker (by broker id) throttled by the ongoing inter-broker replica movements, as the concurrency adjuster may set them per broker.
       additionalProperties:
         $ref: '#/BrokerReplicationThrottle'
+    ongoingLogDirThrottleByBroker:
+      type: object
+      description: Log dir throttle (bytes/second) in force on each broker with ongoing intra-broker replica movements.
+      additionalProperties:
+        type: string
     # leadership information
     numTotalLeadershipMovements:
       type: integer

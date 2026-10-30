@@ -27,6 +27,7 @@ import com.linkedin.kafka.cruisecontrol.exception.BrokerCapacityResolutionExcept
 import com.linkedin.kafka.cruisecontrol.exception.KafkaCruiseControlException;
 import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
 import com.linkedin.kafka.cruisecontrol.executor.ConcurrencyType;
+import com.linkedin.kafka.cruisecontrol.executor.DynamicThrottleResult;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutionProposal;
 import com.linkedin.kafka.cruisecontrol.executor.Executor;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutorState;
@@ -526,6 +527,46 @@ public class KafkaCruiseControl {
    */
   public void setRequestedMaxInterBrokerPartitionMovements(Integer requestedMaxInterBrokerPartitionMovements) {
     _executor.setRequestedMaxInterBrokerPartitionMovements(requestedMaxInterBrokerPartitionMovements);
+  }
+
+  /**
+   * Dynamically update the replication throttle of the ongoing execution (if any).
+   *
+   * @param replicationThrottle The new replication throttle rate in bytes per second.
+   * @return {@code true} if the replication throttle of the ongoing execution has been updated, {@code false} if
+   * there is no ongoing execution with remaining inter-broker replica movements to throttle.
+   */
+  public boolean updateOngoingExecutionReplicationThrottle(long replicationThrottle) {
+    return _executor.updateOngoingExecutionReplicationThrottle(replicationThrottle);
+  }
+
+  /**
+   * Remove the replication throttle of the ongoing execution (if any).
+   *
+   * @return The outcome of the removal -- removed, not throttled, or no ongoing inter-broker replica movement.
+   */
+  public DynamicThrottleResult removeOngoingExecutionReplicationThrottle() {
+    return _executor.removeOngoingExecutionReplicationThrottle();
+  }
+
+  /**
+   * Remove the log dir throttle of the ongoing execution (if any).
+   *
+   * @return The outcome of the removal -- removed, not throttled, or no ongoing intra-broker replica movement.
+   */
+  public DynamicThrottleResult removeOngoingExecutionLogDirThrottle() {
+    return _executor.removeOngoingExecutionLogDirThrottle();
+  }
+
+  /**
+   * Dynamically update the log dir throttle of the ongoing execution (if any).
+   *
+   * @param logDirThrottle The new log dir throttle rate in bytes per second.
+   * @return {@code true} if the log dir throttle of the ongoing execution has been updated, {@code false} if
+   * there is no ongoing execution with remaining intra-broker replica movements to throttle.
+   */
+  public boolean updateOngoingExecutionLogDirThrottle(long logDirThrottle) {
+    return _executor.updateOngoingExecutionLogDirThrottle(logDirThrottle);
   }
 
   /**
