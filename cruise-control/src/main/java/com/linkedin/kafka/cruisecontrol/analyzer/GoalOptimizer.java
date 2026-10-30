@@ -9,6 +9,7 @@ import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.Timer;
 import com.linkedin.kafka.cruisecontrol.common.Utils;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.Goal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils;
 import com.linkedin.kafka.cruisecontrol.config.BrokerSetResolver;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
@@ -476,9 +477,12 @@ public class GoalOptimizer implements Runnable {
       throws KafkaCruiseControlException {
     LOG.trace("Cluster before optimization is {}", clusterModel);
     BrokerStats brokerStatsBeforeOptimization = initBrokerStats != null ? initBrokerStats : clusterModel.brokerStats(null);
+    // The disk balance stats of a disk rebalance cover only the brokers it is scoped to.
+    Set<Integer> diskStatsBrokerIds = GoalUtils.diskStatsBrokerIds(goalsByPriority, optimizationOptions);
     ClusterModelStats statsBeforeOptimization = initClusterModelStats != null
                                                 ? initClusterModelStats
-                                                : clusterModel.getClusterStats(_balancingConstraint, optimizationOptions);
+                                                : clusterModel.getClusterStats(_balancingConstraint, optimizationOptions,
+                                                                               diskStatsBrokerIds);
     Map<TopicPartition, List<ReplicaPlacementInfo>> initReplicaDistribution = clusterModel.getReplicaDistribution();
     Map<TopicPartition, ReplicaPlacementInfo> initLeaderDistribution = clusterModel.getLeaderDistribution();
     boolean isSelfHealing = !clusterModel.selfHealingEligibleReplicas().isEmpty();
@@ -509,7 +513,7 @@ public class GoalOptimizer implements Runnable {
         throw e;
       }
       optimizedGoals.add(goal);
-      statsByGoalPriority.put(goal, clusterModel.getClusterStats(_balancingConstraint, optimizationOptions));
+      statsByGoalPriority.put(goal, clusterModel.getClusterStats(_balancingConstraint, optimizationOptions, diskStatsBrokerIds));
       optimizationDurationByGoal.put(goal.name(), Duration.ofMillis(_time.milliseconds() - startTimeMs));
 
       boolean hasDiff = AnalyzerUtils.hasDiff(preOptimizedReplicaDistribution, preOptimizedLeaderDistribution, clusterModel);

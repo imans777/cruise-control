@@ -135,7 +135,23 @@ public class ClusterModel implements Serializable {
    * @return Analysis stats with this cluster and given balancing constraint.
    */
   public ClusterModelStats getClusterStats(BalancingConstraint balancingConstraint, OptimizationOptions optimizationOptions) {
-    return (new ClusterModelStats()).populate(this, balancingConstraint, optimizationOptions);
+    return getClusterStats(balancingConstraint, optimizationOptions, Collections.emptySet());
+  }
+
+  /**
+   * Populate the analysis stats with this cluster, given balancing constraint, and optimization options, with the disk balance
+   * stats ({@link ClusterModelStats#diskBalanceStats()}) over the given brokers only.
+   *
+   * @param balancingConstraint Balancing constraint.
+   * @param optimizationOptions Options to take into account while populating stats.
+   * @param diskStatsBrokerIds The ids of the brokers to compute the disk balance stats over, or an empty set for all alive brokers
+   *                           (see {@link com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils#diskStatsBrokerIds}).
+   * @return Analysis stats with this cluster and given balancing constraint.
+   */
+  public ClusterModelStats getClusterStats(BalancingConstraint balancingConstraint,
+                                           OptimizationOptions optimizationOptions,
+                                           Set<Integer> diskStatsBrokerIds) {
+    return (new ClusterModelStats()).populate(this, balancingConstraint, optimizationOptions, diskStatsBrokerIds);
   }
 
   /**

@@ -102,7 +102,8 @@ public class RemoveDisksRunnable extends GoalBasedOperationRunnable {
                 _excludeRecentlyDemotedBrokers,
                 _excludeRecentlyRemovedBrokers,
                 _excludedTopics,
-                Collections.emptySet(),
+                // The brokers whose disks are removed: only they are balanced, and the disk balance stats cover only them.
+                _brokerIdAndLogdirs.keySet(),
                 false,
                 _fastMode
         );
@@ -110,7 +111,8 @@ public class RemoveDisksRunnable extends GoalBasedOperationRunnable {
         // Marking disks for removal drops their capacity, hence the load and stats before the disk removal are taken beforehand.
         BrokerStats brokerStatsBeforeRemoval = clusterModel.brokerStats(null);
         ClusterModelStats clusterModelStatsBeforeRemoval =
-                clusterModel.getClusterStats(new BalancingConstraint(_kafkaCruiseControl.config()), optimizationOptions);
+                clusterModel.getClusterStats(new BalancingConstraint(_kafkaCruiseControl.config()), optimizationOptions,
+                                             _brokerIdAndLogdirs.keySet());
         _brokerIdAndLogdirs.forEach((brokerId, logDirsToRemove) ->
                 logDirsToRemove.forEach(logDir -> clusterModel.markDiskForRemoval(brokerId, logDir))
         );

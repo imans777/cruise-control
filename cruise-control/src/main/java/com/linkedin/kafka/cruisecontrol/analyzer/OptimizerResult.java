@@ -5,6 +5,7 @@
 package com.linkedin.kafka.cruisecontrol.analyzer;
 
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.Goal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutionProposal;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
@@ -22,6 +23,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 
 import static com.linkedin.cruisecontrol.common.utils.Utils.validateNotNull;
 import static com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils.MAX_BALANCEDNESS_SCORE;
@@ -85,6 +87,7 @@ public class OptimizerResult {
   private final Map<String, Duration> _optimizationDurationByGoal;
   private final ProvisionResponse _provisionResponse;
   private final Set<String> _intraBrokerGoalNames;
+  private final Set<Integer> _diskStatsBrokerIds;
 
   OptimizerResult(LinkedHashMap<Goal, ClusterModelStats> statsByGoalPriority,
                   Set<String> violatedGoalNamesBeforeOptimization,
@@ -123,7 +126,8 @@ public class OptimizerResult {
     _clusterModelStatsBeforeOptimization = clusterModelStatsBeforeOptimization;
     _brokerStatsAfterOptimization = clusterModel.brokerStats(null);
     _modelGeneration = clusterModel.generation();
-    _clusterModelStats = clusterModel.getClusterStats(balancingConstraint, optimizationOptions);
+    _diskStatsBrokerIds = GoalUtils.diskStatsBrokerIds(statsByGoalPriority.keySet(), optimizationOptions);
+    _clusterModelStats = clusterModel.getClusterStats(balancingConstraint, optimizationOptions, _diskStatsBrokerIds);
     _capacityEstimationInfoByBrokerId = clusterModel.capacityEstimationInfoByBrokerId();
     _optimizationOptions = optimizationOptions;
     // Populate on-demand balancedness score before and after.
@@ -341,9 +345,10 @@ public class OptimizerResult {
     }
     DiskBalanceStats.DiskUsageStats usageBefore = before.usage();
     DiskBalanceStats.DiskUsageStats usageAfter = after.usage();
-    return String.format("%nDisk usage balance (before -> after): unbalanced disks %d of %d -> %d of %d, max utilization %.2f%% -> "
+    String scope = _diskStatsBrokerIds.isEmpty() ? "" : String.format(" of brokers %s", new TreeSet<>(_diskStatsBrokerIds));
+    return String.format("%nDisk usage balance%s (before -> after): unbalanced disks %d of %d -> %d of %d, max utilization %.2f%% -> "
                          + "%.2f%%, max spread within a broker %.2fpp -> %.2fpp.",
-                         usageBefore.numUnbalancedDisks(), before.numAliveDisks(), usageAfter.numUnbalancedDisks(),
+                         scope, usageBefore.numUnbalancedDisks(), before.numAliveDisks(), usageAfter.numUnbalancedDisks(),
                          after.numAliveDisks(), usageBefore.max().utilizationPct(), usageAfter.max().utilizationPct(),
                          usageBefore.maxSpreadWithinBroker().utilizationPct(), usageAfter.maxSpreadWithinBroker().utilizationPct());
   }

@@ -6,7 +6,9 @@ package com.linkedin.kafka.cruisecontrol.analyzer;
 
 import com.codahale.metrics.MetricRegistry;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUnitTestUtils;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskUsageDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.Goal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskCapacityGoal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskUsageDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.async.progress.OperationProgress;
@@ -18,6 +20,7 @@ import com.linkedin.kafka.cruisecontrol.exception.OptimizationFailureException;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutionProposal;
 import com.linkedin.kafka.cruisecontrol.executor.Executor;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
+import com.linkedin.kafka.cruisecontrol.model.DiskBalanceStats;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -33,6 +36,7 @@ import org.junit.Test;
 import static com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUnitTestUtils.getAggregatedMetricValues;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 
 
 /**
@@ -52,6 +56,38 @@ public class IntraBrokerDiskRebalanceScopeTest {
     ClusterModel clusterModel = clusterWithAllReplicasOnFirstDisk(BALANCED_REPLICA_DISK_LOAD, BALANCED_REPLICA_DISK_LOAD);
     Set<ExecutionProposal> proposals = optimize(clusterModel, Collections.emptySet(), diskGoals());
     assertEquals(Set.of(0, 1), brokersWithReplicasToMoveBetweenDisks(proposals));
+  }
+
+  @Test
+  public void testDiskBalanceStatsCoverRequestedBrokersOnly() throws KafkaCruiseControlException {
+    // Both brokers have all their replicas on their first disk, and only broker 0 is rebalanced.
+    ClusterModel clusterModel = clusterWithAllReplicasOnFirstDisk(BALANCED_REPLICA_DISK_LOAD, BALANCED_REPLICA_DISK_LOAD);
+    int numDisksOfBroker0 = clusterModel.broker(0).disks().size();
+    OptimizerResult result = optimizerResult(clusterModel, Collections.singleton(0), diskGoals());
+
+    // The disk balance stats before and after count the disks of broker 0 only, so they read as balanced after the rebalance,
+    // while the disks of broker 1 are still unbalanced.
+    DiskBalanceStats before = result.clusterModelStatsBeforeOptimization().diskBalanceStats();
+    DiskBalanceStats after = result.clusterModelStats().diskBalanceStats();
+    assertEquals(numDisksOfBroker0, before.numAliveDisks());
+    assertEquals(numDisksOfBroker0, before.usage().numUnbalancedDisks());
+    assertEquals(numDisksOfBroker0, after.numAliveDisks());
+    assertEquals(0, after.usage().numUnbalancedDisks());
+    String summary = result.getProposalSummary();
+    assertTrue(summary, summary.contains(String.format("Disk usage balance of brokers [0] (before -> after): unbalanced disks %d of %d -> 0 of %d,",
+                                                       numDisksOfBroker0, numDisksOfBroker0, numDisksOfBroker0)));
+
+    // Without requested brokers, the stats count the disks of every alive broker.
+    ClusterModel otherClusterModel = clusterWithAllReplicasOnFirstDisk(BALANCED_REPLICA_DISK_LOAD, BALANCED_REPLICA_DISK_LOAD);
+    OptimizerResult unscoped = optimizerResult(otherClusterModel, Collections.emptySet(), diskGoals());
+    assertEquals(2 * numDisksOfBroker0, unscoped.clusterModelStatsBeforeOptimization().diskBalanceStats().numAliveDisks());
+    assertTrue(unscoped.getProposalSummary().contains("Disk usage balance (before -> after)"));
+
+    // An inter-broker request with destination brokers (e.g. adding brokers) changes the disks of the source brokers too.
+    OptimizationOptions options = new OptimizationOptions(Collections.emptySet(), Collections.emptySet(), Collections.emptySet(),
+                                                          false, Collections.singleton(0));
+    assertEquals(Collections.singleton(0), GoalUtils.diskStatsBrokerIds(diskGoals(), options));
+    assertEquals(Collections.emptySet(), GoalUtils.diskStatsBrokerIds(List.of(configure(new DiskUsageDistributionGoal())), options));
   }
 
   @Test
@@ -111,11 +147,16 @@ public class IntraBrokerDiskRebalanceScopeTest {
 
   private static Set<ExecutionProposal> optimize(ClusterModel clusterModel, Set<Integer> requestedBrokerIds, List<Goal> goals)
       throws KafkaCruiseControlException {
+    return optimizerResult(clusterModel, requestedBrokerIds, goals).goalProposals();
+  }
+
+  private static OptimizerResult optimizerResult(ClusterModel clusterModel, Set<Integer> requestedBrokerIds, List<Goal> goals)
+      throws KafkaCruiseControlException {
     GoalOptimizer goalOptimizer = new GoalOptimizer(CONFIG, null, Time.SYSTEM, new MetricRegistry(),
                                                     EasyMock.mock(Executor.class), EasyMock.mock(Admin.class));
     OptimizationOptions optimizationOptions = new OptimizationOptions(Collections.emptySet(), Collections.emptySet(),
                                                                       Collections.emptySet(), false, requestedBrokerIds);
-    return goalOptimizer.optimizations(clusterModel, goals, new OperationProgress(), null, optimizationOptions).goalProposals();
+    return goalOptimizer.optimizations(clusterModel, goals, new OperationProgress(), null, optimizationOptions);
   }
 
   private static Set<Integer> brokersWithReplicasToMoveBetweenDisks(Set<ExecutionProposal> proposals) {

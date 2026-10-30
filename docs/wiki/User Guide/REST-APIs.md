@@ -410,6 +410,9 @@ disks of each broker, grouped by the metric it is about -- currently the disk us
 * The summary shows the disk usage balance before and after the optimization, e.g. `Disk usage balance (before -> after):
   unbalanced disks 12 of 12 -> 0 of 12, max utilization 17.33% -> 6.18%, max spread within a broker 16.62pp -> 2.83pp.`
   (`diskStatisticsBefore` and `diskStatisticsAfter` in JSON, shaped like `diskStatistics`).
+* The disk-level stats and the summary cover the brokers the request balances: with `rebalance_disk=true` and
+  `destination_broker_ids`, only those brokers (`Disk usage balance of brokers [1, 2] (before -> after): ...`); for
+  `remove_disks`, only the brokers in `brokerid_and_logdirs`. Otherwise, all alive brokers.
 * With `verbose=true`, a proposal that moves replicas between disks shows each replica as `brokerId-logdir` in plaintext (e.g.
   `[0-/d1, 1-/d1] -> [0-/d2, 1-/d1]`), and the log directory of each replica before and after in JSON (`oldReplicaLogdirs`
   and `newReplicaLogdirs`, keyed by broker id). A replica whose log directory is not known, e.g. on a dead broker, is shown
