@@ -168,6 +168,22 @@ RebalanceEndpoint:
           type: integer
           format: int64
           minimum: 5000
+      - name: execution_window_start_hour
+        in: query
+        description: Hour of the day (0-23, inclusive) from which the execution is allowed to start new movements every day. Must be set together with execution_window_end_hour. Movements in progress when the window closes are allowed to finish.
+        schema:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 23
+      - name: execution_window_end_hour
+        in: query
+        description: Hour of the day (0-23, exclusive) after which the execution stops starting new movements until the window opens again the next day. Must be set together with execution_window_start_hour. A value smaller than execution_window_start_hour defines a window that spans midnight.
+        schema:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 23
       - name: reason
         in: query
         description: Reason for request.
