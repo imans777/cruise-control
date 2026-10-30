@@ -554,7 +554,8 @@ public final class ExecutorConfig {
       + "execution started without a replication throttle (neither replication_throttle nor default.replication.throttle) starts each "
       + "broker at a fraction of its network headroom (see concurrency.adjuster.replication.throttle.initial.headroom.fraction). It "
       + "can be enabled or disabled at runtime with the replication_throttle_adjustment parameter of the admin endpoint; disabling it "
-      + "during an execution leaves the replication throttles at their last values until the execution ends.";
+      + "during an execution makes a replication_throttle set during the execution hold for the rest of it, or else leaves the "
+      + "replication throttles at their last values.";
 
   /**
    * <code>concurrency.adjuster.min.replication.throttle</code>

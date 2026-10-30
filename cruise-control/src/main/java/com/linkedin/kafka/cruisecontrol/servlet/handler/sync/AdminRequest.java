@@ -8,6 +8,7 @@ import com.linkedin.cruisecontrol.detector.AnomalyType;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControl;
 import com.linkedin.kafka.cruisecontrol.executor.ConcurrencyType;
 import com.linkedin.kafka.cruisecontrol.executor.DynamicThrottleResult;
+import com.linkedin.kafka.cruisecontrol.servlet.UserRequestException;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutorState;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.AdminParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.ChangeExecutionConcurrencyParameters;
@@ -181,6 +182,11 @@ public class AdminRequest extends AbstractSyncRequest {
     Long replicationThrottle = changeExecutionConcurrencyParameters.replicationThrottle();
     if (changeExecutionConcurrencyParameters.removeReplicationThrottle()) {
       DynamicThrottleResult result = _kafkaCruiseControl.removeOngoingExecutionReplicationThrottle();
+      if (result == DynamicThrottleResult.ADJUSTER_ENABLED) {
+        throw new UserRequestException("The replication throttle of the ongoing execution cannot be removed while replication throttle "
+                                       + "adjustment is enabled, as the concurrency adjuster throttles every broker of the execution. "
+                                       + "Turn replication_throttle_adjustment off first (a separate admin request), then remove it.");
+      }
       if (result == DynamicThrottleResult.REMOVED) {
         sb.append(String.format("Replication throttle of the ongoing execution is removed%n"));
         LOG.info("Replication throttle of the ongoing execution is removed by user.");
