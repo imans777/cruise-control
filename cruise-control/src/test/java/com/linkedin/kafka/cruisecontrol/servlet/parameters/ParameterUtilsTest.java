@@ -330,4 +330,39 @@ public class ParameterUtilsTest {
     EasyMock.replay(request);
     return request;
   }
+
+  @Test
+  public void testRebalanceDiskBrokerByBroker() {
+    // Default: not set.
+    Assert.assertFalse(ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(Collections.emptyMap())));
+
+    // Set along with rebalance_disk=true.
+    Map<String, String> params = new HashMap<>();
+    params.put(ParameterUtils.REBALANCE_DISK_MODE_PARAM, "true");
+    params.put(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "true");
+    Assert.assertTrue(ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(params)));
+
+    // Explicitly disabled along with rebalance_disk=true.
+    params.put(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "false");
+    Assert.assertFalse(ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(params)));
+
+    // Set without rebalance_disk=true.
+    Map<String, String> invalidParams = Collections.singletonMap(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "true");
+    Assert.assertThrows(UserRequestException.class,
+                        () -> ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(invalidParams)));
+    params.put(ParameterUtils.REBALANCE_DISK_MODE_PARAM, "false");
+    params.put(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "true");
+    Assert.assertThrows(UserRequestException.class,
+                        () -> ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(params)));
+  }
+
+  private static CruiseControlRequestContext mockRequestWithParams(Map<String, String> params) {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    Map<String, String[]> paramMap = new HashMap<>();
+    params.forEach((name, value) -> paramMap.put(name, new String[]{value}));
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).anyTimes();
+    params.forEach((name, value) -> EasyMock.expect(mockRequest.getParameter(name)).andReturn(value).anyTimes());
+    EasyMock.replay(mockRequest);
+    return mockRequest;
+  }
 }
