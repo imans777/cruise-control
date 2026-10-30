@@ -47,10 +47,14 @@ public class ExecutorStateTest {
   public void testReplicationThrottleByBrokerAlongWithTheOtherThrottles() {
     ExecutorState executorState = ExecutorState.noTaskInProgress(Set.of(), Set.of());
     SortedMap<Integer, BrokerReplicationThrottle> throttleByBroker = new TreeMap<>(Map.of(1, new BrokerReplicationThrottle(3L, 4L)));
-    // In either order, the state keeps the base rate and the log dir throttles as well as the per-broker rates.
-    for (ExecutorState state : List.of(executorState.withThrottles(2L, Map.of(1, "5")).withReplicationThrottleByBroker(throttleByBroker),
-                                       executorState.withReplicationThrottleByBroker(throttleByBroker).withThrottles(2L, Map.of(1, "5")))) {
+    Map<String, Object> recovery = Map.of("uuid", "interrupted-execution");
+    // In any order, the state keeps the base rate and the log dir throttles, the per-broker rates and the recovery.
+    for (ExecutorState state : List.of(
+        executorState.withThrottles(2L, Map.of(1, "5")).withReplicationThrottleByBroker(throttleByBroker).withRecovery(recovery),
+        executorState.withReplicationThrottleByBroker(throttleByBroker).withRecovery(recovery).withThrottles(2L, Map.of(1, "5")),
+        executorState.withRecovery(recovery).withThrottles(2L, Map.of(1, "5")).withReplicationThrottleByBroker(throttleByBroker))) {
       Map<String, Object> jsonStructure = state.getJsonStructure(false);
+      assertEquals(recovery, jsonStructure.get("recovery"));
       assertEquals(2L, jsonStructure.get("ongoingReplicationThrottle"));
       assertEquals(Map.of(1, "5"), jsonStructure.get("ongoingLogDirThrottleByBroker"));
       assertEquals("{\"1\":{\"leader\":3,\"follower\":4}}", new Gson().toJson(jsonStructure.get(ONGOING_REPLICATION_THROTTLE_BY_BROKER)));

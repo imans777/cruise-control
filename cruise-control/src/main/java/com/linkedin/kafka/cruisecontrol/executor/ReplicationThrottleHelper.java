@@ -91,6 +91,10 @@ class ReplicationThrottleHelper {
   // Brokers whose throttle rate has been set by this helper and not yet removed. Written under the lock of this helper, concurrent
   // for the unsynchronized read of the executor state (see #throttleRateByBroker()).
   private final Set<Integer> _throttledBrokers;
+  // Whether to remove a throttled rate only if it is still the throttle rate of this helper (see #forInterruptedExecution).
+  private final boolean _removeOnlyOwnRates;
+  // The throttled rates that were kept rather than removed because they were not set by the execution.
+  private final List<String> _keptRates = new ArrayList<>();
 
   ReplicationThrottleHelper(Admin adminClient, Long throttleRate) {
     this(adminClient, throttleRate, RETRIES);
@@ -111,6 +115,11 @@ class ReplicationThrottleHelper {
 
   ReplicationThrottleHelper(Admin adminClient, Long throttleRate, int retries, Set<Integer> deadBrokers,
                             AppliedThrottles appliedThrottles) {
+    this(adminClient, throttleRate, retries, deadBrokers, appliedThrottles, false);
+  }
+
+  private ReplicationThrottleHelper(Admin adminClient, Long throttleRate, int retries, Set<Integer> deadBrokers,
+                                    AppliedThrottles appliedThrottles, boolean removeOnlyOwnRates) {
     this._adminClient = adminClient;
     this._throttleRate = throttleRate;
     this._retries = retries;
@@ -119,6 +128,31 @@ class ReplicationThrottleHelper {
     this._leaderThrottleRateByBroker = new ConcurrentHashMap<>();
     this._followerThrottleRateByBroker = new ConcurrentHashMap<>();
     this._throttledBrokers = ConcurrentHashMap.newKeySet();
+    this._removeOnlyOwnRates = removeOnlyOwnRates;
+  }
+
+  /**
+   * A helper to remove the throttles left behind by an execution that was interrupted by a Cruise Control restart. Unlike the
+   * helper of an ongoing execution, it removes the throttled rate of a broker only if the rate is still set on that broker
+   * (rather than inherited from a cluster-wide default) to the throttle rate of the interrupted execution. A different rate was
+   * set by someone else after the execution set it -- e.g. by an operator while Cruise Control was not running -- and is kept.
+   *
+   * @param adminClient The admin client to use.
+   * @param throttleRate The replication throttle of the interrupted execution.
+   * @param deadBrokers Brokers that are not alive -- i.e. whose throttles cannot be removed.
+   * @param retries The number of attempts to read back a config change.
+   * @return A helper to remove the leftover throttles of an interrupted execution.
+   */
+  static ReplicationThrottleHelper forInterruptedExecution(Admin adminClient, Long throttleRate, Set<Integer> deadBrokers, int retries) {
+    return new ReplicationThrottleHelper(adminClient, throttleRate, retries, deadBrokers, new AppliedThrottles(), true);
+  }
+
+  /**
+   * @return Descriptions of the throttled rates that were not removed because they were not set by the execution -- see
+   * {@link #forInterruptedExecution(Admin, Long, Set, int)}.
+   */
+  synchronized List<String> keptRates() {
+    return new ArrayList<>(_keptRates);
   }
 
   /**
@@ -287,10 +321,6 @@ class ReplicationThrottleHelper {
           .filter(ReplicationThrottleHelper::hasDataMovement)
           .collect(Collectors.toList());
 
-      // These are the brokers which have completed a task with
-      // inter-broker replica movement
-      Set<Integer> participatingBrokers = getParticipatingBrokers(completedProposals);
-
       List<ExecutionProposal> inProgressProposals =
         inProgressTasks
           .stream()
@@ -298,6 +328,24 @@ class ReplicationThrottleHelper {
           .map(ExecutionTask::proposal)
           .filter(ReplicationThrottleHelper::hasDataMovement)
           .collect(Collectors.toList());
+
+      clearThrottlesForProposals(completedProposals, inProgressProposals);
+    }
+  }
+
+  /**
+   * Clear throttles for the given finished inter-broker replica movement proposals, while retaining the throttled rate on
+   * brokers that participate in the given in-progress proposals.
+   *
+   * @param finishedProposals Inter-broker replica movement proposals that are no longer being executed.
+   * @param inProgressProposals Inter-broker replica movement proposals that are still being executed.
+   */
+  synchronized void clearThrottlesForProposals(List<ExecutionProposal> finishedProposals, List<ExecutionProposal> inProgressProposals)
+  throws InterruptedException {
+    if (throttlingEnabled()) {
+      // These are the brokers which have completed a task with
+      // inter-broker replica movement
+      Set<Integer> participatingBrokers = getParticipatingBrokers(finishedProposals);
 
       // These are the brokers which currently have in-progress
       // inter-broker replica movement
@@ -310,7 +358,7 @@ class ReplicationThrottleHelper {
 
       LOG.info("Removing replica movement throttles from {} brokers in the cluster: {}",
           brokersToRemoveThrottlesFrom.size(), brokersToRemoveThrottlesFrom);
-      removeThrottles(brokersToRemoveThrottlesFrom, completedProposals);
+      removeThrottles(brokersToRemoveThrottlesFrom, finishedProposals);
     }
   }
 
@@ -604,6 +652,14 @@ class ReplicationThrottleHelper {
       }
       if (LOWER_PRECEDENCE_CONFIG_SOURCES.contains(currThrottle.source())) {
         LOG.debug("Skipping removal for {} not set on broker {}: {}", throttleRateConfigKey, brokerId, currThrottle);
+      } else if (_removeOnlyOwnRates && !isOwnRate(currThrottle)) {
+        String keptRate = String.format("broker %d: %s=%s (%s)", brokerId, throttleRateConfigKey, currThrottle.value(),
+                                        currThrottle.source());
+        LOG.info("Keeping the throttled rate {}, which is not the throttle of the interrupted execution ({} bytes/sec).",
+                 keptRate, _throttleRate);
+        synchronized (this) {
+          _keptRates.add(keptRate);
+        }
       } else {
         LOG.debug("Removing {}: {} on broker {}", throttleRateConfigKey, currThrottle, brokerId);
         ops.add(new AlterConfigOp(new ConfigEntry(throttleRateConfigKey, null), AlterConfigOp.OpType.DELETE));
@@ -611,6 +667,14 @@ class ReplicationThrottleHelper {
       }
     }
     return ops;
+  }
+
+  /**
+   * @param throttle A throttled rate config of a broker.
+   * @return {@code true} if the given throttled rate is set on the broker itself to the throttle rate of this helper.
+   */
+  private boolean isOwnRate(ConfigEntry throttle) {
+    return throttle.source() == ConfigEntry.ConfigSource.DYNAMIC_BROKER_CONFIG && String.valueOf(_throttleRate).equals(throttle.value());
   }
 
   private List<AlterConfigOp> buildRemoveThrottledReplicasOps(Config topicConfigs, String topic, Set<String> replicas,

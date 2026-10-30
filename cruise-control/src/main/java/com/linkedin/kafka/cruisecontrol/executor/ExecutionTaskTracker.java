@@ -7,6 +7,7 @@ package com.linkedin.kafka.cruisecontrol.executor;
 import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -42,6 +43,8 @@ public class ExecutionTaskTracker {
   private boolean _isKafkaAssignerMode;
   private final Time _time;
   private volatile boolean _stopRequested;
+  // Incremented whenever a task is added or changes its state -- used for detecting changes to persist.
+  private long _taskStateVersion;
   private final Meter _interBrokerPartitionMovementRateMeter;
   private final Meter _intraBrokerPartitionMovementRateMeter;
   private final Meter _leadershipMovementRateMeter;
@@ -104,6 +107,7 @@ public class ExecutionTaskTracker {
     _isKafkaAssignerMode = false;
     _time = time;
     _stopRequested = false;
+    _taskStateVersion = 0L;
     _interBrokerPartitionMovementRateMeter = new Meter();
     _intraBrokerPartitionMovementRateMeter = new Meter();
     _leadershipMovementRateMeter = new Meter();
@@ -192,6 +196,7 @@ public class ExecutionTaskTracker {
    * @param newState New execution state of the task.
    */
   public void markTaskState(ExecutionTask task, ExecutionTaskState newState) {
+    _taskStateVersion++;
     _tasksByType.get(task.type()).get(task.state()).remove(task);
     switch (newState) {
       case PENDING:
@@ -325,6 +330,7 @@ public class ExecutionTaskTracker {
       // would be reported as 0.
       _stopRequested = false;
     }
+    _taskStateVersion++;
     _tasksByType.get(taskType).get(ExecutionTaskState.PENDING).addAll(tasks);
     if (taskType == TaskType.INTER_BROKER_REPLICA_ACTION) {
       long dataToMoveInMB = tasks.stream().mapToLong(t -> t.proposal().interBrokerDataToMoveInMB()).sum();
@@ -379,6 +385,7 @@ public class ExecutionTaskTracker {
    * Clear the replica action and leader action tasks.
    */
   public void clear() {
+    _taskStateVersion++;
     _tasksByType.values().forEach(m -> m.values().forEach(Set::clear));
     _totalInterBrokerDataToMoveInMB = 0L;
     _totalIntraBrokerDataToMoveInMB = 0L;
@@ -398,6 +405,22 @@ public class ExecutionTaskTracker {
 
   public void setStopRequested() {
     _stopRequested = true;
+  }
+
+  /**
+   * @return A number that changes whenever a task is added or changes its state.
+   */
+  public long taskStateVersion() {
+    return _taskStateVersion;
+  }
+
+  /**
+   * @return All tracked tasks regardless of their type and state.
+   */
+  public List<ExecutionTask> allTasks() {
+    List<ExecutionTask> allTasks = new ArrayList<>();
+    _tasksByType.values().forEach(tasksByState -> tasksByState.values().forEach(allTasks::addAll));
+    return allTasks;
   }
 
   // Internal query APIs.
