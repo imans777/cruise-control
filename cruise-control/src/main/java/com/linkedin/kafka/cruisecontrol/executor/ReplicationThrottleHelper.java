@@ -322,8 +322,6 @@ class ReplicationThrottleHelper {
           // Filter for completed tasks related to inter-broker replica movement
           .filter(this::shouldRemoveThrottleForTask)
           .map(ExecutionTask::proposal)
-          // Throttles are not set for proposals without data movement
-          .filter(ReplicationThrottleHelper::hasDataMovement)
           .collect(Collectors.toList());
 
       List<ExecutionProposal> inProgressProposals =
@@ -331,7 +329,6 @@ class ReplicationThrottleHelper {
           .stream()
           .filter(this::taskIsInProgress)
           .map(ExecutionTask::proposal)
-          .filter(ReplicationThrottleHelper::hasDataMovement)
           .collect(Collectors.toList());
 
       clearThrottlesForProposals(completedProposals, inProgressProposals);
@@ -340,7 +337,10 @@ class ReplicationThrottleHelper {
 
   /**
    * Clear throttles for the given finished inter-broker replica movement proposals, while retaining the throttled rate on
-   * brokers that participate in the given in-progress proposals.
+   * brokers that participate in the given in-progress proposals. Proposals without data movement are ignored: no throttle is
+   * set for them, so none is removed or retained for them either -- e.g. an operator's throttled rate on a broker that a
+   * removal-only proposal touches is left alone. Both {@link #clearThrottles(List, List)} and the recovery of an interrupted
+   * execution go through here.
    *
    * @param finishedProposals Inter-broker replica movement proposals that are no longer being executed.
    * @param inProgressProposals Inter-broker replica movement proposals that are still being executed.
@@ -348,13 +348,15 @@ class ReplicationThrottleHelper {
   synchronized void clearThrottlesForProposals(List<ExecutionProposal> finishedProposals, List<ExecutionProposal> inProgressProposals)
   throws InterruptedException {
     if (throttlingEnabled()) {
+      // Throttles are not set for proposals without data movement.
+      List<ExecutionProposal> finishedDataMovementProposals = proposalsWithDataMovement(finishedProposals);
       // These are the brokers which have completed a task with
       // inter-broker replica movement
-      Set<Integer> participatingBrokers = getParticipatingBrokers(finishedProposals);
+      Set<Integer> participatingBrokers = getParticipatingBrokers(finishedDataMovementProposals);
 
       // These are the brokers which currently have in-progress
       // inter-broker replica movement
-      Set<Integer> brokersWithInProgressTasks = getParticipatingBrokers(inProgressProposals);
+      Set<Integer> brokersWithInProgressTasks = getParticipatingBrokers(proposalsWithDataMovement(inProgressProposals));
 
       // Remove the brokers with in-progress replica moves from the brokers that have
       // completed inter-broker replica moves
@@ -363,7 +365,7 @@ class ReplicationThrottleHelper {
 
       LOG.info("Removing replica movement throttles from {} brokers in the cluster: {}",
           brokersToRemoveThrottlesFrom.size(), brokersToRemoveThrottlesFrom);
-      removeThrottles(brokersToRemoveThrottlesFrom, finishedProposals);
+      removeThrottles(brokersToRemoveThrottlesFrom, finishedDataMovementProposals);
     }
   }
 

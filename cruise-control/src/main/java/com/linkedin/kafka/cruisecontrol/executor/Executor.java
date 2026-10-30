@@ -2939,6 +2939,14 @@ public class Executor {
     return logDirInfoByReplica;
   }
 
+  /**
+   * @param proposals Inter-broker replica proposals.
+   * @return The given proposals that move data -- i.e. whose replicas are throttled (see {@link ReplicationThrottleHelper#hasDataMovement}).
+   */
+  private static List<ExecutionProposal> dataMovementProposals(List<ExecutionProposal> proposals) {
+    return proposals.stream().filter(ReplicationThrottleHelper::hasDataMovement).collect(Collectors.toList());
+  }
+
   private static Set<Integer> participatingBrokers(List<ExecutionProposal> proposals) {
     Set<Integer> brokers = new HashSet<>();
     proposals.forEach(p -> brokers.addAll(ExecutionRecoveryUtils.participatingBrokers(p)));
@@ -2970,11 +2978,13 @@ public class Executor {
       try {
         LOG.info("Interrupted execution {}: Removing leftover replication throttles of {} finished partition movement(s).",
                  _interruptedExecutionUuid, _finishedProposals.size());
-        // The resumed execution throttles the brokers of the adopted movements itself.
-        Set<Integer> brokers = participatingBrokers(_finishedProposals);
-        brokers.removeAll(participatingBrokers(_adoptedProposals));
+        // Throttles are set only for movements with data movement (PR #5), and the resumed execution throttles the brokers of
+        // the adopted movements itself.
+        List<ExecutionProposal> finishedProposals = dataMovementProposals(_finishedProposals);
+        Set<Integer> brokers = participatingBrokers(finishedProposals);
+        brokers.removeAll(participatingBrokers(dataMovementProposals(_adoptedProposals)));
         ReplicationThrottleHelper.AppliedThrottles finishedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
-        finishedThrottles.add(brokers, _finishedProposals);
+        finishedThrottles.add(brokers, finishedProposals);
         List<String> keptThrottles = removeThrottlesOfInterruptedExecution(_interruptedExecutionUuid, _replicationThrottle,
                                                                            finishedThrottles);
         if (!keptThrottles.isEmpty()) {
@@ -3030,8 +3040,10 @@ public class Executor {
           _recovery.setStatus(InterruptedExecutionRecovery.Status.REMOVING_THROTTLES);
           LOG.info("Interrupted execution {}: Removing leftover replication throttles of {} partition(s).", uuid, proposals.size());
           // What cannot be removed now (e.g. of a broker that is not alive) is retained and removed later, also across restarts.
+          // Throttles are set only for movements with data movement (PR #5).
+          List<ExecutionProposal> throttledProposals = dataMovementProposals(proposals);
           ReplicationThrottleHelper.AppliedThrottles interruptedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
-          interruptedThrottles.add(participatingBrokers(proposals), proposals);
+          interruptedThrottles.add(participatingBrokers(throttledProposals), throttledProposals);
           _recovery.setKeptThrottles(removeThrottlesOfInterruptedExecution(uuid, _state.replicationThrottle(), interruptedThrottles));
         }
         deletePersistedExecutionState(uuid);
