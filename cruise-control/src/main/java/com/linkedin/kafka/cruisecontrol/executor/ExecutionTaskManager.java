@@ -28,7 +28,8 @@ import static com.linkedin.kafka.cruisecontrol.executor.ExecutionTaskTracker.Exe
  * 2. When one partition movement finishes, it checks the involved brokers to see if we can run more partition movements.
  * We only keep track of the number of concurrent partition movements but not the sizes of the partitions.
  * Because the concurrent level determines how much impact the balancing process would have on the involved
- * brokers. And the size of partitions only affect how long the impact would last.
+ * brokers. And the size of partitions only affect how long the impact would last. Whether the destination of a partition
+ * movement has room for the partition is checked by the {@link DiskCapacityTracker} the tasks are requested with, if any.
  *
  * The execution task manager is thread-safe.
  */
@@ -72,20 +73,56 @@ public class ExecutionTaskManager {
    * @return A list of execution tasks that move the replicas cross brokers.
    */
   public synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks() {
+    return getInterBrokerReplicaMovementTasks(null);
+  }
+
+  /**
+   * @param diskCapacityTracker The disk capacity tracker to check and reserve the disk space of movements against, or {@code null}
+   *                            to ignore disk capacity.
+   * @return A list of execution tasks that move the replicas cross brokers.
+   */
+  synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks(DiskCapacityTracker diskCapacityTracker) {
     Map<Integer, Integer> brokersReadyForReplicaMovement = brokersReadyForReplicaMovement(_inProgressInterBrokerReplicaMovementsByBrokerId,
                                                                                           ConcurrencyType.INTER_BROKER_REPLICA);
     return _executionTaskPlanner.getInterBrokerReplicaMovementTasks(
         brokersReadyForReplicaMovement, _inProgressPartitionsForInterBrokerMovement,
-        _executionConcurrencyManager.maxClusterInterBrokerPartitionMovements());
+        _executionConcurrencyManager.maxClusterInterBrokerPartitionMovements(), diskCapacityTracker);
   }
 
   /**
    * @return A list of execution tasks that move the replicas cross disks of the same broker.
    */
   public synchronized List<ExecutionTask> getIntraBrokerReplicaMovementTasks() {
+    return getIntraBrokerReplicaMovementTasks(null);
+  }
+
+  /**
+   * @param diskCapacityTracker The disk capacity tracker to check and reserve the disk space of movements against, or {@code null}
+   *                            to ignore disk capacity.
+   * @return A list of execution tasks that move the replicas cross disks of the same broker.
+   */
+  synchronized List<ExecutionTask> getIntraBrokerReplicaMovementTasks(DiskCapacityTracker diskCapacityTracker) {
     Map<Integer, Integer> brokersReadyForReplicaMovement = brokersReadyForReplicaMovement(_inProgressIntraBrokerReplicaMovementsByBrokerId,
                                                                                           ConcurrencyType.INTRA_BROKER_REPLICA);
-    return _executionTaskPlanner.getIntraBrokerReplicaMovementTasks(brokersReadyForReplicaMovement);
+    return _executionTaskPlanner.getIntraBrokerReplicaMovementTasks(brokersReadyForReplicaMovement, diskCapacityTracker);
+  }
+
+  /**
+   * @param type The type of replica movement tasks, i.e. {@link TaskType#INTER_BROKER_REPLICA_ACTION} or
+   *             {@link TaskType#INTRA_BROKER_REPLICA_ACTION}.
+   * @return The ids of the brokers that the remaining replica movement tasks of the given type move replicas from or to.
+   */
+  synchronized Set<Integer> brokersInvolvedInRemainingReplicaMovements(TaskType type) {
+    Set<Integer> brokers = new HashSet<>();
+    if (type == TaskType.INTER_BROKER_REPLICA_ACTION) {
+      for (ExecutionTask task : _executionTaskPlanner.remainingInterBrokerReplicaMovements()) {
+        task.proposal().oldReplicas().forEach(r -> brokers.add(r.brokerId()));
+        task.proposal().replicasToAdd().forEach(r -> brokers.add(r.brokerId()));
+      }
+    } else if (type == TaskType.INTRA_BROKER_REPLICA_ACTION) {
+      _executionTaskPlanner.remainingIntraBrokerReplicaMovements().forEach(task -> brokers.add(task.brokerId()));
+    }
+    return brokers;
   }
 
   /**

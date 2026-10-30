@@ -621,6 +621,19 @@ public class LoadMonitor {
   }
 
   /**
+   * Get the capacity of the given broker from the broker capacity config resolver, allowing capacity estimation.
+   *
+   * @param node The broker.
+   * @return The capacity of the given broker.
+   * @throws TimeoutException If the capacity of the broker cannot be resolved in time.
+   * @throws BrokerCapacityResolutionException If the capacity of the broker cannot be resolved.
+   */
+  public BrokerCapacityInfo brokerCapacity(Node node) throws TimeoutException, BrokerCapacityResolutionException {
+    return _brokerCapacityConfigResolver.capacityForBroker(getRackHandleNull(node), node.host(), node.id(), BROKER_CAPACITY_FETCH_TIMEOUT_MS,
+                                                           true);
+  }
+
+  /**
    * Get all the active brokers in the cluster based on the replica assignment. If a metadata refresh failed due to
    * timeout, the current metadata information will be used. This is to handle the case that all the brokers are down.
    * @param timeout the timeout in milliseconds.

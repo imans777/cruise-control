@@ -103,6 +103,20 @@ The general resolution is to ensure that the brokers with the missing metrics ar
 1. Ensure that the Cruise Control metrics reporter jar is present on the brokers
 2. Ensure that you are using a version of Cruise Control compatible with the version of Kafka. For more information on version compatibility, see the [Environment Requirements](https://github.com/cruise-control-for-kafka/cruise-control#environment-requirements) section
 
+### Execution stopped: `None of the remaining ... replica movements fits the disk capacity of the log dirs it writes to`
+
+A sample alert might look like the following:
+```
+Task [5ad1b3e2-...] user/rebalance execution is interrupted with exception None of the remaining inter-broker replica movements fits the disk capacity of the log dirs it writes to, and no movement is in progress to free disk space: partition my_topic-3: it needs 194560 MB on log dir /var/kafka/data-1 of broker 2, which has 102400 MB free of 1024000 MB.
+```
+
+The executor starts a replica movement only if each disk (log dir) it writes to can hold a full copy of the replica, since Kafka deletes the replaced replica only after the copy is complete. Movements that do not fit wait while other movements are in progress or can start, since those may free disk space. The execution stops with this error once nothing is in progress and none of the remaining movements fits, even against freshly described log dirs. The movements that completed stay in place.
+
+#### Resolution
+
+1. Check that the disk capacity of the brokers in the broker capacity config matches the actual size of their disks. The capacity of a log dir is the smaller of the two.
+2. The plan may need more temporary space than the destinations have, e.g. two full brokers or disks exchanging large replicas, or a partition moving several replicas at once to nearly full brokers. Free disk space (e.g. by lowering the retention of large topics), add capacity, or compute a plan that leaves more headroom on the destinations (e.g. with a lower `disk.capacity.threshold`).
+
 ## Contributing
 
 Found an error/interesting behaviour of Cruise Control and have a resolution for it? Consider adding that to this guide by following the [contributing guidelines](https://github.com/cruise-control-for-kafka/cruise-control/blob/main/CONTRIBUTING.md) for the project.
