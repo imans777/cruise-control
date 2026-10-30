@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -83,6 +84,11 @@ public class GoalViolationDetectorTest {
                  ((IntraBrokerGoalViolations) anomaly).violatedGoalsByFixability());
     assertEquals(MAX_BALANCEDNESS_SCORE - balancednessCostWithIntraBrokerGoals(fixture._config).get(INTRA_BROKER_DISK_USAGE_DISTRIBUTION_GOAL),
                  detector.balancednessScore(), DELTA);
+    // Self-healing rebalances the disks of the violating broker only: the disks of broker 1 are balanced.
+    IntraBrokerGoalViolations intraBrokerGoalViolations = (IntraBrokerGoalViolations) anomaly;
+    assertEquals(Set.of(0), intraBrokerGoalViolations.violatingBrokers());
+    assertEquals(Set.of(0), intraBrokerGoalViolations._rebalanceRunnable.destinationBrokerIds());
+    assertTrue(intraBrokerGoalViolations.toString(), intraBrokerGoalViolations.toString().contains("Brokers to heal: [0]"));
     // The semaphore for cluster model generation is acquired once for detecting the violations of inter-broker goals, and once
     // for intra-broker goals. A thread cannot acquire the semaphore again before releasing it.
     assertEquals(2, fixture._semaphore.numAcquired());

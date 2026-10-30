@@ -66,7 +66,7 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
                            Supplier<String> reasonSupplier,
                            boolean stopOngoingExecution) {
     this(kafkaCruiseControl, selfHealingGoals, allowCapacityEstimation, excludeRecentlyDemotedBrokers, excludeRecentlyRemovedBrokers,
-         anomalyId, reasonSupplier, stopOngoingExecution, SELF_HEALING_IS_REBALANCE_DISK_MODE);
+         anomalyId, reasonSupplier, stopOngoingExecution, SELF_HEALING_IS_REBALANCE_DISK_MODE, SELF_HEALING_DESTINATION_BROKER_IDS);
   }
 
   /**
@@ -82,6 +82,8 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
    * @param stopOngoingExecution Whether to stop the ongoing execution (if any) to start self-healing.
    * @param isRebalanceDiskMode {@code true} to balance the disks of each broker with intra-broker goals -- i.e. moving replicas
    *                            only between the disks of the same broker, {@code false} to balance the brokers.
+   * @param destinationBrokerIds The brokers to balance (see {@link RebalanceParameters#destinationBrokerIds()}): with
+   *                             isRebalanceDiskMode, only the disks of these brokers are balanced. Empty to balance all brokers.
    */
   public RebalanceRunnable(KafkaCruiseControl kafkaCruiseControl,
                            List<String> selfHealingGoals,
@@ -91,7 +93,8 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
                            String anomalyId,
                            Supplier<String> reasonSupplier,
                            boolean stopOngoingExecution,
-                           boolean isRebalanceDiskMode) {
+                           boolean isRebalanceDiskMode,
+                           Set<Integer> destinationBrokerIds) {
     // Hard goals are inter-broker goals, which do not apply to balancing the disks of each broker.
     super(kafkaCruiseControl, new OperationFuture("Rebalance for Self-Healing"), SELF_HEALING_DRYRUN, selfHealingGoals, stopOngoingExecution,
           SELF_HEALING_MODEL_COMPLETENESS_REQUIREMENTS, SELF_HEALING_SKIP_HARD_GOAL_CHECK || isRebalanceDiskMode,
@@ -108,7 +111,7 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
     _replicationThrottle = config.getLong(ExecutorConfig.DEFAULT_REPLICATION_THROTTLE_CONFIG);
     _logDirThrottle = config.getLong(ExecutorConfig.DEFAULT_LOG_DIR_THROTTLE_CONFIG);
     _ignoreProposalCache = SELF_HEALING_IGNORE_PROPOSAL_CACHE;
-    _destinationBrokerIds = SELF_HEALING_DESTINATION_BROKER_IDS;
+    _destinationBrokerIds = destinationBrokerIds;
     _isRebalanceDiskMode = isRebalanceDiskMode;
     _isRebalanceDiskBrokerByBroker = SELF_HEALING_IS_REBALANCE_DISK_BROKER_BY_BROKER;
   }
@@ -132,6 +135,14 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
     _destinationBrokerIds = parameters.destinationBrokerIds();
     _isRebalanceDiskMode = parameters.isRebalanceDiskMode();
     _isRebalanceDiskBrokerByBroker = parameters.isRebalanceDiskBrokerByBroker();
+  }
+
+  /**
+   * @return The brokers that this rebalance balances (with the disk mode, the brokers whose disks it balances), or an empty set
+   * for all brokers.
+   */
+  public Set<Integer> destinationBrokerIds() {
+    return Collections.unmodifiableSet(_destinationBrokerIds);
   }
 
   @Override

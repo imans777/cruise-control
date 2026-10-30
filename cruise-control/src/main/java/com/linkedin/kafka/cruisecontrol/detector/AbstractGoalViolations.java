@@ -118,10 +118,18 @@ public abstract class AbstractGoalViolations extends KafkaAnomaly {
     joiner = new StringJoiner(",");
     _violatedGoalsByFixability.getOrDefault(true, Collections.emptyList()).forEach(joiner::add);
     sb.append(joiner);
-    sb.append(String.format("}, Exclude brokers recently (removed: %s demoted: %s)%s}",
+    sb.append(String.format("}, Exclude brokers recently (removed: %s demoted: %s)%s%s}",
                             _excludeRecentlyRemovedBrokers, _excludeRecentlyDemotedBrokers,
-                            _provisionResponse == null ? "" : String.format(", Provision: %s", _provisionResponse)));
+                            _provisionResponse == null ? "" : String.format(", Provision: %s", _provisionResponse), details()));
     return sb.toString();
+  }
+
+  /**
+   * @return Details of the anomaly to add to its string representation, e.g. {@code ", Brokers to heal: [1, 2]"}, or an empty
+   * string.
+   */
+  protected String details() {
+    return "";
   }
 
   @Override

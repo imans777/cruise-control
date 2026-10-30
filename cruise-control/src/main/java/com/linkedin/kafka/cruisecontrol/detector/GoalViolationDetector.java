@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 import org.apache.kafka.common.TopicPartition;
@@ -474,6 +475,13 @@ public class GoalViolationDetector extends AbstractAnomalyDetector implements Ru
     if (hasDiff) {
       // A goal violation that can be optimized by applying the generated proposals.
       goalViolations.addViolation(goal.name(), true);
+      if (goalViolations instanceof IntraBrokerGoalViolations) {
+        // Self-healing an intra-broker goal violation rebalances only the brokers whose disks the goal moved replicas between.
+        Set<Integer> violatingBrokers = new TreeSet<>();
+        AnalyzerUtils.getDiff(initReplicaDistribution, initLeaderDistribution, clusterModel)
+                     .forEach(proposal -> violatingBrokers.addAll(proposal.replicasToMoveBetweenDisksByBroker().keySet()));
+        ((IntraBrokerGoalViolations) goalViolations).addViolatingBrokers(violatingBrokers);
+      }
       return true;
     } else {
       // The goal is already satisfied.
