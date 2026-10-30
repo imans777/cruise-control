@@ -114,7 +114,8 @@ The returned state contains the following information:
 	   `LEADER_MOVEMENT_TASK_IN_PROGRESS` /
 	   `STOPPING_EXECUTION` /
 	   `INITIALIZING_PROPOSAL_EXECUTION` /
-	   `GENERATING_PROPOSALS_FOR_EXECUTION`
+	   `GENERATING_PROPOSALS_FOR_EXECUTION` /
+	   `RECOVERING_INTERRUPTED_EXECUTION`
   * Inter-broker replica movement progress (if state is `INTER_BROKER_REPLICA_MOVEMENT_IN_PROGRESS`)
   * Intra-broker replica movement progress (if state is `INTRA_BROKER_REPLICA_MOVEMENT_IN_PROGRESS`)
   * Leadership movement progress (if state is `LEADERSHIP_MOVEMENT`)
@@ -123,6 +124,9 @@ The returned state contains the following information:
     `ongoingReplicationThrottleByBroker`, e.g. `{"1": {"leader": 10485760, "follower": 20971520}}` in bytes/second), per broker
     and direction since the concurrency adjuster may adjust them (see `concurrency.adjuster.replication.throttle.enabled`)
   * UUID triggers the execution
+  * Recovery of the latest execution interrupted by a Cruise Control restart (if any, until the next execution starts): whether it
+    was resumed or is being cleaned up, why it was not resumed (e.g. how the cluster has changed since), and the in-flight
+    movements and throttled rates of the cleanup
 * **Analyzer State**:
   * isProposalReady: Is there a proposal cached
   * ReadyGoals: A list of goals that are ready for running
