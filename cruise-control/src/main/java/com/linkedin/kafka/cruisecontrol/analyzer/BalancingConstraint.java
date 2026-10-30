@@ -83,9 +83,10 @@ public class BalancingConstraint {
     _replicaBalancePercentage = config.getDouble(AnalyzerConfig.REPLICA_COUNT_BALANCE_THRESHOLD_CONFIG);
     _leaderReplicaBalancePercentage = config.getDouble(AnalyzerConfig.LEADER_REPLICA_COUNT_BALANCE_THRESHOLD_CONFIG);
     _diskIOReadWeight = config.getDouble(AnalyzerConfig.INTRA_BROKER_DISK_IO_READ_WEIGHT_CONFIG);
-    // Set intra-broker disk I/O balance percentage -- if not explicitly configured, fall back to the disk balance percentage.
+    // Set intra-broker disk I/O balance percentage -- if not explicitly configured, fall back to the intra-broker disk balance
+    // percentage (which itself falls back to the disk balance percentage).
     Double intraBrokerDiskIOBalancePercentage = config.getDouble(AnalyzerConfig.INTRA_BROKER_DISK_IO_BALANCE_THRESHOLD_CONFIG);
-    _intraBrokerDiskIOBalancePercentage = intraBrokerDiskIOBalancePercentage == null ? _resourceBalancePercentage.get(Resource.DISK)
+    _intraBrokerDiskIOBalancePercentage = intraBrokerDiskIOBalancePercentage == null ? _intraBrokerDiskBalancePercentage
                                                                                      : intraBrokerDiskIOBalancePercentage;
     _topicReplicaBalancePercentage = config.getDouble(AnalyzerConfig.TOPIC_REPLICA_COUNT_BALANCE_THRESHOLD_CONFIG);
     _topicReplicaBalanceMinGap = config.getInt(AnalyzerConfig.TOPIC_REPLICA_COUNT_BALANCE_MIN_GAP_CONFIG);

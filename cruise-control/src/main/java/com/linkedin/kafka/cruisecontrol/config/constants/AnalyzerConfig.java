@@ -127,9 +127,9 @@ public final class AnalyzerConfig {
   public static final String INTRA_BROKER_DISK_IO_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for the "
       + "estimated disk I/O rate across the disks of the same broker, used by IntraBrokerDiskIORateDistributionGoal. For "
       + "example, 1.20 means the highest estimated disk I/O rate of a disk should not be above 1.20x of the average estimated "
-      + "disk I/O rate of all the disks of its broker. If not set, the value of " + DISK_BALANCE_THRESHOLD_CONFIG + " is used. "
-      + "Since a single hot replica can account for a large share of the I/O rate of a disk, consider a looser value than "
-      + DISK_BALANCE_THRESHOLD_CONFIG + ".";
+      + "disk I/O rate of all the disks of its broker. If not set, the value of " + INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG
+      + " is used (which in turn defaults to " + DISK_BALANCE_THRESHOLD_CONFIG + "). Since a single hot replica can account for a "
+      + "large share of the I/O rate of a disk, consider a looser value than " + INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG + ".";
 
   /**
    * <code>leader.replica.count.balance.threshold</code>
