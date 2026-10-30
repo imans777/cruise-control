@@ -4,7 +4,9 @@
 
 package com.linkedin.kafka.cruisecontrol.model;
 
+import com.linkedin.cruisecontrol.metricdef.MetricInfo;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.AggregatedMetricValues;
+import com.linkedin.cruisecontrol.monitor.sampling.aggregator.MetricValues;
 import com.linkedin.kafka.cruisecontrol.analyzer.AnalyzerUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingConstraint;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
@@ -12,6 +14,7 @@ import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.monitor.ModelGeneration;
+import com.linkedin.kafka.cruisecontrol.monitor.metricdefinition.KafkaMetricDef;
 import com.linkedin.kafka.cruisecontrol.servlet.response.stats.BrokerStats;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -28,6 +31,7 @@ import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.commons.math3.stat.descriptive.moment.Variance;
@@ -48,8 +52,9 @@ import static com.linkedin.kafka.cruisecontrol.monitor.MonitorUtils.EMPTY_BROKER
 public class ClusterModel implements Serializable {
   private static final Logger LOG = LoggerFactory.getLogger(ClusterModel.class);
   private static final long serialVersionUID = -6840253566423285966L;
-  // Hypothetical broker that indicates the original broker of replicas to be created in the existing cluster model.
-  private static final Broker GENESIS_BROKER = new Broker(null, -1, new BrokerCapacityInfo(EMPTY_BROKER_CAPACITY), false);
+  // Hypothetical brokers that indicate the original broker of replicas to be created in the existing cluster model, by the index
+  // of replicas in the replica list. Hence, replicas to be created at different indices of the same partition are not equal.
+  private static final Map<Integer, Broker> GENESIS_BROKER_BY_INDEX = new ConcurrentHashMap<>();
   private static final OptimizationOptions DEFAULT_OPTIMIZATION_OPTIONS = new OptimizationOptions(Collections.emptySet(),
                                                                                                   Collections.emptySet(),
                                                                                                   Collections.emptySet());
@@ -844,7 +849,9 @@ public class ClusterModel implements Serializable {
       }
       replica = new Replica(tp, broker, isLeader, isOffline, disk);
     } else {
-      replica = new Replica(tp, GENESIS_BROKER, false);
+      Broker genesisBroker = GENESIS_BROKER_BY_INDEX.computeIfAbsent(
+          index, i -> new Broker(null, -1 - i, new BrokerCapacityInfo(EMPTY_BROKER_CAPACITY), false));
+      replica = new Replica(tp, genesisBroker, isLeader);
       replica.setBroker(broker);
     }
     rack(rackId).addReplica(replica);
@@ -1033,6 +1040,106 @@ public class ClusterModel implements Serializable {
     if (needToRefreshClusterMaxReplicationFactor) {
       refreshClusterMaxReplicationFactor();
     }
+  }
+
+  /**
+   * Create replicas for a topic that does not exist in the cluster yet. Replicas are created as future replicas (see
+   * {@link #createReplica(String, int, TopicPartition, int, boolean, boolean, String, boolean)}), so goals are free to move
+   * them to any broker. They are tentatively added to the given brokers in a rack-aware (if possible), round-robin way, and
+   * the first replica of each partition is its leader.
+   *
+   * The leader of each partition has the given estimated load, plus the replication bytes out to its followers. Followers
+   * get the load of the leader as a follower -- i.e. the same disk usage and inbound network load, without the outbound
+   * network load. CPU usage is not estimated.
+   *
+   * @param topic The topic to create.
+   * @param partitionCount Number of partitions of the topic.
+   * @param replicationFactor Replication factor of the topic.
+   * @param partitionDiskMb Expected disk usage of each replica of the topic in MB.
+   * @param partitionNwInKbps Expected inbound network load (i.e. produce rate) of each partition of the topic in KB/s.
+   * @param partitionNwOutKbps Expected outbound network load (i.e. consume rate) of each partition of the topic in KB/s.
+   * @param brokersByRack A map from rack to the brokers to tentatively add the replicas to. There must be at least as many
+   *                      brokers as the replication factor.
+   */
+  public void createReplicasForNewTopic(String topic,
+                                        int partitionCount,
+                                        short replicationFactor,
+                                        double partitionDiskMb,
+                                        double partitionNwInKbps,
+                                        double partitionNwOutKbps,
+                                        Map<String, List<Integer>> brokersByRack) {
+    if (_numReplicasByTopic.containsKey(topic)) {
+      throw new IllegalArgumentException(String.format("Topic %s already exists in the cluster model.", topic));
+    }
+    int numBrokers = brokersByRack.values().stream().mapToInt(List::size).sum();
+    if (replicationFactor > numBrokers) {
+      throw new IllegalArgumentException(String.format("Unable to create topic %s with replication factor %d on %d brokers.",
+                                                       topic, replicationFactor, numBrokers));
+    }
+    // The cluster has no load windows only if it has no monitored replicas, in which case any single window will do.
+    List<Long> windows = _load.windows() == null ? Collections.singletonList(0L) : _load.windows();
+    AggregatedMetricValues leaderLoad = estimatedLeaderLoad(windows.size(), replicationFactor - 1, partitionDiskMb,
+                                                            partitionNwInKbps, partitionNwOutKbps);
+
+    List<String> racks = new ArrayList<>(brokersByRack.keySet());
+    int[] cursors = new int[racks.size()];
+    int rackCursor = 0;
+    for (int partitionId = 0; partitionId < partitionCount; partitionId++) {
+      TopicPartition tp = new TopicPartition(topic, partitionId);
+      List<Integer> assignedBrokers = new ArrayList<>(replicationFactor);
+      Set<String> occupiedRacks = new HashSet<>();
+      while (assignedBrokers.size() < replicationFactor) {
+        String rack = racks.get(rackCursor);
+        if (!occupiedRacks.contains(rack) || occupiedRacks.size() == racks.size()) {
+          List<Integer> brokersInRack = brokersByRack.get(rack);
+          int brokerId = brokersInRack.get(cursors[rackCursor]);
+          if (!assignedBrokers.contains(brokerId)) {
+            boolean isLeader = assignedBrokers.isEmpty();
+            createReplica(rack, brokerId, tp, assignedBrokers.size(), isLeader, false, null, true);
+            if (isLeader) {
+              setReplicaLoad(rack, brokerId, tp, leaderLoad, windows);
+            } else {
+              Load load = partition(tp).leader().getFollowerLoadFromLeader();
+              setReplicaLoad(rack, brokerId, tp, load.loadByWindows(), load.windows());
+            }
+            assignedBrokers.add(brokerId);
+            occupiedRacks.add(rack);
+          }
+          cursors[rackCursor] = (cursors[rackCursor] + 1) % brokersInRack.size();
+        }
+        rackCursor = (rackCursor + 1) % racks.size();
+      }
+    }
+  }
+
+  /**
+   * @param numWindows Number of windows of the load.
+   * @param numFollowers Number of followers of the partition.
+   * @param diskMb Expected disk usage in MB.
+   * @param nwInKbps Expected inbound network load (i.e. produce rate) in KB/s.
+   * @param nwOutKbps Expected outbound network load (i.e. consume rate) in KB/s.
+   * @return The load of a leader replica with the given expected usage in each window, and no CPU usage.
+   */
+  private static AggregatedMetricValues estimatedLeaderLoad(int numWindows,
+                                                            int numFollowers,
+                                                            double diskMb,
+                                                            double nwInKbps,
+                                                            double nwOutKbps) {
+    Map<Short, Double> valueByMetricId = Map.of(KafkaMetricDef.commonMetricDefId(KafkaMetricDef.DISK_USAGE), diskMb,
+                                                KafkaMetricDef.commonMetricDefId(KafkaMetricDef.LEADER_BYTES_IN), nwInKbps,
+                                                KafkaMetricDef.commonMetricDefId(KafkaMetricDef.LEADER_BYTES_OUT), nwOutKbps,
+                                                KafkaMetricDef.commonMetricDefId(KafkaMetricDef.REPLICATION_BYTES_OUT_RATE),
+                                                nwInKbps * numFollowers);
+    AggregatedMetricValues leaderLoad = new AggregatedMetricValues();
+    for (MetricInfo metricInfo : KafkaMetricDef.commonMetricDef().all()) {
+      MetricValues metricValues = new MetricValues(numWindows);
+      double value = valueByMetricId.getOrDefault(metricInfo.id(), 0.0);
+      for (int i = 0; i < numWindows; i++) {
+        metricValues.set(i, value);
+      }
+      leaderLoad.add(metricInfo.id(), metricValues);
+    }
+    return leaderLoad;
   }
 
   /**

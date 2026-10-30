@@ -11,6 +11,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint;
+import com.linkedin.kafka.cruisecontrol.servlet.UserRequestException;
 import org.easymock.EasyMock;
 import org.junit.Assert;
 import org.junit.Test;
@@ -232,6 +233,40 @@ public class ParameterUtilsTest {
     EasyMock.replay(mockRequest);
 
     Assert.assertNull(ParameterUtils.endPoint(mockRequest));
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testTopicToCreate() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    Map<String, String[]> paramMap = Collections.singletonMap(ParameterUtils.TOPIC_PARAM, new String[]{"new_topic"});
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(Collections.emptyMap()).andReturn(paramMap).times(2);
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.TOPIC_PARAM)).andReturn("new_topic").andReturn("invalid/topic");
+    EasyMock.replay(mockRequest);
+
+    Assert.assertNull(ParameterUtils.topicToCreate(mockRequest));
+    Assert.assertEquals("new_topic", ParameterUtils.topicToCreate(mockRequest));
+    // Expected: UserRequestException if the topic name is not a legal Kafka topic name.
+    Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.topicToCreate(mockRequest));
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testPartitionLoad() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    Map<String, String[]> paramMap = Collections.singletonMap(ParameterUtils.PARTITION_DISK_MB_PARAM, new String[]{"12.5"});
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(Collections.emptyMap()).andReturn(paramMap).times(4);
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.PARTITION_DISK_MB_PARAM))
+            .andReturn("12.5").andReturn("-1").times(2).andReturn("NaN").times(2).andReturn("Infinity").times(2);
+    EasyMock.replay(mockRequest);
+
+    // Expected load defaults to 0.
+    Assert.assertEquals(0.0, ParameterUtils.partitionLoad(mockRequest, ParameterUtils.PARTITION_DISK_MB_PARAM), 0.0);
+    Assert.assertEquals(12.5, ParameterUtils.partitionLoad(mockRequest, ParameterUtils.PARTITION_DISK_MB_PARAM), 0.0);
+    // Expected: UserRequestException if the expected load is negative, not a number, or infinite.
+    for (int i = 0; i < 3; i++) {
+      Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.partitionLoad(mockRequest, ParameterUtils.PARTITION_DISK_MB_PARAM));
+    }
     EasyMock.verify(mockRequest);
   }
 
