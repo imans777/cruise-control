@@ -93,8 +93,26 @@ public class IntraBrokerDiskIORateDistributionGoal extends AbstractGoal {
     return false;
   }
 
+  @Override
+  public boolean isIntraBrokerGoal() {
+    return true;
+  }
+
   /**
-   * Initialize the disk I/O rate thresholds.
+   * To avoid churns, a balance margin is added to the user specified threshold: for a threshold of
+   * intraBrokerDiskIOBalancePercentage, a disk is balanced if its estimated I/O rate is within
+   * (intraBrokerDiskIOBalancePercentage-1)*balanceMargin of the average estimated I/O rate of the disks of its broker -- e.g. 0.18
+   * for a threshold of 1.20, i.e. between 0.82 and 1.18 times that average.
+   *
+   * @param balancingConstraint Balancing constraint.
+   * @return The relative distance from the average I/O rate of the disks of its broker within which a disk is balanced.
+   */
+  public static double balancePercentageWithMargin(BalancingConstraint balancingConstraint) {
+    return (balancingConstraint.intraBrokerDiskIOBalancePercentage() - 1) * BALANCE_MARGIN;
+  }
+
+  /**
+   * Initialize the disk I/O rate thresholds (see {@link #balancePercentageWithMargin(BalancingConstraint)}).
    * To avoid churns, we add a balance margin to the user specified rebalance threshold. e.g. when user sets the
    * threshold to be intraBrokerDiskIOBalancePercentage, we use (intraBrokerDiskIOBalancePercentage-1)*balanceMargin instead.
    * @param clusterModel The state of the cluster.
@@ -108,7 +126,7 @@ public class IntraBrokerDiskIORateDistributionGoal extends AbstractGoal {
     _balanceLowerThresholdByBroker.clear();
     _averageDiskIORateByBroker.clear();
     _diskIORateByDisk.clear();
-    double balancePercentageWithMargin = (_balancingConstraint.intraBrokerDiskIOBalancePercentage() - 1) * BALANCE_MARGIN;
+    double balancePercentageWithMargin = balancePercentageWithMargin(_balancingConstraint);
     for (Broker broker : brokersToBalance(clusterModel)) {
       double totalDiskIORate = 0;
       int numAliveDisks = 0;

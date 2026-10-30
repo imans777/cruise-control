@@ -6,6 +6,7 @@ package com.linkedin.kafka.cruisecontrol.analyzer;
 
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.Goal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskIORateDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutionProposal;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
@@ -346,11 +347,23 @@ public class OptimizerResult {
     DiskBalanceStats.DiskUsageStats usageBefore = before.usage();
     DiskBalanceStats.DiskUsageStats usageAfter = after.usage();
     String scope = _diskStatsBrokerIds.isEmpty() ? "" : String.format(" of brokers %s", new TreeSet<>(_diskStatsBrokerIds));
-    return String.format("%nDisk usage balance%s (before -> after): unbalanced disks %d of %d -> %d of %d, max utilization %.2f%% -> "
-                         + "%.2f%%, max spread within a broker %.2fpp -> %.2fpp.",
-                         scope, usageBefore.numUnbalancedDisks(), before.numAliveDisks(), usageAfter.numUnbalancedDisks(),
-                         after.numAliveDisks(), usageBefore.max().utilizationPct(), usageAfter.max().utilizationPct(),
-                         usageBefore.maxSpreadWithinBroker().utilizationPct(), usageAfter.maxSpreadWithinBroker().utilizationPct());
+    String usageSummary = String.format("%nDisk usage balance%s (before -> after): unbalanced disks %d of %d -> %d of %d, max "
+                                        + "utilization %.2f%% -> %.2f%%, max spread within a broker %.2fpp -> %.2fpp.",
+                                        scope, usageBefore.numUnbalancedDisks(), before.numAliveDisks(), usageAfter.numUnbalancedDisks(),
+                                        after.numAliveDisks(), usageBefore.max().utilizationPct(), usageAfter.max().utilizationPct(),
+                                        usageBefore.maxSpreadWithinBroker().utilizationPct(),
+                                        usageAfter.maxSpreadWithinBroker().utilizationPct());
+    // The disk I/O balance is an estimate from network load: it is only summarized if the goal that balances it was optimized.
+    if (!_statsByGoalName.containsKey(IntraBrokerDiskIORateDistributionGoal.class.getSimpleName())) {
+      return usageSummary;
+    }
+    DiskBalanceStats.DiskIORateStats ioBefore = before.ioRate();
+    DiskBalanceStats.DiskIORateStats ioAfter = after.ioRate();
+    return usageSummary + String.format("%nDisk I/O balance%s (before -> after): unbalanced disks %d of %d -> %d of %d, max ratio "
+                                        + "%.2f%% -> %.2f%%, max spread within a broker %.2fpp -> %.2fpp.",
+                                        scope, ioBefore.numUnbalancedDisks(), before.numAliveDisks(), ioAfter.numUnbalancedDisks(),
+                                        after.numAliveDisks(), ioBefore.maxRatio().ratioPct(), ioAfter.maxRatio().ratioPct(),
+                                        ioBefore.maxSpreadWithinBroker().ratioPct(), ioAfter.maxSpreadWithinBroker().ratioPct());
   }
 
   private DiskBalanceStats diskBalanceStatsBeforeOptimization() {
