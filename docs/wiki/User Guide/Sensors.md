@@ -74,9 +74,13 @@ Cruise Control metrics are useful to monitor the state of Cruise Control itself.
 
 The `ongoing-execution-*-data-movement-*-MB` and `ongoing-execution-duration-ms` sensors describe the ongoing execution and are
 reset to 0 once the execution finishes. They can be combined to monitor the progress of an execution: for example, the progress of
-inter-broker replica movements is `completed-MB / total-MB`, and its remaining time can be estimated as
-`(remaining-MB + in-execution-MB) / partition-movement-MB-per-second`. `finished-MB - completed-MB` is the data of the aborted and dead
-tasks, e.g. the in-progress movements that were rolled back when the execution was stopped.
+inter-broker replica movements is `completed-MB / total-MB`. `finished-MB - completed-MB` is the data of the aborted and dead
+tasks, e.g. the in-progress movements that were rolled back when the execution was stopped. For the remaining time of the replica
+movements, read `estimatedRemainingTimeMs` (inter-broker) or `estimatedIntraBrokerRemainingTimeMs` (intra-broker) from
+`GET /kafkacruisecontrol/state?substates=executor`: it divides the data that is not moved yet -- the part of the in-progress
+movements still to copy included -- by the current data movement rate of the in-progress movements. Deriving it from these sensors,
+e.g. as `(remaining-MB + in-execution-MB) / partition-movement-MB-per-second`, counts the data the in-progress movements have already
+moved as still to move, and divides by the average rate of the whole phase.
 
 With partition movement progress tracking enabled (`partition.movement.progress.tracking.enabled`, the default), the data that
 in-progress partition movements have moved so far -- measured as the growth of their new replicas -- is marked in
