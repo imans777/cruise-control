@@ -17,6 +17,7 @@ import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.clients.admin.ListTopicsResult;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.internals.KafkaFutureImpl;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
@@ -30,13 +31,16 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import static com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUnitTestUtils.waitUntilTrue;
 import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC0;
 import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC1;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.*;
@@ -181,7 +185,7 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     // Expect batched calls: one batch read (via values()), one batch write, one batch verify (via values()),
     // then topic read fails
     expectBatchDescribeBrokerConfigsViaValues(mockAdminClient, brokers, brokerConfig);
-    expectBatchIncrementalBrokerConfigs(mockAdminClient);
+    expectBatchIncrementalBrokerConfigsViaValues(mockAdminClient, brokers);
     expectBatchDescribeBrokerConfigsViaValues(mockAdminClient, brokers, brokerConfig2);
     expectBatchDescribeTopicConfigsViaValues(mockAdminClient, TOPIC0, EMPTY_CONFIG, false);
     expectListTopics(mockAdminClient, Collections.emptySet());
@@ -194,7 +198,7 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     // Case 2: a situation where Topic0 gets deleted after its configs were read.
     EasyMock.reset(mockAdminClient);
     expectBatchDescribeBrokerConfigsViaValues(mockAdminClient, brokers);
-    expectBatchIncrementalBrokerConfigs(mockAdminClient);
+    expectBatchIncrementalBrokerConfigsViaValues(mockAdminClient, brokers);
     expectBatchDescribeBrokerConfigsViaValues(mockAdminClient, brokers, EMPTY_CONFIG);
     String throttledReplicas = brokerId0 + "," + brokerId1;
     Config topicConfigProps = new Config(Arrays.asList(
@@ -207,6 +211,37 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     EasyMock.replay(mockAdminClient);
 
     // Expect no exception
+    throttleHelper.clearThrottles(Collections.singletonList(mockCompleteTask), Collections.emptyList());
+    EasyMock.verify(mockAdminClient, mockCompleteTask);
+  }
+
+  @Test
+  public void testClearThrottleDoesNotRemoveThrottledRateNotSetOnBroker() throws Exception {
+    final long throttleRate = 100L;
+    final List<Integer> brokers = Arrays.asList(0, 1, 2);
+    // A proposal to move a partition with 2 replicas from broker 0 and 1 to broker 0 and 2
+    ExecutionProposal proposal = new ExecutionProposal(new TopicPartition(TOPIC0, 0),
+                                                       100,
+                                                       new ReplicaPlacementInfo(0),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+
+    Admin mockAdminClient = EasyMock.strictMock(Admin.class);
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(mockAdminClient, throttleRate);
+
+    // The throttle rates come from the cluster-wide dynamic default and the static broker configs. Hence, there is no
+    // broker-level throttle rate to remove and the test would fail on any attempt to alter the broker configs.
+    Config brokerConfig = new Config(Arrays.asList(
+            mockConfigEntry(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG, "200",
+                    ConfigEntry.ConfigSource.DYNAMIC_DEFAULT_BROKER_CONFIG),
+            mockConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, "300",
+                    ConfigEntry.ConfigSource.STATIC_BROKER_CONFIG))
+    );
+    expectBatchDescribeBrokerConfigsViaValues(mockAdminClient, brokers, brokerConfig);
+    expectBatchDescribeTopicConfigsViaValues(mockAdminClient, TOPIC0, EMPTY_CONFIG, true);
+    ExecutionTask mockCompleteTask = prepareMockCompleteTask(proposal);
+    EasyMock.replay(mockAdminClient);
+
     throttleHelper.clearThrottles(Collections.singletonList(mockCompleteTask), Collections.emptyList());
     EasyMock.verify(mockAdminClient, mockCompleteTask);
   }
@@ -419,6 +454,48 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
   }
 
   @Test
+  public void testClearThrottlesWithClusterDefaultThrottledRate() throws Exception {
+    createTopics();
+
+    final long throttleRate = 100L;
+    final long clusterDefaultThrottleRate = 200L;
+    // Use a few retries, so that the test fails fast if waiting for the throttles to be removed never converges.
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttleRate, 3);
+    ExecutionProposal proposal = new ExecutionProposal(new TopicPartition(TOPIC0, 0),
+                                                       100,
+                                                       new ReplicaPlacementInfo(0),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+
+    ExecutionTask task = completedTaskForProposal(0, proposal);
+
+    // The throttle rate is set outside of Cruise Control as a cluster-wide dynamic default broker config, e.g. by
+    // an operator who adjusts the throttle of an ongoing execution.
+    _adminClient.incrementalAlterConfigs(Collections.singletonMap(KafkaCruiseControlUtils.CLUSTER_CONFIG, Arrays.asList(
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG,
+                                          String.valueOf(clusterDefaultThrottleRate)), AlterConfigOp.OpType.SET),
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG,
+                                          String.valueOf(clusterDefaultThrottleRate)), AlterConfigOp.OpType.SET)
+    ))).all().get();
+    waitForClusterDefaultThrottledRate(clusterDefaultThrottleRate);
+
+    // The broker-level throttles set by Cruise Control take precedence over the cluster-wide default.
+    throttleHelper.setThrottles(Collections.singletonList(proposal));
+    assertExpectedThrottledRateForBroker(0, throttleRate);
+    assertExpectedThrottledRateForBroker(1, throttleRate);
+    assertExpectedThrottledRateForBroker(2, throttleRate);
+
+    // Clearing the throttles removes the broker-level throttles, and the brokers fall back to the cluster-wide default.
+    throttleHelper.clearThrottles(Collections.singletonList(task), Collections.emptyList());
+    waitForClusterDefaultThrottledRate(clusterDefaultThrottleRate);
+    assertExpectedThrottledReplicas(TOPIC0, "");
+
+    // Clearing the throttles again leaves the cluster-wide default untouched.
+    throttleHelper.clearThrottles(Collections.singletonList(task), Collections.emptyList());
+    waitForClusterDefaultThrottledRate(clusterDefaultThrottleRate);
+  }
+
+  @Test
   public void testDoNotModifyExistingWildcardReplicaThrottles() throws Exception {
     createTopics();
 
@@ -546,6 +623,114 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
       assertExpectedThrottledRateForBroker(i, null);
     }
     assertExpectedThrottledReplicas(TOPIC0, "");
+  }
+
+  @Test
+  public void testThrottlesThatFailToBeRemovedAreRemovedLater() throws Exception {
+    createTopics();
+
+    final long throttleRate = 100L;
+    final int brokerToFail = 1;
+    AtomicBoolean failRemoval = new AtomicBoolean(false);
+    ReplicationThrottleHelper.AppliedThrottles appliedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
+    ConfigResource brokerResourceToFail = new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(brokerToFail));
+    ConfigResource topicResourceToFail = new ConfigResource(ConfigResource.Type.TOPIC, TOPIC1);
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttleRate, ReplicationThrottleHelper.RETRIES,
+                                                                             new HashSet<>(), appliedThrottles) {
+      // Fails the batched config writes of broker 1 and topic1 while failRemoval is set; the other resources are written.
+      @Override
+      Map<ConfigResource, KafkaFuture<Void>> alterConfigs(Map<ConfigResource, Collection<AlterConfigOp>> chunkOps) {
+        Map<ConfigResource, Collection<AlterConfigOp>> opsToWrite = new HashMap<>(chunkOps);
+        Map<ConfigResource, KafkaFuture<Void>> futures = new HashMap<>();
+        if (failRemoval.get()) {
+          for (ConfigResource cf : Arrays.asList(brokerResourceToFail, topicResourceToFail)) {
+            if (opsToWrite.remove(cf) != null) {
+              KafkaFutureImpl<Void> failedFuture = new KafkaFutureImpl<>();
+              failedFuture.completeExceptionally(new org.apache.kafka.common.errors.TimeoutException("Injected failure"));
+              futures.put(cf, failedFuture);
+            }
+          }
+        }
+        if (!opsToWrite.isEmpty()) {
+          futures.putAll(super.alterConfigs(opsToWrite));
+        }
+        return futures;
+      }
+    };
+    // Throttles brokers 0, 1, 2 and topic0 replicas 0:0, 0:1, 0:2.
+    ExecutionProposal proposal0 = new ExecutionProposal(new TopicPartition(TOPIC0, 0), 100, new ReplicaPlacementInfo(0),
+                                                        Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                        Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+    // Throttles brokers 0, 2, 3 and topic1 replicas 0:0, 0:2, 0:3.
+    ExecutionProposal proposal1 = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 100, new ReplicaPlacementInfo(3),
+                                                        Arrays.asList(new ReplicaPlacementInfo(3), new ReplicaPlacementInfo(0)),
+                                                        Arrays.asList(new ReplicaPlacementInfo(3), new ReplicaPlacementInfo(2)));
+    throttleHelper.setThrottles(Arrays.asList(proposal0, proposal1));
+    assertEquals(Set.of(0, 1, 2, 3), appliedThrottles.brokers());
+    assertEquals(Set.of(proposal0, proposal1), appliedThrottles.proposals());
+
+    // Failing to remove the throttled rate of broker 1 and the throttled replicas of topic1 fails the call, but only after
+    // removing the others.
+    failRemoval.set(true);
+    List<ExecutionTask> completedTasks = Arrays.asList(completedTaskForProposal(0, proposal0), completedTaskForProposal(1, proposal1));
+    IllegalStateException exception = assertThrows(IllegalStateException.class,
+                                                   () -> throttleHelper.clearThrottles(completedTasks, Collections.emptyList()));
+    assertTrue(exception.getMessage(), exception.getMessage().contains("brokers [" + brokerToFail + "] and topics [" + TOPIC1 + "]"));
+    for (int i = 0; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, i == brokerToFail ? throttleRate : null);
+    }
+    assertExpectedThrottledReplicas(TOPIC0, "");
+    assertExpectedThrottledReplicas(TOPIC1, "0:0,0:2,0:3");
+    assertEquals(Set.of(brokerToFail), appliedThrottles.brokers());
+    assertEquals(Set.of(proposal1), appliedThrottles.proposals());
+
+    // The throttles that could not be removed are removed later.
+    failRemoval.set(false);
+    throttleHelper.clearLeftoverThrottles(Collections.emptySet());
+    for (int i = 0; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, null);
+    }
+    assertExpectedThrottledReplicas(TOPIC1, "");
+    assertTrue(appliedThrottles.isEmpty());
+  }
+
+  @Test
+  public void testClearLeftoverThrottlesRetainsThrottlesOfOngoingMovements() throws Exception {
+    createTopics();
+
+    final long throttleRate = 100L;
+    ReplicationThrottleHelper.AppliedThrottles appliedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttleRate, ReplicationThrottleHelper.RETRIES,
+                                                                             new HashSet<>(), appliedThrottles);
+    // Throttles brokers 0, 1, 2 and topic0 replicas 0:0, 0:1, 0:2.
+    ExecutionProposal finishedProposal = new ExecutionProposal(new TopicPartition(TOPIC0, 0), 100, new ReplicaPlacementInfo(0),
+                                                               Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                               Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+    // Throttles brokers 1, 2, 3 and topic1 replicas 0:1, 0:2, 0:3.
+    ExecutionProposal ongoingProposal = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 100, new ReplicaPlacementInfo(2),
+                                                              Arrays.asList(new ReplicaPlacementInfo(2), new ReplicaPlacementInfo(3)),
+                                                              Arrays.asList(new ReplicaPlacementInfo(3), new ReplicaPlacementInfo(1)));
+    // E.g. the execution fails after setting the throttles, and Kafka carries on with the partition reassignments.
+    throttleHelper.setThrottles(Arrays.asList(finishedProposal, ongoingProposal));
+
+    // Retain the throttles that the ongoing partition reassignment needs.
+    throttleHelper.clearLeftoverThrottles(Collections.singleton(ongoingProposal.topicPartition()));
+    assertExpectedThrottledRateForBroker(0, null);
+    for (int i = 1; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, throttleRate);
+    }
+    assertExpectedThrottledReplicas(TOPIC0, "");
+    assertExpectedThrottledReplicas(TOPIC1, "0:1,0:2,0:3");
+    assertEquals(Set.of(1, 2, 3), appliedThrottles.brokers());
+    assertEquals(Set.of(ongoingProposal), appliedThrottles.proposals());
+
+    // Remove the rest once the partition reassignment is over.
+    throttleHelper.clearLeftoverThrottles(Collections.emptySet());
+    for (int i = 0; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, null);
+    }
+    assertExpectedThrottledReplicas(TOPIC1, "");
+    assertTrue(appliedThrottles.isEmpty());
   }
 
   @Test
@@ -697,6 +882,21 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     expectedConfigs.put("name6", "other-value");
     assertFalse(ReplicationThrottleHelper.configsEqual(new Config(entries), expectedConfigs));
     expectedConfigs.put("name6", null);
+
+    // In the case that a dynamic config is deleted, but the dynamic config is still returned, the configs are not equal
+    expectedConfigs.put("name8", null);
+    entries.add(mockConfigEntry("name8", "value8", ConfigEntry.ConfigSource.DYNAMIC_BROKER_CONFIG));
+    assertFalse(ReplicationThrottleHelper.configsEqual(new Config(entries), expectedConfigs));
+    // In the case that a deleted config is reported with the default config source but still with the deleted value, the
+    // deletion is not applied yet; a different value from the default config source means that it is applied
+    Map<String, String> expectedDeletion = Collections.singletonMap("name9", null);
+    Config staleDefaultConfig = new Config(Collections.singletonList(mockConfigEntry("name9", "value9", ConfigEntry.ConfigSource.DEFAULT_CONFIG)));
+    assertFalse(ReplicationThrottleHelper.configsEqual(staleDefaultConfig, expectedDeletion, Collections.singletonMap("name9", "value9")));
+    assertTrue(ReplicationThrottleHelper.configsEqual(staleDefaultConfig, expectedDeletion, Collections.singletonMap("name9", "other-value")));
+    // ... which does not apply to a cluster-wide dynamic default with the deleted value
+    Config clusterDefaultConfig =
+        new Config(Collections.singletonList(mockConfigEntry("name9", "value9", ConfigEntry.ConfigSource.DYNAMIC_DEFAULT_BROKER_CONFIG)));
+    assertTrue(ReplicationThrottleHelper.configsEqual(clusterDefaultConfig, expectedDeletion, Collections.singletonMap("name9", "value9")));
   }
 
   private ExecutionTask prepareMockCompleteTask(ExecutionProposal proposal) {
@@ -729,15 +929,17 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
 
   // --- Batch mock helpers (used by testSetThrottleOnNonExistentTopic and testClearThrottleOnNonExistentTopic) ---
 
-  // Expects a single batched incrementalAlterConfigs call for brokers, succeeding via all().
-  private void expectBatchIncrementalBrokerConfigs(Admin adminClient)
-  throws ExecutionException, InterruptedException, TimeoutException {
+  // Expects a single batched incrementalAlterConfigs call for the given brokers, succeeding via per-broker futures (values()),
+  // as the removal of throttled rates writes them.
+  private void expectBatchIncrementalBrokerConfigsViaValues(Admin adminClient, List<Integer> brokers) {
     AlterConfigsResult mockAlterConfigsResult = EasyMock.mock(AlterConfigsResult.class);
-    KafkaFuture<Void> mockFuture = EasyMock.mock(KafkaFuture.class);
-    EasyMock.expect(mockAlterConfigsResult.all()).andReturn(mockFuture);
-    EasyMock.expect(mockFuture.get(EasyMock.anyLong(), EasyMock.anyObject())).andReturn(null);
+    Map<ConfigResource, KafkaFuture<Void>> futureMap = new HashMap<>();
+    for (int id : brokers) {
+      futureMap.put(new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(id)), KafkaFuture.completedFuture(null));
+    }
+    EasyMock.expect(mockAlterConfigsResult.values()).andReturn(futureMap);
     EasyMock.expect(adminClient.incrementalAlterConfigs(EasyMock.anyObject())).andReturn(mockAlterConfigsResult);
-    EasyMock.replay(mockAlterConfigsResult, mockFuture);
+    EasyMock.replay(mockAlterConfigsResult);
   }
 
   // Expects a single batched describeConfigs call for a topic, returning per-topic futures via values().
@@ -904,6 +1106,35 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
       assertEquals(expectedString, brokerConfig.get(cf).get(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG).value());
       assertEquals(expectedString, brokerConfig.get(cf).get(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG).value());
     }
+  }
+
+  private void waitForClusterDefaultThrottledRate(long expectedRate) {
+    for (int i = 0; i < clusterSize(); i++) {
+      int brokerId = i;
+      waitUntilTrue(() -> hasClusterDefaultThrottledRate(brokerId, expectedRate),
+                    String.format("Broker %d does not have the cluster-wide default throttle rate %d", brokerId, expectedRate),
+                    10_000L, 100L);
+    }
+  }
+
+  private boolean hasClusterDefaultThrottledRate(int brokerId, long expectedRate) {
+    ConfigResource cf = new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(brokerId));
+    Config brokerConfig;
+    try {
+      brokerConfig = _adminClient.describeConfigs(Collections.singletonList(cf)).all().get().get(cf);
+    } catch (InterruptedException | ExecutionException e) {
+      return false;
+    }
+    for (String throttledRateConfig : Arrays.asList(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG,
+                                                    ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG)) {
+      ConfigEntry configEntry = brokerConfig.get(throttledRateConfig);
+      if (configEntry == null
+          || configEntry.source() != ConfigEntry.ConfigSource.DYNAMIC_DEFAULT_BROKER_CONFIG
+          || !String.valueOf(expectedRate).equals(configEntry.value())) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private void assertExpectedThrottledReplicas(String topic, String expectedReplicas) throws ExecutionException, InterruptedException {
