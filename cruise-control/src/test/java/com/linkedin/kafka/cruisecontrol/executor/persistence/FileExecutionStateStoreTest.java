@@ -60,6 +60,25 @@ public class FileExecutionStateStoreTest {
   }
 
   @Test
+  public void testRetainedThrottlesOutliveTheExecutionState() throws IOException {
+    String json = "{\"retained\": 1}";
+    assertEquals(Optional.empty(), _store.loadRetainedThrottles());
+    _store.save(sampleState());
+    _store.saveRetainedThrottles(json);
+    assertEquals(Optional.of(json), _store.loadRetainedThrottles());
+    Path retainedThrottlesPath = Paths.get(_statePath + FileExecutionStateStore.RETAINED_THROTTLES_FILE_SUFFIX);
+    assertFalse(Files.exists(Paths.get(retainedThrottlesPath + FileExecutionStateStore.TEMP_FILE_SUFFIX)));
+    // Deleting the execution state keeps the retained throttles.
+    _store.delete();
+    assertEquals(Optional.of(json), _store.loadRetainedThrottles());
+    _store.saveRetainedThrottles(null);
+    assertEquals(Optional.empty(), _store.loadRetainedThrottles());
+    assertFalse(Files.exists(retainedThrottlesPath));
+    // Deleting non-existing retained throttles is a no-op.
+    _store.saveRetainedThrottles(null);
+  }
+
+  @Test
   public void testSaveLoadAndDelete() throws IOException {
     PersistedExecutionState state = sampleState();
     _store.save(state);

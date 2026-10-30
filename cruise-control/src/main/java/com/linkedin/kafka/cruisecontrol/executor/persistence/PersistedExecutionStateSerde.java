@@ -75,6 +75,7 @@ public final class PersistedExecutionStateSerde {
   static final String NUM_PARTITIONS = "numPartitions";
   static final String NUM_REPLICAS_BY_BROKER = "numReplicasByBroker";
   static final String LOGDIR_FINGERPRINT_BY_BROKER = "logDirFingerprintByBroker";
+  static final String BROKERS = "brokers";
 
   private PersistedExecutionStateSerde() {
   }
@@ -154,17 +155,7 @@ public final class PersistedExecutionStateSerde {
 
     json.name(PROPOSALS).beginArray();
     for (ExecutionProposal proposal : state.proposals().values()) {
-      json.beginObject();
-      json.name(TOPIC).value(proposal.topic());
-      json.name(PARTITION).value(proposal.partitionId());
-      json.name(PARTITION_SIZE).value(proposal.partitionSize());
-      json.name(OLD_LEADER);
-      writeReplica(json, proposal.oldLeader());
-      json.name(OLD_REPLICAS);
-      writeReplicas(json, proposal.oldReplicas());
-      json.name(NEW_REPLICAS);
-      writeReplicas(json, proposal.newReplicas());
-      json.endObject();
+      writeProposal(json, proposal);
     }
     json.endArray();
 
@@ -249,12 +240,7 @@ public final class PersistedExecutionStateSerde {
 
       List<ExecutionProposal> proposals = new ArrayList<>();
       for (JsonElement element : required(root, PROPOSALS).getAsJsonArray()) {
-        JsonObject p = element.getAsJsonObject();
-        proposals.add(new ExecutionProposal(new TopicPartition(required(p, TOPIC).getAsString(), required(p, PARTITION).getAsInt()),
-                                            required(p, PARTITION_SIZE).getAsLong(),
-                                            replicaFromJson(required(p, OLD_LEADER).getAsJsonObject()),
-                                            replicasFromJson(required(p, OLD_REPLICAS).getAsJsonArray()),
-                                            replicasFromJson(required(p, NEW_REPLICAS).getAsJsonArray())));
+        proposals.add(proposalFromJson(element.getAsJsonObject()));
       }
       builder.proposals(proposals);
 
@@ -276,6 +262,99 @@ public final class PersistedExecutionStateSerde {
     } catch (RuntimeException e) {
       throw new IllegalArgumentException("Failed to parse the persisted execution state.", e);
     }
+  }
+
+  /**
+   * @param brokers Brokers whose replication throttled rate has been set, but not removed yet.
+   * @param proposals Inter-broker replica movements whose replicas have been throttled, but not unthrottled yet.
+   * @return JSON representation of the given retained replication throttles.
+   */
+  public static String retainedThrottlesToJson(Collection<Integer> brokers, Collection<ExecutionProposal> proposals) {
+    StringWriter writer = new StringWriter();
+    try {
+      JsonWriter json = new JsonWriter(writer);
+      json.beginObject();
+      json.name(VERSION).value(PersistedExecutionState.CURRENT_VERSION);
+      writeIntegers(json, BROKERS, brokers);
+      json.name(PROPOSALS).beginArray();
+      for (ExecutionProposal proposal : proposals) {
+        writeProposal(json, proposal);
+      }
+      json.endArray();
+      json.endObject();
+      json.flush();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    return writer.toString();
+  }
+
+  /**
+   * @param json JSON representation of retained replication throttles.
+   * @return The deserialized retained replication throttles.
+   * @throws IllegalArgumentException If the given JSON is not valid, or has an unsupported version.
+   */
+  public static RetainedThrottles retainedThrottlesFromJson(String json) {
+    try {
+      JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+      int version = required(root, VERSION).getAsInt();
+      if (version > PersistedExecutionState.CURRENT_VERSION) {
+        throw new IllegalArgumentException(String.format("Unsupported retained throttles version %d (latest supported: %d).",
+                                                         version, PersistedExecutionState.CURRENT_VERSION));
+      }
+      List<ExecutionProposal> proposals = new ArrayList<>();
+      for (JsonElement element : required(root, PROPOSALS).getAsJsonArray()) {
+        proposals.add(proposalFromJson(element.getAsJsonObject()));
+      }
+      return new RetainedThrottles(optionalIntegers(root, BROKERS), proposals);
+    } catch (IllegalArgumentException e) {
+      throw e;
+    } catch (RuntimeException e) {
+      throw new IllegalArgumentException("Failed to parse the retained replication throttles.", e);
+    }
+  }
+
+  /**
+   * The replication throttles that executions set, but could not remove yet.
+   */
+  public static final class RetainedThrottles {
+    private final List<Integer> _brokers;
+    private final List<ExecutionProposal> _proposals;
+
+    RetainedThrottles(List<Integer> brokers, List<ExecutionProposal> proposals) {
+      _brokers = brokers == null ? List.of() : brokers;
+      _proposals = proposals;
+    }
+
+    public List<Integer> brokers() {
+      return _brokers;
+    }
+
+    public List<ExecutionProposal> proposals() {
+      return _proposals;
+    }
+  }
+
+  private static void writeProposal(JsonWriter json, ExecutionProposal proposal) throws IOException {
+    json.beginObject();
+    json.name(TOPIC).value(proposal.topic());
+    json.name(PARTITION).value(proposal.partitionId());
+    json.name(PARTITION_SIZE).value(proposal.partitionSize());
+    json.name(OLD_LEADER);
+    writeReplica(json, proposal.oldLeader());
+    json.name(OLD_REPLICAS);
+    writeReplicas(json, proposal.oldReplicas());
+    json.name(NEW_REPLICAS);
+    writeReplicas(json, proposal.newReplicas());
+    json.endObject();
+  }
+
+  private static ExecutionProposal proposalFromJson(JsonObject p) {
+    return new ExecutionProposal(new TopicPartition(required(p, TOPIC).getAsString(), required(p, PARTITION).getAsInt()),
+                                 required(p, PARTITION_SIZE).getAsLong(),
+                                 replicaFromJson(required(p, OLD_LEADER).getAsJsonObject()),
+                                 replicasFromJson(required(p, OLD_REPLICAS).getAsJsonArray()),
+                                 replicasFromJson(required(p, NEW_REPLICAS).getAsJsonArray()));
   }
 
   private static void writeIntegers(JsonWriter json, String name, Collection<Integer> values) throws IOException {

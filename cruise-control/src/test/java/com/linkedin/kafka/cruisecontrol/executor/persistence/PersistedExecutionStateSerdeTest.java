@@ -124,6 +124,21 @@ public class PersistedExecutionStateSerdeTest {
   }
 
   @Test
+  public void testRetainedThrottlesRoundTrip() {
+    List<ExecutionProposal> proposals = List.copyOf(sampleState().proposals().values());
+    PersistedExecutionStateSerde.RetainedThrottles retained =
+        PersistedExecutionStateSerde.retainedThrottlesFromJson(PersistedExecutionStateSerde.retainedThrottlesToJson(List.of(3, 1), proposals));
+    assertEquals(List.of(3, 1), retained.brokers());
+    assertEquals(proposals.size(), retained.proposals().size());
+    for (int i = 0; i < proposals.size(); i++) {
+      assertProposalEquals(proposals.get(i), retained.proposals().get(i));
+    }
+    assertThrows(IllegalArgumentException.class, () -> PersistedExecutionStateSerde.retainedThrottlesFromJson("{\"version\": 1}"));
+    String futureVersion = "{\"version\": 99, \"proposals\": []}";
+    assertThrows(IllegalArgumentException.class, () -> PersistedExecutionStateSerde.retainedThrottlesFromJson(futureVersion));
+  }
+
+  @Test
   public void testRoundTripWithDefaults() {
     PersistedExecutionState state = new PersistedExecutionState.Builder("uuid-2", PersistedExecutionState.Operation.DEMOTE_BROKERS)
         .demotedBrokers(List.of(1, 2))

@@ -137,19 +137,24 @@ class ReplicationThrottleHelper {
    * (rather than inherited from a cluster-wide default) to the throttle rate of the interrupted execution. A different rate was
    * set by someone else after the execution set it -- e.g. by an operator while Cruise Control was not running -- and is kept.
    *
+   * <p>It removes the throttles recorded in the given record (see {@link #clearLeftoverThrottles(Set)} and
+   * {@link #clearThrottlesForProposals(List, List)}): what it cannot remove (e.g. the throttled rate of a broker that is not alive)
+   * stays recorded, so that it can be retained and removed later.</p>
+   *
    * @param adminClient The admin client to use.
    * @param throttleRate The replication throttle of the interrupted execution.
-   * @param deadBrokers Brokers that are not alive -- i.e. whose throttles cannot be removed.
    * @param retries The number of attempts to read back a config change.
+   * @param appliedThrottles The record of the throttles of the interrupted execution.
    * @return A helper to remove the leftover throttles of an interrupted execution.
    */
-  static ReplicationThrottleHelper forInterruptedExecution(Admin adminClient, Long throttleRate, Set<Integer> deadBrokers, int retries) {
-    return new ReplicationThrottleHelper(adminClient, throttleRate, retries, deadBrokers, new AppliedThrottles(), true);
+  static ReplicationThrottleHelper forInterruptedExecution(Admin adminClient, Long throttleRate, int retries,
+                                                           AppliedThrottles appliedThrottles) {
+    return new ReplicationThrottleHelper(adminClient, throttleRate, retries, new HashSet<>(), appliedThrottles, true);
   }
 
   /**
    * @return Descriptions of the throttled rates that were not removed because they were not set by the execution -- see
-   * {@link #forInterruptedExecution(Admin, Long, Set, int)}.
+   * {@link #forInterruptedExecution(Admin, Long, int, AppliedThrottles)}.
    */
   synchronized List<String> keptRates() {
     return new ArrayList<>(_keptRates);
@@ -1195,6 +1200,18 @@ class ReplicationThrottleHelper {
   static final class AppliedThrottles {
     private final Set<Integer> _brokers = ConcurrentHashMap.newKeySet();
     private final Set<ExecutionProposal> _proposals = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Record the given throttles as set, but not removed yet -- e.g. the throttles that an execution interrupted by a restart
+     * left behind, or the ones that were retained before the restart.
+     *
+     * @param brokers Brokers whose throttled rate has been set.
+     * @param proposals Inter-broker replica movements whose replicas have been throttled.
+     */
+    void add(Collection<Integer> brokers, Collection<ExecutionProposal> proposals) {
+      _brokers.addAll(brokers);
+      _proposals.addAll(proposals);
+    }
 
     /**
      * @return {@code true} if there is no throttle to remove, {@code false} otherwise.

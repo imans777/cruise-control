@@ -43,8 +43,10 @@ public class FileExecutionStateStore implements ExecutionStateStore {
   private static final Logger LOG = LoggerFactory.getLogger(FileExecutionStateStore.class);
   public static final String TEMP_FILE_SUFFIX = ".tmp";
   public static final String CORRUPT_FILE_SUFFIX = ".corrupt";
+  public static final String RETAINED_THROTTLES_FILE_SUFFIX = ".throttles";
   private Path _path;
   private Path _tempPath;
+  private Path _retainedThrottlesPath;
 
   @Override
   public synchronized void configure(Map<String, ?> configs) {
@@ -55,6 +57,7 @@ public class FileExecutionStateStore implements ExecutionStateStore {
     }
     _path = Paths.get(pathString);
     _tempPath = Paths.get(pathString + TEMP_FILE_SUFFIX);
+    _retainedThrottlesPath = Paths.get(pathString + RETAINED_THROTTLES_FILE_SUFFIX);
   }
 
   /**
@@ -67,28 +70,69 @@ public class FileExecutionStateStore implements ExecutionStateStore {
   @Override
   public synchronized void save(PersistedExecutionState state) throws IOException {
     ensureConfigured();
-    Path parent = _path.toAbsolutePath().getParent();
+    atomicWrite(_path, _tempPath, writer -> PersistedExecutionStateSerde.writeJson(state, writer));
+  }
+
+  @Override
+  public synchronized void saveRetainedThrottles(String json) throws IOException {
+    ensureConfigured();
+    if (json == null) {
+      Files.deleteIfExists(_retainedThrottlesPath);
+      syncDirectory(_retainedThrottlesPath.toAbsolutePath().getParent());
+    } else {
+      atomicWrite(_retainedThrottlesPath, Paths.get(_retainedThrottlesPath + TEMP_FILE_SUFFIX), writer -> writer.write(json));
+    }
+  }
+
+  @Override
+  public synchronized Optional<String> loadRetainedThrottles() throws IOException {
+    ensureConfigured();
+    try {
+      return Optional.of(Files.readString(_retainedThrottlesPath, StandardCharsets.UTF_8));
+    } catch (NoSuchFileException e) {
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Atomically replace the given file with the content written by the given writer: write a temporary file, sync it, rename it
+   * over the file, and sync the directory.
+   *
+   * @param path File to replace.
+   * @param tempPath Temporary file to write first.
+   * @param content Writes the content of the file.
+   */
+  private static void atomicWrite(Path path, Path tempPath, Content content) throws IOException {
+    Path parent = path.toAbsolutePath().getParent();
     if (parent != null) {
       Files.createDirectories(parent);
     }
-    try (FileChannel channel = FileChannel.open(_tempPath, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+    try (FileChannel channel = FileChannel.open(tempPath, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
                                                 StandardOpenOption.WRITE);
          Writer writer = new BufferedWriter(Channels.newWriter(channel, StandardCharsets.UTF_8))) {
-      PersistedExecutionStateSerde.writeJson(state, writer);
+      content.writeTo(writer);
       writer.flush();
       channel.force(true);
     }
     try {
-      Files.setPosixFilePermissions(_tempPath, EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
+      Files.setPosixFilePermissions(tempPath, EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
     } catch (UnsupportedOperationException | IOException e) {
-      LOG.debug("Unable to restrict the file permissions of the execution state file {}.", _tempPath, e);
+      LOG.debug("Unable to restrict the file permissions of {}.", tempPath, e);
     }
     try {
-      Files.move(_tempPath, _path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+      Files.move(tempPath, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     } catch (AtomicMoveNotSupportedException e) {
-      Files.move(_tempPath, _path, StandardCopyOption.REPLACE_EXISTING);
+      Files.move(tempPath, path, StandardCopyOption.REPLACE_EXISTING);
     }
     syncDirectory(parent);
+  }
+
+  /**
+   * Writes the content of a file.
+   */
+  @FunctionalInterface
+  private interface Content {
+    void writeTo(Writer writer) throws IOException;
   }
 
   @Override

@@ -1242,7 +1242,7 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     changeBrokerConfigs(executionThrottleHelper, 1, ops);
 
     ReplicationThrottleHelper cleanupThrottleHelper =
-        ReplicationThrottleHelper.forInterruptedExecution(_adminClient, throttleRate, Collections.emptySet(), 5);
+        ReplicationThrottleHelper.forInterruptedExecution(_adminClient, throttleRate, 5, new ReplicationThrottleHelper.AppliedThrottles());
     cleanupThrottleHelper.clearThrottlesForProposals(Collections.singletonList(proposal), Collections.emptyList());
     assertExpectedThrottledRateForBroker(0, null);
     assertExpectedThrottledRateForBroker(2, null);

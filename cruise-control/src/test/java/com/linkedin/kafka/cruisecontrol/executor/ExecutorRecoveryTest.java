@@ -17,6 +17,7 @@ import com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorManager;
 import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.ExecutionStateStore;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedExecutionState;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedExecutionStateSerde;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedTask;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.ReplicaPlacementFingerprint;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.utils.CCKafkaClientsIntegrationTestHarness;
@@ -149,6 +150,7 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
   private static final class RecordingExecutionStateStore implements ExecutionStateStore {
     private final List<PersistedExecutionState> _savedStates = new CopyOnWriteArrayList<>();
     private volatile PersistedExecutionState _state;
+    private volatile String _retainedThrottles;
 
     @Override
     public synchronized void save(PersistedExecutionState state) {
@@ -167,10 +169,24 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     }
 
     @Override
+    public synchronized void saveRetainedThrottles(String json) {
+      _retainedThrottles = json;
+    }
+
+    @Override
+    public synchronized Optional<String> loadRetainedThrottles() {
+      return Optional.ofNullable(_retainedThrottles);
+    }
+
+    @Override
     public void configure(Map<String, ?> configs) { }
 
     PersistedExecutionState state() {
       return _state;
+    }
+
+    String retainedThrottles() {
+      return _retainedThrottles;
     }
 
     List<PersistedExecutionState> savedStates() {
@@ -672,6 +688,49 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     assertNull(brokerRate(1, ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG));
     assertEquals(List.of("broker 2: follower.replication.throttled.rate=5000 (DYNAMIC_BROKER_CONFIG)"),
                  recovery(executor).get("keptThrottles"));
+  }
+
+  @Test
+  public void testThrottlesRetainedBeforeRestartAreRemoved() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    long throttle = 100_000L;
+    // Throttles that an execution could not remove before the restart (e.g. a broker was unavailable), and so retained.
+    new ReplicationThrottleHelper(_adminClient, throttle).setThrottles(List.of(proposal));
+    assertTrue(hasThrottles());
+    _store.saveRetainedThrottles(PersistedExecutionStateSerde.retainedThrottlesToJson(Set.of(0, 1, 2), List.of(proposal)));
+
+    AnomalyDetectorManager anomalyDetectorManager = mockAnomalyDetectorManager(null);
+    Executor executor = newExecutor(false, null, new RecordingNotifier(), anomalyDetectorManager);
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitUntilTrue(() -> _store.retainedThrottles() == null, "The retained throttles are not removed", WAIT_TIME_MS, 100L);
+    assertFalse(hasThrottles());
+    assertFalse(executor.hasOngoingExecution());
+    EasyMock.verify(anomalyDetectorManager);
+  }
+
+  @Test
+  public void testRecoveryRetainsThrottledRateOfUnavailableBroker() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    long throttle = 100_000L;
+    new ReplicationThrottleHelper(_adminClient, throttle).setThrottles(List.of(proposal(TP0, List.of(0, 1), List.of(0, 2))));
+    assertTrue(hasThrottles());
+    // The interrupted execution also involves a broker that is unavailable upon recovery.
+    int unavailableBroker = 99;
+    _store.save(interruptedExecutionState(throttle, List.of(proposal(TP0, List.of(0, 1), List.of(0, 2, unavailableBroker)))));
+
+    AnomalyDetectorManager anomalyDetectorManager = mockAnomalyDetectorManager(null);
+    Executor executor = newExecutor(false, null, new RecordingNotifier(), anomalyDetectorManager);
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitUntilTrue(() -> _store.state() == null, "The interrupted execution is not cleaned up", WAIT_TIME_MS, 100L);
+    waitForExecutionToFinish(executor);
+    // The throttles of the available brokers and of the topic are removed. The throttled rate of the unavailable broker is
+    // retained and persisted, so that it is removed once the broker is available -- even if Cruise Control restarts before.
+    assertFalse(hasThrottles());
+    assertEquals(List.of(unavailableBroker), PersistedExecutionStateSerde.retainedThrottlesFromJson(_store.retainedThrottles()).brokers());
+    assertTrue(((List<?>) recovery(executor).get("keptThrottles")).contains(
+        "broker 99: retained -- its throttled rates are removed once it is available"));
+    EasyMock.verify(anomalyDetectorManager);
   }
 
   @Test
