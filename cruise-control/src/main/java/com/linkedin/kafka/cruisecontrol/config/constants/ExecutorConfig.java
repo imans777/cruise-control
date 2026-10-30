@@ -86,6 +86,18 @@ public final class ExecutorConfig {
       + "max.num.cluster.partition.movements throttles the maximum partition movements across the cluster";
 
   /**
+   * <code>clear.replication.throttles.before.execution</code>
+   */
+  public static final String CLEAR_REPLICATION_THROTTLES_BEFORE_EXECUTION_CONFIG = "clear.replication.throttles.before.execution";
+  public static final boolean DEFAULT_CLEAR_REPLICATION_THROTTLES_BEFORE_EXECUTION = false;
+  public static final String CLEAR_REPLICATION_THROTTLES_BEFORE_EXECUTION_DOC = "Remove every replication throttle in the cluster "
+      + "before starting an execution: the leader/follower.replication.throttled.replicas of every topic and the "
+      + "leader/follower.replication.throttled.rate set on each broker, e.g. left by an execution that a crash or forced restart "
+      + "interrupted, or set by other tools. The throttles of partitions that are still being reassigned, the throttled rates of the "
+      + "brokers hosting them, the cluster-wide default throttled rates and the rates of unavailable brokers are retained. If a "
+      + "throttle cannot be removed, the execution fails before moving anything. Set to false to keep existing throttles.";
+
+  /**
    * <code>default.replication.throttle</code>
    */
   public static final String DEFAULT_REPLICATION_THROTTLE_CONFIG = "default.replication.throttle";
@@ -543,6 +555,11 @@ public final class ExecutorConfig {
                             atLeast(1),
                             ConfigDef.Importance.MEDIUM,
                             MAX_NUM_CLUSTER_PARTITION_MOVEMENTS_DOC)
+                    .define(CLEAR_REPLICATION_THROTTLES_BEFORE_EXECUTION_CONFIG,
+                            ConfigDef.Type.BOOLEAN,
+                            DEFAULT_CLEAR_REPLICATION_THROTTLES_BEFORE_EXECUTION,
+                            ConfigDef.Importance.LOW,
+                            CLEAR_REPLICATION_THROTTLES_BEFORE_EXECUTION_DOC)
                     .define(DEFAULT_REPLICATION_THROTTLE_CONFIG,
                             ConfigDef.Type.LONG,
                             DEFAULT_DEFAULT_REPLICATION_THROTTLE,
