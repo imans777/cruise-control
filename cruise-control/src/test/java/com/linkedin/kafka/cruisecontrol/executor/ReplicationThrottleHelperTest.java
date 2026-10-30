@@ -321,6 +321,14 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
   }
 
   @Test
+  public void testThrottleRateDoesNotWaitForTheLockOfTheHelper() throws Exception {
+    // The executor state reads the rate while setting, clearing or updating the throttles holds the lock of the helper for as
+    // long as it takes to alter and verify the configs.
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(EasyMock.mock(Admin.class), 100L);
+    assertEquals(Long.valueOf(100L), readWhileLocked(throttleHelper, throttleHelper::throttleRate));
+  }
+
+  @Test
   public void testRemovingThrottleOfAnOngoingExecution() throws Exception {
     createTopics();
 

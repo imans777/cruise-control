@@ -41,6 +41,7 @@ import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC0;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.EXECUTION_ALERTING_THRESHOLD_MS;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.EXECUTION_DEADLINE_MS;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.EXECUTION_SHORT_CHECK_MS;
+import static com.linkedin.kafka.cruisecontrol.executor.ExecutorTestUtils.readWhileLocked;
 import static com.linkedin.kafka.cruisecontrol.executor.LogDirThrottleHelper.LOG_DIR_THROTTLE_CONFIG;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -139,6 +140,16 @@ public class LogDirThrottleHelperTest extends CCKafkaIntegrationTestHarness {
     ConfigEntry throttle = brokerConfig(0).get(LOG_DIR_THROTTLE_CONFIG);
     assertEquals(clusterWideDefaultThrottle, throttle.value());
     assertEquals(ConfigEntry.ConfigSource.DYNAMIC_DEFAULT_BROKER_CONFIG, throttle.source());
+  }
+
+  @Test
+  public void testAppliedThrottleByBrokerDoesNotWaitForTheLockOfTheHelper() throws Exception {
+    // The executor state reads the applied throttles while setting, updating or restoring them holds the lock of the helper for
+    // as long as it takes to alter and verify the configs.
+    LogDirThrottleHelper throttleHelper = new LogDirThrottleHelper(_adminClient, THROTTLE_RATE, new LogDirThrottleHelper.AppliedThrottles());
+    throttleHelper.setThrottles(Collections.singletonList(intraBrokerTask(0, 0)));
+    assertEquals(Collections.singletonMap(0, THROTTLE_RATE_STRING), readWhileLocked(throttleHelper, throttleHelper::appliedThrottleByBroker));
+    throttleHelper.clearAllThrottles();
   }
 
   @Test

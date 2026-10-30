@@ -49,8 +49,9 @@ class ReplicationThrottleHelper {
   static final int RETRIES = 30;
 
   private final Admin _adminClient;
-  // Guarded by this. The throttle rate (null if no throttling is applied), which may be updated during the execution.
-  private Long _throttleRate;
+  // Written under the lock of this helper, volatile for the unsynchronized getter. The throttle rate (null if no throttling is
+  // applied), which may be updated during the execution.
+  private volatile Long _throttleRate;
   private final int _retries;
   private final Set<Integer> _deadBrokers;
 
@@ -94,7 +95,13 @@ class ReplicationThrottleHelper {
     setThrottles(inProgressProposals.get());
   }
 
-  synchronized Long throttleRate() {
+  /**
+   * Not synchronized: the executor state reads it while setting, clearing or updating the throttles may hold the lock of this
+   * helper for as long as it takes to alter and verify the configs.
+   *
+   * @return The replication throttle rate of the ongoing execution, or {@code null} if it is not throttled.
+   */
+  Long throttleRate() {
     return _throttleRate;
   }
 

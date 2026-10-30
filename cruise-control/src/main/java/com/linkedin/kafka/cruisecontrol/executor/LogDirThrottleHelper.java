@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -62,7 +63,8 @@ class LogDirThrottleHelper {
   // Guarded by this. Brokers throttled by this helper, mapped to their original per-broker value of the config (null if they had
   // none). Owned by the caller, so that a throttle this helper fails to restore can be removed later.
   private final Map<Integer, String> _originalThrottleByBroker;
-  // Guarded by this. Brokers throttled by this helper, mapped to the per-broker value of the config this helper last applied.
+  // Written under the lock of this helper, concurrent for the unsynchronized getter. Brokers throttled by this helper, mapped to
+  // the per-broker value of the config this helper last applied.
   private final Map<Integer, String> _appliedThrottleByBroker;
   // Guarded by this. Whether the throttles have been restored -- i.e. this helper must not throttle any broker afterwards.
   private boolean _closed;
@@ -99,7 +101,7 @@ class LogDirThrottleHelper {
     _throttleRate = throttleRate;
     _retries = retries;
     _originalThrottleByBroker = appliedThrottles.originalThrottleByBroker();
-    _appliedThrottleByBroker = new HashMap<>();
+    _appliedThrottleByBroker = new ConcurrentHashMap<>();
     _closed = false;
   }
 
@@ -207,17 +209,13 @@ class LogDirThrottleHelper {
   }
 
   /**
-   * Restore the original per-broker value of the config (or remove the per-broker value if there was none) on all brokers
-   * throttled by this helper, using a single batch of requests. If the config of a broker has been changed since this helper last
-   * applied the throttle to it, the config of that broker is left as is. This method is best-effort and does not throw. A broker
-   * whose throttle could not be restored is kept in the applied throttles, so that the removal can be retried afterwards. This
-   * helper does not throttle any broker afterwards.
-   */
-  /**
+   * Not synchronized: the executor state reads it while an update may hold the lock of this helper for as long as it takes to
+   * alter and verify the configs.
+   *
    * @return The per-broker value of {@value #LOG_DIR_THROTTLE_CONFIG} this helper last applied to each broker it has
    * throttled and not restored yet.
    */
-  synchronized Map<Integer, String> appliedThrottleByBroker() {
+  Map<Integer, String> appliedThrottleByBroker() {
     return Collections.unmodifiableMap(new TreeMap<>(_appliedThrottleByBroker));
   }
 
@@ -249,6 +247,13 @@ class LogDirThrottleHelper {
     return true;
   }
 
+  /**
+   * Restore the original per-broker value of the config (or remove the per-broker value if there was none) on all brokers
+   * throttled by this helper, using a single batch of requests. If the config of a broker has been changed since this helper last
+   * applied the throttle to it, the config of that broker is left as is. This method is best-effort and does not throw. A broker
+   * whose throttle could not be restored is kept in the applied throttles, so that the removal can be retried afterwards. This
+   * helper does not throttle any broker afterwards.
+   */
   synchronized void clearAllThrottles() {
     _closed = true;
     removeThrottles(_adminClient, _originalThrottleByBroker, _appliedThrottleByBroker, _retries);
