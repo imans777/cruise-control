@@ -166,7 +166,9 @@ class ReplicationThrottleHelper {
     }
     // Clear the rate first, so that the upcoming task batches are not throttled even if the removal below fails midway.
     _throttleRate = null;
-    List<ExecutionProposal> proposals = inProgressProposals.get();
+    // Removal-only moves (e.g. a replication factor decrease) are never throttled, as setThrottles skips them: their brokers'
+    // rates are not this execution's to remove.
+    List<ExecutionProposal> proposals = proposalsWithDataMovement(inProgressProposals.get());
     Set<Integer> participatingBrokers = getParticipatingBrokers(proposals);
     LOG.info("Removing the replication throttle of the ongoing execution from brokers {}.", participatingBrokers);
     // Through the batched removal, so that the record of applied throttles (and of throttled brokers) stays in line: what fails

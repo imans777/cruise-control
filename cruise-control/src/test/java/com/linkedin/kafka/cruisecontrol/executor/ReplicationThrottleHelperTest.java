@@ -605,6 +605,38 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
   }
 
   @Test
+  public void testRemovingThrottleOfAnOngoingExecutionSkipsRemovalOnlyMovements() throws Exception {
+    createTopics();
+
+    final long throttleRate = 100L;
+    final long operatorRate = 500L;
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttleRate);
+    // A movement that adds a replica on broker 2, and a removal-only movement (a replication factor decrease) off broker 3.
+    ExecutionProposal movement = new ExecutionProposal(new TopicPartition(TOPIC0, 0), 100, new ReplicaPlacementInfo(0),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+    ExecutionProposal removalOnly = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 100, new ReplicaPlacementInfo(1),
+                                                          Arrays.asList(new ReplicaPlacementInfo(1), new ReplicaPlacementInfo(3)),
+                                                          Collections.singletonList(new ReplicaPlacementInfo(1)));
+    // Broker 3 carries a throttle rate that this execution did not set, e.g. set by an operator.
+    changeBrokerConfigs(throttleHelper, 3, Arrays.asList(
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG, String.valueOf(operatorRate)),
+                          AlterConfigOp.OpType.SET),
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, String.valueOf(operatorRate)),
+                          AlterConfigOp.OpType.SET)));
+    throttleHelper.setThrottles(Arrays.asList(movement, removalOnly));
+    assertExpectedThrottledRateForBroker(2, throttleRate);
+    assertExpectedThrottledRateForBroker(3, operatorRate);
+
+    // Removing the throttle of the ongoing execution leaves the brokers of the removal-only movement alone.
+    assertTrue(throttleHelper.removeThrottleRate(() -> Arrays.asList(movement, removalOnly)));
+    for (int i = 0; i < 3; i++) {
+      assertExpectedThrottledRateForBroker(i, null);
+    }
+    assertExpectedThrottledRateForBroker(3, operatorRate);
+  }
+
+  @Test
   public void testAddingThrottlesWithPreExistingThrottles() throws Exception {
     createTopics();
 
