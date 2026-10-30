@@ -1899,6 +1899,7 @@ public class Executor {
         .replicationThrottle(replicationThrottle)
         .replicationThrottleAdjusted(_replicationThrottleAdjusterEnabled)
         .logDirThrottle(logDirThrottle)
+        .intraBrokerMovementsBrokerByBroker(intraBrokerMovementsBrokerByBroker)
         .kafkaAssignerMode(isKafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(skipInterBrokerReplicaConcurrencyAdjustment)
         .build();
@@ -3006,7 +3007,8 @@ public class Executor {
                          false,
                          state.uuid(),
                          state.kafkaAssignerMode(),
-                         state.skipInterBrokerReplicaConcurrencyAdjustment());
+                         state.skipInterBrokerReplicaConcurrencyAdjustment(),
+                         state.intraBrokerMovementsBrokerByBroker());
       }
     } finally {
       _recoveryPlanToResume = null;

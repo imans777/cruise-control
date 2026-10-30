@@ -63,6 +63,7 @@ public class PersistedExecutionStateSerdeTest {
         .replicaMovementStrategy("PostponeUrpReplicaMovementStrategy,BaseReplicaMovementStrategy")
         .replicationThrottle(1000000L)
         .skipInterBrokerReplicaConcurrencyAdjustment(true)
+        .intraBrokerMovementsBrokerByBroker(true)
         .logDirThrottle(2000000L)
         .replicationThrottleAdjustmentDisabled(true)
         .replicationThrottleAdjusted(true)
@@ -113,6 +114,7 @@ public class PersistedExecutionStateSerdeTest {
     assertEquals(expected.replicationThrottle(), actual.replicationThrottle());
     assertEquals(expected.kafkaAssignerMode(), actual.kafkaAssignerMode());
     assertEquals(expected.skipInterBrokerReplicaConcurrencyAdjustment(), actual.skipInterBrokerReplicaConcurrencyAdjustment());
+    assertEquals(expected.intraBrokerMovementsBrokerByBroker(), actual.intraBrokerMovementsBrokerByBroker());
     assertEquals(expected.logDirThrottle(), actual.logDirThrottle());
     assertEquals(expected.replicationThrottleAdjustmentDisabled(), actual.replicationThrottleAdjustmentDisabled());
     assertEquals(expected.replicationThrottleAdjusted(), actual.replicationThrottleAdjusted());

@@ -864,6 +864,23 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
   }
 
   @Test
+  public void testResumeKeepsBrokerByBrokerIntraBrokerMovements() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal pending = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    // The interrupted execution ran its intra-broker replica movements one broker at a time (PR #1).
+    _store.save(interruptedExecutionState(null, List.of(pending)).toBuilder().intraBrokerMovementsBrokerByBroker(true).build());
+    int numSavedStatesBeforeResume = _store.savedStates().size();
+
+    Executor executor = newExecutor(true, null, new RecordingNotifier(), mockAnomalyDetectorManager(null));
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitForExecutionToFinish(executor);
+    // The resumed execution runs them one broker at a time too (it would otherwise run them on every broker at once).
+    PersistedExecutionState resumedState = _store.savedStates().get(numSavedStatesBeforeResume);
+    assertEquals(1, resumedState.resumeCount());
+    assertTrue(resumedState.intraBrokerMovementsBrokerByBroker());
+  }
+
+  @Test
   public void testResumeIsRefusedIfReplicasOutsideTheExecutionMoved() throws Exception {
     createTopic(Map.of(0, List.of(0, 1), 1, List.of(2, 1)));
     ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));

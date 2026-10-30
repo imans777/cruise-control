@@ -58,6 +58,7 @@ public final class PersistedExecutionStateSerde {
   static final String REPLICATION_THROTTLE = "replicationThrottle";
   static final String KAFKA_ASSIGNER_MODE = "kafkaAssignerMode";
   static final String SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT = "skipInterBrokerReplicaConcurrencyAdjustment";
+  static final String INTRA_BROKER_MOVEMENTS_BROKER_BY_BROKER = "intraBrokerMovementsBrokerByBroker";
   static final String LOG_DIR_THROTTLE = "logDirThrottle";
   static final String REPLICATION_THROTTLE_ADJUSTMENT_DISABLED = "replicationThrottleAdjustmentDisabled";
   static final String REPLICATION_THROTTLE_ADJUSTED = "replicationThrottleAdjusted";
@@ -139,6 +140,7 @@ public final class PersistedExecutionStateSerde {
     json.name(REPLICATION_THROTTLE).value(state.replicationThrottle());
     json.name(KAFKA_ASSIGNER_MODE).value(state.kafkaAssignerMode());
     json.name(SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).value(state.skipInterBrokerReplicaConcurrencyAdjustment());
+    json.name(INTRA_BROKER_MOVEMENTS_BROKER_BY_BROKER).value(state.intraBrokerMovementsBrokerByBroker());
     json.name(LOG_DIR_THROTTLE).value(state.logDirThrottle());
     json.name(REPLICATION_THROTTLE_ADJUSTMENT_DISABLED).value(state.replicationThrottleAdjustmentDisabled());
     json.name(REPLICATION_THROTTLE_ADJUSTED).value(state.replicationThrottleAdjusted());
@@ -228,6 +230,7 @@ public final class PersistedExecutionStateSerde {
              .replicationThrottle(optionalLong(parameters, REPLICATION_THROTTLE))
              .kafkaAssignerMode(required(parameters, KAFKA_ASSIGNER_MODE).getAsBoolean())
              .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean())
+             .intraBrokerMovementsBrokerByBroker(optionalBoolean(parameters, INTRA_BROKER_MOVEMENTS_BROKER_BY_BROKER))
              .logDirThrottle(optionalLong(parameters, LOG_DIR_THROTTLE))
              .replicationThrottleAdjustmentDisabled(optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTMENT_DISABLED))
              .replicationThrottleAdjusted(optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTED));

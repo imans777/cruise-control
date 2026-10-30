@@ -65,6 +65,7 @@ public final class PersistedExecutionState {
   private final Long _replicationThrottle;
   private final boolean _kafkaAssignerMode;
   private final boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+  private final boolean _intraBrokerMovementsBrokerByBroker;
   private final Long _logDirThrottle;
   private final boolean _replicationThrottleAdjustmentDisabled;
   private final boolean _replicationThrottleAdjusted;
@@ -97,6 +98,7 @@ public final class PersistedExecutionState {
     _replicationThrottle = builder._replicationThrottle;
     _kafkaAssignerMode = builder._kafkaAssignerMode;
     _skipInterBrokerReplicaConcurrencyAdjustment = builder._skipInterBrokerReplicaConcurrencyAdjustment;
+    _intraBrokerMovementsBrokerByBroker = builder._intraBrokerMovementsBrokerByBroker;
     _logDirThrottle = builder._logDirThrottle;
     _replicationThrottleAdjustmentDisabled = builder._replicationThrottleAdjustmentDisabled;
     _replicationThrottleAdjusted = builder._replicationThrottleAdjusted;
@@ -142,6 +144,7 @@ public final class PersistedExecutionState {
         .replicationThrottle(_replicationThrottle)
         .kafkaAssignerMode(_kafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(_skipInterBrokerReplicaConcurrencyAdjustment)
+        .intraBrokerMovementsBrokerByBroker(_intraBrokerMovementsBrokerByBroker)
         .logDirThrottle(_logDirThrottle)
         .replicationThrottleAdjustmentDisabled(_replicationThrottleAdjustmentDisabled)
         .replicationThrottleAdjusted(_replicationThrottleAdjusted)
@@ -251,6 +254,14 @@ public final class PersistedExecutionState {
   }
 
   /**
+   * @return whether the intra-broker replica movements of the execution run one broker at a time
+   * (rebalance_disk_broker_by_broker, PR #1).
+   */
+  public boolean intraBrokerMovementsBrokerByBroker() {
+    return _intraBrokerMovementsBrokerByBroker;
+  }
+
+  /**
    * @return the log dir throttle (bytes/sec) of the intra-broker replica movements of the execution, or null if they are not
    * throttled (PR #26; changed at runtime by PR #17).
    */
@@ -345,6 +356,7 @@ public final class PersistedExecutionState {
     private Long _replicationThrottle;
     private boolean _kafkaAssignerMode;
     private boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+    private boolean _intraBrokerMovementsBrokerByBroker;
     private Long _logDirThrottle;
     private boolean _replicationThrottleAdjustmentDisabled;
     private boolean _replicationThrottleAdjusted;
@@ -536,6 +548,16 @@ public final class PersistedExecutionState {
      */
     public Builder skipInterBrokerReplicaConcurrencyAdjustment(boolean skip) {
       _skipInterBrokerReplicaConcurrencyAdjustment = skip;
+      return this;
+    }
+
+    /**
+     * @param intraBrokerMovementsBrokerByBroker Whether the intra-broker replica movements of the execution run one broker at
+     * a time (rebalance_disk_broker_by_broker, PR #1).
+     * @return This builder.
+     */
+    public Builder intraBrokerMovementsBrokerByBroker(boolean intraBrokerMovementsBrokerByBroker) {
+      _intraBrokerMovementsBrokerByBroker = intraBrokerMovementsBrokerByBroker;
       return this;
     }
 
