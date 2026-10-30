@@ -150,6 +150,28 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
   }
 
   @Test
+  public void testIsNoOpForProposalsWithoutDataMovement() throws Exception {
+    Admin mockAdminClient = EasyMock.strictMock(Admin.class);
+    EasyMock.replay(mockAdminClient);
+
+    // Test would fail on any unexpected interactions with the adminClient
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(mockAdminClient, 100L);
+    // A proposal that only removes a replica (e.g. to decrease the replication factor) does not replicate any data.
+    ExecutionProposal proposal = new ExecutionProposal(new TopicPartition("topic", 0),
+                                                       100,
+                                                       new ReplicaPlacementInfo(0),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1),
+                                                                     new ReplicaPlacementInfo(2)),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)));
+
+    ExecutionTask task = completedTaskForProposal(0, proposal);
+
+    throttleHelper.setThrottles(Collections.singletonList(proposal));
+    throttleHelper.clearThrottles(Collections.singletonList(task), Collections.emptyList());
+    EasyMock.verify(mockAdminClient);
+  }
+
+  @Test
   public void testClearThrottleOnNonExistentTopic() throws Exception {
     final long throttleRate = 100L;
     final int brokerId0 = 0;
@@ -745,7 +767,7 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     ExecutionProposal move = new ExecutionProposal(new TopicPartition(TOPIC0, 0), 100, new ReplicaPlacementInfo(0),
                                                    Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
                                                    Arrays.asList(new ReplicaPlacementInfo(1), new ReplicaPlacementInfo(2)));
-    // Broker 3 drops its replica: nothing to add, so no follower to throttle.
+    // Broker 3 drops its replica: nothing to add, so it is not throttled at all (only movements that add a replica are).
     ExecutionProposal removal = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 100, new ReplicaPlacementInfo(2),
                                                       Arrays.asList(new ReplicaPlacementInfo(2), new ReplicaPlacementInfo(3)),
                                                       Collections.singletonList(new ReplicaPlacementInfo(2)));
@@ -753,7 +775,7 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     // The kept replica on broker 1 is never a throttled follower: if it falls behind under the load of the movements, the
     // follower throttle of broker 1 must not keep it from catching up.
     assertExpectedThrottledReplicas(TOPIC0, "0:0,0:1,0:2", "0:2");
-    assertExpectedThrottledReplicas(TOPIC1, "0:2,0:3", "");
+    assertExpectedThrottledReplicas(TOPIC1, "");
 
     // Removing the throttles of a movement removes all of its replicas from both lists, including the follower throttled replicas
     // that an earlier version of Cruise Control listed for it.
