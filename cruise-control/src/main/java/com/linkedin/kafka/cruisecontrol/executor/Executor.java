@@ -171,6 +171,8 @@ public class Executor {
   private final TopicMinIsrCache _topicMinIsrCache;
   private final long _minExecutionProgressCheckIntervalMs;
   private final long _slowTaskAlertingBackoffTimeMs;
+  private final double _replicaMovementThrottleWriteRateMargin;
+  private final long _metricSamplingIntervalMs;
   private final KafkaCruiseControlConfig _config;
   private final AtomicDouble _partitionMovementCountPerSec;
   private final AtomicDouble _partitionMovementMbPerSec;
@@ -259,6 +261,8 @@ public class Executor {
     _removalHistoryRetentionTimeMs = config.getLong(ExecutorConfig.REMOVAL_HISTORY_RETENTION_TIME_MS_CONFIG);
     _minExecutionProgressCheckIntervalMs = config.getLong(ExecutorConfig.MIN_EXECUTION_PROGRESS_CHECK_INTERVAL_MS_CONFIG);
     _slowTaskAlertingBackoffTimeMs = config.getLong(ExecutorConfig.SLOW_TASK_ALERTING_BACKOFF_TIME_MS_CONFIG);
+    _replicaMovementThrottleWriteRateMargin = config.getDouble(ExecutorConfig.REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG);
+    _metricSamplingIntervalMs = config.getLong(MonitorConfig.METRIC_SAMPLING_INTERVAL_MS_CONFIG);
     _concurrencyAdjusterEnabled = new ConcurrentHashMap<>(ConcurrencyType.cachedValues().size());
     _concurrencyAdjusterEnabled.put(ConcurrencyType.INTER_BROKER_REPLICA,
                                     config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_INTER_BROKER_REPLICA_ENABLED_CONFIG));
@@ -1923,6 +1927,7 @@ public class Executor {
     private final Set<Integer> _recentlyDemotedBrokers;
     private final Set<Integer> _recentlyRemovedBrokers;
     private final Long _replicationThrottle;
+    private final PartitionWriteRateCache _partitionWriteRateCache;
     private Throwable _executionException;
     private final boolean _isTriggeredByUserRequest;
     private long _lastSlowTaskReportingTimeMs;
@@ -1939,6 +1944,8 @@ public class Executor {
                               Long replicationThrottle,
                               boolean isTriggeredByUserRequest) {
       _loadMonitor = loadMonitor;
+      _partitionWriteRateCache = new PartitionWriteRateCache(_time, _metricSamplingIntervalMs,
+                                                             () -> _loadMonitor.currentPartitionMetricValues());
       _demotedBrokers = demotedBrokers;
       _removedBrokers = removedBrokers;
       _executionException = null;
@@ -2266,6 +2273,7 @@ public class Executor {
     }
 
     private void interBrokerMoveReplicas() throws InterruptedException, ExecutionException, TimeoutException {
+      _partitionWriteRateCache.reset();
       Set<Integer> currentDeadBrokersWithReplicas = _loadMonitor.deadBrokersWithReplicas(MAX_METADATA_WAIT_MS);
       ReplicationThrottleHelper throttleHelper;
       if (_replicationThrottle == null && _replicationThrottleAdjusterEnabled) {
@@ -2293,6 +2301,7 @@ public class Executor {
       long totalDataToMoveInMB = _executionTaskManager.remainingInterBrokerDataToMoveInMB();
       long startTime = System.currentTimeMillis();
       LOG.info("User task {}: Starting {} inter-broker partition movements.", _uuid, numTotalPartitionMovements);
+      logInterBrokerReplicaMovementSkew(numTotalPartitionMovements);
 
       int partitionsToMove = numTotalPartitionMovements;
       // Exhaust all the pending partition movements. Once the execution is stopped, keep going until the in-progress partition
@@ -2300,7 +2309,7 @@ public class Executor {
       while ((partitionsToMove > 0 && _stopSignal.get() == NO_STOP_EXECUTION) || !inExecutionTasks().isEmpty()) {
         // Get tasks to execute.
         List<ExecutionTask> tasksToExecute = _stopSignal.get() == NO_STOP_EXECUTION
-                                             ? _executionTaskManager.getInterBrokerReplicaMovementTasks()
+                                             ? _executionTaskManager.getInterBrokerReplicaMovementTasks(replicationThrottleBudget())
                                              : Collections.emptyList();
         LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
 
@@ -2418,6 +2427,52 @@ public class Executor {
                  executionTasksSummary.remainingIntraBrokerDataToMoveInMB(),
                  executionTasksSummary.taskStat().get(LEADER_ACTION).get(ExecutionTaskState.PENDING));
       }
+    }
+
+    /**
+     * Get the replication throttle budget of brokers based on the inter-broker replica movements in progress and the current
+     * write rate of partitions, which is used if the replica movement strategy contains
+     * ThrottleAwareReplicaMovementStrategy.
+     *
+     * @return The replication throttle budget of brokers, or {@code null} if the execution has no replication throttle or its
+     * replica movement strategy is not throttle-aware.
+     */
+    private ReplicationThrottleBudget replicationThrottleBudget() {
+      if (_replicationThrottle == null || !_executionTaskManager.isThrottleAware()) {
+        return null;
+      }
+      Cluster cluster = _metadataClient.cluster();
+      return new ReplicationThrottleBudget(_executionTaskManager.inExecutionTasks(Collections.singleton(INTER_BROKER_REPLICA_ACTION)),
+                                           _partitionWriteRateCache.writeRatesInBytesPerSec(), task -> currentLeader(cluster, task),
+                                           brokerId -> _replicationThrottle, brokerId -> _replicationThrottle,
+                                           _replicaMovementThrottleWriteRateMargin);
+    }
+
+    /**
+     * @param cluster The cluster metadata.
+     * @param task Inter-broker replica movement task.
+     * @return The current leader of the partition of the given task, or {@code null} if unknown.
+     */
+    private Integer currentLeader(Cluster cluster, ExecutionTask task) {
+      Node leader = cluster.leaderFor(task.proposal().topicPartition());
+      return leader != null ? leader.id() : null;
+    }
+
+    /**
+     * Log the number of inter-broker partition movements by broker and the share of the most involved broker, which indicates
+     * whether a single broker may become the bottleneck of the execution.
+     *
+     * @param numTotalPartitionMovements Total number of inter-broker partition movements.
+     */
+    private void logInterBrokerReplicaMovementSkew(int numTotalPartitionMovements) {
+      Map<Integer, Integer> numMovementsByBrokerId = _executionTaskManager.numRemainingInterBrokerReplicaMovementsByBrokerId();
+      if (numMovementsByBrokerId.isEmpty() || numTotalPartitionMovements == 0) {
+        return;
+      }
+      Map.Entry<Integer, Integer> mostInvolvedBroker = numMovementsByBrokerId.entrySet().iterator().next();
+      LOG.info("User task {}: Inter-broker partition movements by broker: {}. The most involved broker {} is involved in {} of {} "
+               + "movements ({}%).", _uuid, numMovementsByBrokerId, mostInvolvedBroker.getKey(), mostInvolvedBroker.getValue(),
+               numTotalPartitionMovements, String.format("%.1f", 100.0 * mostInvolvedBroker.getValue() / numTotalPartitionMovements));
     }
 
     /**
