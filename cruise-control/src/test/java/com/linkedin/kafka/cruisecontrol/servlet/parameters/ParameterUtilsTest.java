@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint;
+import java.util.regex.Pattern;
 import org.easymock.EasyMock;
 import org.junit.Assert;
 import org.junit.Test;
@@ -418,5 +419,50 @@ public class ParameterUtilsTest {
     params.forEach((name, value) -> EasyMock.expect(mockRequest.getParameter(name)).andReturn(value).anyTimes());
     EasyMock.replay(mockRequest);
     return mockRequest;
+  }
+
+  @Test
+  public void testIncludedTopics() {
+    String includedTopics = "topic1|topic2";
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getParameterMap())
+            .andReturn(Collections.emptyMap())
+            .andReturn(Collections.singletonMap(ParameterUtils.INCLUDED_TOPICS_PARAM, new String[]{includedTopics})).times(2);
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.INCLUDED_TOPICS_PARAM)).andReturn(includedTopics);
+    EasyMock.replay(mockRequest);
+
+    // Verify default response.
+    Assert.assertNull(ParameterUtils.includedTopics(mockRequest));
+
+    // Verify response for valid input.
+    Pattern includedTopicsPattern = ParameterUtils.includedTopics(mockRequest);
+    Assert.assertNotNull(includedTopicsPattern);
+    Assert.assertEquals(includedTopics, includedTopicsPattern.pattern());
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testIncludedTopicsIsMutuallyExclusiveWithExcludedTopics() {
+    Map<String, String[]> paramMap = new HashMap<>();
+    paramMap.put(ParameterUtils.INCLUDED_TOPICS_PARAM, new String[]{"topic1"});
+    paramMap.put(ParameterUtils.EXCLUDED_TOPICS_PARAM, new String[]{"topic2"});
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).times(2);
+    EasyMock.replay(mockRequest);
+
+    Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.includedTopics(mockRequest));
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testIncludedTopicsCannotBeEmpty() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getParameterMap())
+            .andReturn(Collections.singletonMap(ParameterUtils.INCLUDED_TOPICS_PARAM, new String[]{""})).times(2);
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.INCLUDED_TOPICS_PARAM)).andReturn("");
+    EasyMock.replay(mockRequest);
+
+    Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.includedTopics(mockRequest));
+    EasyMock.verify(mockRequest);
   }
 }
