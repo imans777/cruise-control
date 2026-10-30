@@ -380,11 +380,11 @@ public final class ExecutionUtils {
    * @param proposal The proposal of an inter-broker replica movement.
    * @param brokerId Id of a broker with a replica of the movement.
    * @return {@code true} if the follower throttle of the broker applies to its replica of the movement, i.e. if the replica is a
-   * follower throttled replica: {@link ReplicationThrottleHelper} lists the old replicas and the replicas to add of a movement.
+   * follower throttled replica: {@link ReplicationThrottleHelper} lists only the replicas to add of a movement. A replica the
+   * movement keeps or removes fetches under the leader throttle only, so it counts on the leader side only.
    */
   static boolean followerThrottled(ExecutionProposal proposal, int brokerId) {
-    return proposal.oldReplicas().stream().anyMatch(r -> r.brokerId() == brokerId)
-           || proposal.replicasToAdd().stream().anyMatch(r -> r.brokerId() == brokerId);
+    return proposal.replicasToAdd().stream().anyMatch(r -> r.brokerId() == brokerId);
   }
 
   /**
