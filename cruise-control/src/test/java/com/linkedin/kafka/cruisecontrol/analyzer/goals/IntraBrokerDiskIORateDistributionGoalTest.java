@@ -207,6 +207,18 @@ public class IntraBrokerDiskIORateDistributionGoalTest {
   }
 
   @Test
+  public void testDiskIOBalanceThresholdFallsBackToIntraBrokerDiskBalanceThreshold() {
+    // With intra.broker.disk.balance.threshold set and intra.broker.disk.io.balance.threshold unset, the I/O goal follows the
+    // intra-broker disk threshold, not disk.balance.threshold.
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnalyzerConfig.DISK_BALANCE_THRESHOLD_CONFIG, Double.toString(STRICT_BALANCE_THRESHOLD));
+    props.setProperty(AnalyzerConfig.INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG, Double.toString(LOOSE_BALANCE_THRESHOLD));
+    BalancingConstraint constraint = new BalancingConstraint(new KafkaCruiseControlConfig(props));
+    assertEquals(LOOSE_BALANCE_THRESHOLD, constraint.intraBrokerDiskIOBalancePercentage(), 0.0);
+    assertEquals(STRICT_BALANCE_THRESHOLD, constraint.resourceBalancePercentage(Resource.DISK), 0.0);
+  }
+
+  @Test
   public void testInvalidDiskIOBalanceThreshold() {
     assertThrows(ConfigException.class, () -> balancingConstraint(1.0, LOOSE_BALANCE_THRESHOLD, 0.9));
   }
