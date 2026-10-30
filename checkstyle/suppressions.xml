@@ -7,4 +7,6 @@
   <suppress checks="MemberName" files="BrokerCapacityConfigFileResolver.java"/>
   <suppress checks="MemberName" files="BrokerSetFileResolver.java"/>
   <suppress checks="MemberName" files="TopicPatternBrokerSetMappingPolicy.java"/>
+  <!-- Executor#executeProposals takes both the log dir throttle and the broker-by-broker flag of intra-broker movements (18). -->
+  <suppress checks="ParameterNumber" files="executor[\\/]Executor.java"/>
 </suppressions>
