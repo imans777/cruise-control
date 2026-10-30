@@ -81,7 +81,7 @@ public class ExecutionTaskManager {
    * @return A list of execution tasks that move the replicas cross brokers.
    */
   public synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks() {
-    return getInterBrokerReplicaMovementTasks(Collections.emptySet());
+    return getInterBrokerReplicaMovementTasks(null, Collections.emptySet());
   }
 
   /**
@@ -89,12 +89,37 @@ public class ExecutionTaskManager {
    * @return A list of execution tasks that move the replicas cross brokers, none of which moves a replica to or from the given brokers.
    */
   public synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks(Set<Integer> brokersToHoldBack) {
+    return getInterBrokerReplicaMovementTasks(null, brokersToHoldBack);
+  }
+
+  /**
+   * @param budget The replication throttle budget of brokers, or {@code null} to ignore the replication throttle.
+   * @return A list of execution tasks that move the replicas cross brokers.
+   */
+  synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks(ReplicationThrottleBudget budget) {
+    return getInterBrokerReplicaMovementTasks(budget, Collections.emptySet());
+  }
+
+  /**
+   * @param budget The replication throttle budget of brokers, or {@code null} to ignore the replication throttle.
+   * @param brokersToHoldBack Brokers to or from which no new replica movement is to start, e.g. because their replicas fall behind.
+   * @return A list of execution tasks that move the replicas cross brokers, none of which moves a replica to or from the given brokers.
+   */
+  synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks(ReplicationThrottleBudget budget, Set<Integer> brokersToHoldBack) {
     Map<Integer, Integer> brokersReadyForReplicaMovement = brokersReadyForReplicaMovement(_inProgressInterBrokerReplicaMovementsByBrokerId,
                                                                                           ConcurrencyType.INTER_BROKER_REPLICA);
     brokersToHoldBack.forEach(brokerId -> brokersReadyForReplicaMovement.replace(brokerId, 0));
     return _executionTaskPlanner.getInterBrokerReplicaMovementTasks(
         brokersReadyForReplicaMovement, _inProgressPartitionsForInterBrokerMovement,
-        _executionConcurrencyManager.maxClusterInterBrokerPartitionMovements());
+        _executionConcurrencyManager.maxClusterInterBrokerPartitionMovements(), budget);
+  }
+
+  /**
+   * @return {@code true} if inter-broker replica movements are started within the replication throttle budget of brokers,
+   * {@code false} otherwise.
+   */
+  synchronized boolean isThrottleAware() {
+    return _executionTaskPlanner.isThrottleAware();
   }
 
   /**
@@ -323,6 +348,13 @@ public class ExecutionTaskManager {
    */
   public synchronized long remainingInterBrokerDataToMoveInMB() {
     return _executionTaskTracker.remainingInterBrokerDataToMoveInMB();
+  }
+
+  /**
+   * @return The number of remaining inter-broker replica movements by broker id, sorted by the number of movements in descending order.
+   */
+  public synchronized Map<Integer, Integer> numRemainingInterBrokerReplicaMovementsByBrokerId() {
+    return _executionTaskPlanner.numRemainingInterBrokerReplicaMovementsByBrokerId();
   }
 
   /**
