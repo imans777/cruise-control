@@ -21,15 +21,16 @@ import com.linkedin.kafka.cruisecontrol.model.ReplicaSortFunctionFactory;
 import com.linkedin.kafka.cruisecontrol.model.SortedReplicasHelper;
 import com.linkedin.kafka.cruisecontrol.monitor.ModelCompletenessRequirements;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.SortedSet;
-import java.util.TreeSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.ACCEPT;
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.REPLICA_REJECT;
+import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.aliveBrokersForIntraBrokerGoal;
 import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.replicaSortName;
 
 /**
@@ -43,6 +44,8 @@ public class IntraBrokerDiskCapacityGoal extends AbstractGoal {
   private static final Resource RESOURCE = Resource.DISK;
   // This is only used for the remove disks endpoint: the goal only moves replicas off the disks marked for removal.
   private final boolean _shouldEmptyZeroCapacityDisks;
+  // Ids of brokers to limit the rebalance to (if empty, all alive brokers are rebalanced).
+  private Set<Integer> _requestedBrokerIds = Collections.emptySet();
 
   /**
    * Constructor for Capacity Goal.
@@ -92,6 +95,7 @@ public class IntraBrokerDiskCapacityGoal extends AbstractGoal {
   @Override
   protected void initGoalState(ClusterModel clusterModel, OptimizationOptions optimizationOptions)
       throws OptimizationFailureException {
+    _requestedBrokerIds = optimizationOptions.requestedDestinationBrokerIds();
     // While proposals exclude the excludedTopics, the existingUtilization still considers replicas of the excludedTopics.
     for (Broker broker : brokersToBalance(clusterModel)) {
       double existingUtilization = 0.0;
@@ -129,6 +133,7 @@ public class IntraBrokerDiskCapacityGoal extends AbstractGoal {
    * Get brokers in the cluster so that the rebalance process will go over to apply balancing actions to replicas
    * they contain.
    * Note this goal moves replica between disks within broker, therefore it is unable to heal dead broker.
+   * If {@link OptimizationOptions#requestedDestinationBrokerIds()} is non-empty, only the requested alive brokers are balanced.
    * To empty the disks marked for removal, only their brokers are balanced.
    *
    * @param clusterModel The state of the cluster.
@@ -137,7 +142,7 @@ public class IntraBrokerDiskCapacityGoal extends AbstractGoal {
    */
   @Override
   protected SortedSet<Broker> brokersToBalance(ClusterModel clusterModel) {
-    SortedSet<Broker> brokersToBalance = new TreeSet<>(clusterModel.aliveBrokers());
+    SortedSet<Broker> brokersToBalance = aliveBrokersForIntraBrokerGoal(clusterModel, _requestedBrokerIds);
     if (_shouldEmptyZeroCapacityDisks) {
       brokersToBalance.removeIf(broker -> broker.disks().stream().noneMatch(Disk::isMarkedForRemoval));
     }
