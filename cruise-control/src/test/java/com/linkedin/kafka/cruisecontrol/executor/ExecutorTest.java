@@ -54,8 +54,10 @@ import java.util.stream.Collectors;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.AlterConfigOp;
 import org.apache.kafka.clients.admin.AlterPartitionReassignmentsResult;
 import org.apache.kafka.clients.admin.Config;
+import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.ElectLeadersResult;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.TopicDescription;
@@ -94,11 +96,14 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
   private static final int BROKER_ID_0 = 0;
   private static final int BROKER_ID_1 = 1;
   private static final int BROKER_ID_2 = 2;
-  // Moving SLOW_MOVEMENT_NUM_RECORDS records of SLOW_MOVEMENT_RECORD_SIZE_IN_BYTES under this throttle takes tens of seconds,
-  // as the follower can fetch only up to replica.fetch.max.bytes (1 MB) per quota window (~11 seconds).
+  // Moving SLOW_MOVEMENT_NUM_RECORDS records of SLOW_MOVEMENT_RECORD_SIZE_IN_BYTES under this throttle takes at least tens of
+  // seconds: Kafka 4.3.1 brokers copy up to replica.fetch.max.bytes (1 MB) per quota window (~11 seconds), 4.3.2 brokers copied
+  // none of it in over two minutes.
   private static final long SLOW_MOVEMENT_REPLICATION_THROTTLE = 1L;
   private static final int SLOW_MOVEMENT_RECORD_SIZE_IN_BYTES = 100 * 1024;
   private static final int SLOW_MOVEMENT_NUM_RECORDS = 30;
+  // Lets the slow movement complete within seconds.
+  private static final long RAISED_REPLICATION_THROTTLE = 100L * 1024 * 1024;
   private static final Random RANDOM = new Random(0xDEADBEEF);
   private static final int MOCK_BROKER_ID_TO_DROP = 1;
   private static final long MOCK_CURRENT_TIME = 1596842708000L;
@@ -603,7 +608,13 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
       // The throttles of the completed movement are removed when the execution finishes.
       assertFalse("Broker " + BROKER_ID_2 + " is still throttled", hasThrottledRate(BROKER_ID_2));
       assertFalse("Replicas of " + TOPIC1 + " are still throttled", hasThrottledReplicas(TOPIC1));
-      // The throttles of the slow movement, which Kafka carries on with, are removed once it completes.
+      // The throttles of the slow movement, which Kafka carries on with, are removed once it completes. Raise its throttled rate,
+      // so that it completes within the time limit. Skip that if it has completed already: its throttles may be removed already,
+      // and nothing would remove the raised rate.
+      if (ExecutionUtils.partitionsBeingReassigned(_cluster.adminClient()).contains(TP0)) {
+        setThrottledRate(BROKER_ID_0, RAISED_REPLICATION_THROTTLE);
+        setThrottledRate(BROKER_ID_1, RAISED_REPLICATION_THROTTLE);
+      }
       waitUntilTrue(this::hasNoReplicationThrottles, "Replication throttles were not removed after the movement completed",
                     EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
     } finally {
@@ -706,6 +717,15 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
     executor.executeProposals(Arrays.asList(slowMovement, fastMovement), Collections.emptySet(), null, mockLoadMonitor, null, null,
                               null, null, null, null, null, SLOW_MOVEMENT_REPLICATION_THROTTLE, true, RANDOM_UUID, false, false);
     return executor;
+  }
+
+  private void setThrottledRate(int brokerId, long throttledRate) throws ExecutionException, InterruptedException {
+    ConfigResource cf = new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(brokerId));
+    String rate = String.valueOf(throttledRate);
+    _cluster.adminClient().incrementalAlterConfigs(Collections.singletonMap(cf, Arrays.asList(
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG, rate), AlterConfigOp.OpType.SET),
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, rate), AlterConfigOp.OpType.SET))))
+                .all().get();
   }
 
   private boolean hasThrottledRate(int brokerId) throws ExecutionException, InterruptedException {
