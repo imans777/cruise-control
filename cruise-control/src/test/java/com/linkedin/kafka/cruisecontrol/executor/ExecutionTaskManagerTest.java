@@ -298,6 +298,38 @@ public class ExecutionTaskManagerTest {
     assertEquals(10L, dataMovementRateMeter.getCount() - initialMeteredDataMovementInMB);
   }
 
+  @Test
+  public void testRolledBackDataMovementIsNotMarkedAsMoved() {
+    // E.g. the in-progress movements rolled back when an execution is stopped: PR #2 makes the intra-broker ones dead.
+    Meter dataMovementRateMeter = metricRegistry.meter("Executor." + ExecutionTaskTracker.METER_PARTITION_DATA_MOVEMENT_RATE);
+    for (boolean dead : Arrays.asList(true, false)) {
+      ReplicaPlacementInfo r0 = new ReplicaPlacementInfo(0);
+      ReplicaPlacementInfo r1 = new ReplicaPlacementInfo(1);
+      ReplicaPlacementInfo r2 = new ReplicaPlacementInfo(2);
+      ExecutionProposal proposal = new ExecutionProposal(new TopicPartition("topic", 0), 10, r2, Arrays.asList(r0, r2),
+                                                         Arrays.asList(r2, r1));
+      StrategyOptions strategyOptions = new StrategyOptions.Builder(generateExpectedCluster(proposal)).build();
+      taskManager.clear();
+      taskManager.addExecutionProposals(Collections.singletonList(proposal), Collections.emptySet(), strategyOptions, null);
+      List<ExecutionTask> tasks = taskManager.getInterBrokerReplicaMovementTasks();
+      ExecutionTask task = tasks.get(0);
+      taskManager.markTasksInProgress(tasks);
+      long initialMeteredDataMovementInMB = dataMovementRateMeter.getCount();
+      task.updateDataMovementProgress(3 * ExecutionTask.BYTES_IN_MB, 12 * ExecutionTask.BYTES_IN_MB, 0L);
+      taskManager.markInProgressDataMovement();
+      if (dead) {
+        taskManager.markTaskDead(task);
+      } else {
+        taskManager.markTaskAborting(task);
+        taskManager.markTaskDone(task);
+      }
+      // Only the 3 MB moved before the rollback count as moved data, not the 7 MB the movement never moved.
+      assertEquals(3L, dataMovementRateMeter.getCount() - initialMeteredDataMovementInMB);
+      assertEquals(10, taskManager.finishedInterBrokerDataMovementInMB());
+      assertEquals(0, taskManager.completedInterBrokerDataMovementInMB());
+    }
+  }
+
   private ExecutorState interBrokerReplicaMovementInProgressState(ExecutionTaskTracker.ExecutionTasksSummary executionTasksSummary) {
     return ExecutorState.operationInProgress(ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS,
                                              executionTasksSummary,

@@ -354,6 +354,20 @@ public class ExecutionTaskManager {
   }
 
   /**
+   * @return Completed inter broker data movement in MB, which excludes the data of dead and aborted tasks.
+   */
+  public synchronized long completedInterBrokerDataMovementInMB() {
+    return _executionTaskTracker.completedInterBrokerDataMovementInMB();
+  }
+
+  /**
+   * @return Completed intra broker data movement in MB, which excludes the data of dead and aborted tasks.
+   */
+  public synchronized long completedIntraBrokerDataMovementInMB() {
+    return _executionTaskTracker.completedIntraBrokerDataMovementInMB();
+  }
+
+  /**
    * @return The tasks that are {@link ExecutionTaskState#IN_PROGRESS} or {@link ExecutionTaskState#ABORTING} for all task types.
    */
   public synchronized Set<ExecutionTask> inExecutionTasks() {

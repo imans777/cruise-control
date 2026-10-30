@@ -3388,10 +3388,11 @@ public class Executor {
       boolean isInterBroker = type == INTER_BROKER_REPLICA_ACTION;
       int numFinishedPartitionMovements = isInterBroker ? _executionTaskManager.numFinishedInterBrokerPartitionMovements()
                                                         : _executionTaskManager.numFinishedIntraBrokerPartitionMovements();
-      long finishedDataMovementInMB = isInterBroker ? _executionTaskManager.finishedInterBrokerDataMovementInMB()
-                                                    : _executionTaskManager.finishedIntraBrokerDataToMoveInMB();
+      // Dead and aborted tasks (e.g. in-progress movements rolled back when the execution is stopped) have not moved their data.
+      long completedDataMovementInMB = isInterBroker ? _executionTaskManager.completedInterBrokerDataMovementInMB()
+                                                     : _executionTaskManager.completedIntraBrokerDataMovementInMB();
       updatePartitionMovementMetrics(numFinishedPartitionMovements,
-                                     finishedDataMovementInMB + _executionTaskManager.inProgressMovedDataInMB(type),
+                                     completedDataMovementInMB + _executionTaskManager.inProgressMovedDataInMB(type),
                                      System.currentTimeMillis() - _replicaMovementStartTimeMs);
     }
 
