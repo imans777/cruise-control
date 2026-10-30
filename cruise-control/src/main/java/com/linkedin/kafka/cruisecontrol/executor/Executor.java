@@ -65,6 +65,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.Admin;
@@ -2930,8 +2931,8 @@ public class Executor {
     /**
      * Get the replication throttle budget of brokers based on the inter-broker replica movements in progress and the current
      * write rate of partitions, which is used if the replica movement strategy contains
-     * ThrottleAwareReplicaMovementStrategy. Each broker side is budgeted at its current replication throttle (which the concurrency adjuster may
-     * change during the execution). While replication throttle adjustment is enabled, each
+     * ThrottleAwareReplicaMovementStrategy. Each broker side is budgeted at its current replication throttle (which the admin
+     * endpoint and the concurrency adjuster may change during the execution). While replication throttle adjustment is enabled, each
      * movement is charged the throttle that the adjuster gives it, and the in-progress movements the throttle the adjuster keeps for
      * them -- see {@link ConcurrencyAdjuster#admissionInputs(Map, Map, Map)}; otherwise, each movement is charged the write rate of
      * its partition with {@link ExecutorConfig#REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG}.
@@ -2962,13 +2963,19 @@ public class Executor {
                   + "movements needing (leader: {}, follower: {} bytes/sec).", neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
         return budget;
       }
-      if (_replicationThrottle == null) {
+      // Budget at the live rates of the helper, read at every planning call: the replication throttle of the ongoing execution may
+      // be changed or removed meanwhile (admin?replication_throttle), and the adjuster, if turned off during the execution, leaves
+      // its last rate on each broker. Unsynchronized reads, so planning does not wait for an update that holds the helper's lock.
+      if (throttleHelper == null ? _replicationThrottle == null : !throttleHelper.throttlingEnabled()) {
         return null;
       }
+      Function<Integer, Long> leaderThrottleByBrokerId = throttleHelper == null ? brokerId -> _replicationThrottle
+                                                                                : throttleHelper::leaderThrottleRate;
+      Function<Integer, Long> followerThrottleByBrokerId = throttleHelper == null ? brokerId -> _replicationThrottle
+                                                                                  : throttleHelper::followerThrottleRate;
       return new ReplicationThrottleBudget(_executionTaskManager.inExecutionTasks(Collections.singleton(INTER_BROKER_REPLICA_ACTION)),
                                            _partitionWriteRateCache.writeRatesInBytesPerSec(), task -> currentLeader(cluster, task),
-                                           brokerId -> _replicationThrottle, brokerId -> _replicationThrottle,
-                                           _replicaMovementThrottleWriteRateMargin);
+                                           leaderThrottleByBrokerId, followerThrottleByBrokerId, _replicaMovementThrottleWriteRateMargin);
     }
 
     /**
