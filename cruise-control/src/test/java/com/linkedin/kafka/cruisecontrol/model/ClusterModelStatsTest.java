@@ -10,9 +10,11 @@ import com.linkedin.kafka.cruisecontrol.common.DeterministicCluster;
 import com.linkedin.kafka.cruisecontrol.common.TestConstants;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
+import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
 import com.linkedin.kafka.cruisecontrol.monitor.ModelGeneration;
 import java.util.Collections;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.Test;
@@ -55,6 +57,14 @@ public class ClusterModelStatsTest {
     createReplica(clusterModel, 2, 1, LOGDIR0, 0.5);
     createReplica(clusterModel, 3, 1, LOGDIR1, 0.5);
     return clusterModel;
+  }
+
+  private static void createReplica(ClusterModel clusterModel, int partition, int brokerId, String logdir, double nwIn, double nwOut) {
+    TopicPartition tp = new TopicPartition("topic", partition);
+    String rackId = Integer.toString(brokerId);
+    clusterModel.createReplica(rackId, brokerId, tp, 0, true, false, logdir, false);
+    clusterModel.setReplicaLoad(rackId, brokerId, tp, getAggregatedMetricValues(1.0, nwIn, nwOut, 0.1 * DISK_CAPACITY),
+                                Collections.singletonList(1L));
   }
 
   private static void createReplica(ClusterModel clusterModel, int partition, int brokerId, String logdir, double diskUtilization) {
@@ -110,6 +120,84 @@ public class ClusterModelStatsTest {
     assertEquals(Set.of("utilizationPct"), ((Map<?, ?>) usageJson.get("STD")).keySet());
     assertEquals(2, usageJson.get("numUnbalancedDisks"));
     assertEquals(1, usageJson.get("numDisksAboveCapacityLimit"));
+  }
+
+  /**
+   * Three brokers with two disks each, one leader replica per disk, with the estimated disk I/O rate (NW_IN + 0.5 x NW_OUT):
+   * <ul>
+   *   <li>Broker 0: 40 (NW_IN 30, NW_OUT 20) on {@link TestConstants#LOGDIR0} and 10 on {@link TestConstants#LOGDIR1} -- i.e.
+   *   160% and 40% of the broker average of 25.</li>
+   *   <li>Broker 1: 20 on each disk.</li>
+   *   <li>Broker 2: no I/O at all, hence no ratio.</li>
+   * </ul>
+   */
+  @Test
+  public void testDiskIORateStats() {
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnalyzerConfig.INTRA_BROKER_DISK_IO_READ_WEIGHT_CONFIG, "0.5");
+    ClusterModel clusterModel = new ClusterModel(new ModelGeneration(0, 0L), 1.0);
+    BrokerCapacityInfo capacity = new BrokerCapacityInfo(TestConstants.BROKER_CAPACITY, TestConstants.DISK_CAPACITY);
+    for (int brokerId = 0; brokerId < 3; brokerId++) {
+      clusterModel.createRack(Integer.toString(brokerId));
+      clusterModel.createBroker(Integer.toString(brokerId), Integer.toString(brokerId), brokerId, capacity, true);
+    }
+    createReplica(clusterModel, 0, 0, LOGDIR0, 30.0, 20.0);
+    createReplica(clusterModel, 1, 0, LOGDIR1, 10.0, 0.0);
+    createReplica(clusterModel, 2, 1, LOGDIR0, 20.0, 0.0);
+    createReplica(clusterModel, 3, 1, LOGDIR1, 20.0, 0.0);
+    createReplica(clusterModel, 4, 2, LOGDIR0, 0.0, 0.0);
+    createReplica(clusterModel, 5, 2, LOGDIR1, 0.0, 0.0);
+
+    BalancingConstraint constraint = new BalancingConstraint(new KafkaCruiseControlConfig(props));
+    ClusterModelStats stats = clusterModel.getClusterStats(constraint);
+    DiskBalanceStats.DiskIORateStats ioRate = stats.diskBalanceStats().ioRate();
+    assertEquals((40.0 + 10.0 + 20.0 + 20.0) / 6, ioRate.avg().rateKBps(), DELTA);
+    assertEquals(40.0, ioRate.max().rateKBps(), DELTA);
+    assertEquals(Integer.valueOf(0), ioRate.max().brokerId());
+    assertEquals(LOGDIR0, ioRate.max().logdir());
+    assertEquals(0.0, ioRate.min().rateKBps(), DELTA);
+    assertEquals(Integer.valueOf(2), ioRate.min().brokerId());
+    // The disks of broker 0 are 15 away from their broker average, the others at it; the same number as the I/O goal's stats.
+    assertEquals(Math.sqrt(2 * Math.pow(15.0, 2) / 6), ioRate.stDev().rateKBps(), DELTA);
+    assertEquals(stats.diskIORateStDev(), ioRate.stDev().rateKBps(), DELTA);
+    assertEquals(160.0, ioRate.maxRatio().ratioPct(), DELTA);
+    assertEquals(Integer.valueOf(0), ioRate.maxRatio().brokerId());
+    assertEquals(LOGDIR0, ioRate.maxRatio().logdir());
+    assertEquals(120.0, ioRate.maxSpreadWithinBroker().ratioPct(), DELTA);
+    assertEquals(Integer.valueOf(0), ioRate.maxSpreadWithinBroker().brokerId());
+    // Band 25 x (1 +/- 0.1 x 0.9) on broker 0: both of its disks are out of it; broker 1 is at its average, broker 2 has [0, 0].
+    assertEquals(2, ioRate.numUnbalancedDisks());
+    // Band 25 x (1 +/- 1.0 x 0.9) = [2.5, 47.5] on broker 0 with a threshold of 2.0: no disk is out of it.
+    props.setProperty(AnalyzerConfig.INTRA_BROKER_DISK_IO_BALANCE_THRESHOLD_CONFIG, "2.0");
+    BalancingConstraint looseConstraint = new BalancingConstraint(new KafkaCruiseControlConfig(props));
+    assertEquals(0, clusterModel.getClusterStats(looseConstraint).diskBalanceStats().ioRate().numUnbalancedDisks());
+
+    String statsString = stats.toString();
+    assertTrue(statsString, statsString.contains(String.format(
+        "DISK IO RATE:{unbalanced: 2 maxRatio: 160.00%% (broker 0 %s) maxSpreadWithinBroker: 120.00pp (broker 0)}%n"
+        + "DISK IO RATE AVG:{rate:     15.000 KB/s}%n"
+        + "DISK IO RATE MAX:{rate:     40.000 KB/s (broker 0 %s)}%n", LOGDIR0, LOGDIR0)));
+    Map<String, Object> ioRateJson = cast(stats.diskBalanceStats().getJsonStructure().get("ioRate"));
+    assertEquals(Set.of("AVG", "MAX", "MIN", "STD", "maxRatio", "maxSpreadWithinBroker", "numUnbalancedDisks"), ioRateJson.keySet());
+    Map<String, Object> maxRatio = cast(ioRateJson.get("maxRatio"));
+    assertEquals(Set.of("ratioPct", "broker", "logdir"), maxRatio.keySet());
+    assertEquals(Set.of("rateKBps"), ((Map<?, ?>) ioRateJson.get("AVG")).keySet());
+    assertEquals(Set.of("rateKBps", "broker", "logdir"), ((Map<?, ?>) ioRateJson.get("MAX")).keySet());
+  }
+
+  @Test
+  public void testDiskIORateStatsWithoutAnyIO() {
+    // No broker has I/O: no ratio, and every disk is balanced.
+    ClusterModel clusterModel = new ClusterModel(new ModelGeneration(0, 0L), 1.0);
+    clusterModel.createRack("0");
+    clusterModel.createBroker("0", "0", 0, new BrokerCapacityInfo(TestConstants.BROKER_CAPACITY, TestConstants.DISK_CAPACITY), true);
+    createReplica(clusterModel, 0, 0, LOGDIR0, 0.0, 0.0);
+    createReplica(clusterModel, 1, 0, LOGDIR1, 0.0, 0.0);
+    DiskBalanceStats.DiskIORateStats ioRate = clusterModel.getClusterStats(BALANCING_CONSTRAINT).diskBalanceStats().ioRate();
+    assertEquals(0, ioRate.numUnbalancedDisks());
+    assertEquals(0.0, ioRate.maxRatio().ratioPct(), DELTA);
+    assertNull(ioRate.maxRatio().brokerId());
+    assertNull(ioRate.maxSpreadWithinBroker().brokerId());
   }
 
   @Test

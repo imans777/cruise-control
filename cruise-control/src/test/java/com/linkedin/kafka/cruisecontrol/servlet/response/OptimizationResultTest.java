@@ -11,12 +11,14 @@ import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUnitTestUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.GoalOptimizer;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizerResult;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskUsageDistributionGoal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskIORateDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskUsageDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.async.progress.OperationProgress;
 import com.linkedin.kafka.cruisecontrol.common.DeterministicCluster;
 import com.linkedin.kafka.cruisecontrol.common.TestConstants;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
+import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
 import com.linkedin.kafka.cruisecontrol.executor.Executor;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
 import com.linkedin.kafka.cruisecontrol.model.DiskBalanceStats;
@@ -26,6 +28,7 @@ import com.linkedin.kafka.cruisecontrol.servlet.parameters.RebalanceParameters;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.common.TopicPartition;
@@ -166,6 +169,40 @@ public class OptimizationResultTest {
     Map<String, Object> jsonSummary = optimizerResult.getProposalSummaryForJson();
     assertEquals(before.getJsonStructure(), jsonSummary.get("diskStatisticsBefore"));
     assertEquals(after.getJsonStructure(), jsonSummary.get("diskStatisticsAfter"));
+  }
+
+  @Test
+  public void testDiskIOBalanceOnlyWithTheDiskIOGoal() throws Exception {
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnalyzerConfig.INTRA_BROKER_GOALS_CONFIG, String.join(",", IntraBrokerDiskUsageDistributionGoal.class.getName(),
+                                                                            IntraBrokerDiskIORateDistributionGoal.class.getName()));
+    KafkaCruiseControlConfig config = new KafkaCruiseControlConfig(props);
+
+    // With the I/O goal: the before/after I/O stats in JSON, and the I/O summary line. All replicas are on one disk: its I/O
+    // ratio is 200% of the average of the broker, 0% for the other; the goal moves half of the replicas.
+    OptimizerResult withIOGoal = optimize(config, clusterModelWithUnbalancedDisks(), IntraBrokerDiskIORateDistributionGoal.class.getSimpleName());
+    DiskBalanceStats.DiskIORateStats ioBefore = withIOGoal.clusterModelStatsBeforeOptimization().diskBalanceStats().ioRate();
+    DiskBalanceStats.DiskIORateStats ioAfter = withIOGoal.clusterModelStats().diskBalanceStats().ioRate();
+    assertEquals(200.0, ioBefore.maxRatio().ratioPct(), DELTA);
+    assertEquals(2, ioBefore.numUnbalancedDisks());
+    assertEquals(100.0, ioAfter.maxRatio().ratioPct(), DELTA);
+    assertEquals(0, ioAfter.numUnbalancedDisks());
+    Map<String, Object> jsonSummary = withIOGoal.getProposalSummaryForJson();
+    Map<String, Object> before = cast(jsonSummary.get("diskStatisticsBefore"));
+    assertEquals(ioBefore.getJsonStructure(), before.get("ioRate"));
+    String summary = withIOGoal.getProposalSummary();
+    assertTrue(summary, summary.contains(String.format("%nDisk I/O balance (before -> after): unbalanced disks 2 of 2 -> 0 of 2, max "
+                                                       + "ratio 200.00%% -> 100.00%%, max spread within a broker 200.00pp -> 0.00pp.")));
+    String response = response(withIOGoal, config, false);
+    String ioGoalStats = goalStats(response, IntraBrokerDiskIORateDistributionGoal.class.getSimpleName());
+    // The I/O goal is an intra-broker goal: only its disk-level stats are shown.
+    assertTrue(ioGoalStats, ioGoalStats.contains("DISK IO RATE:{unbalanced: 0"));
+    assertFalse(ioGoalStats, ioGoalStats.contains("AVG:{cpu"));
+
+    // Without the I/O goal: the JSON still has the I/O stats, but the summary has no I/O line.
+    OptimizerResult withoutIOGoal = optimize(config, clusterModelWithUnbalancedDisks(), INTRA_BROKER_GOAL);
+    assertTrue(((Map<?, ?>) withoutIOGoal.getProposalSummaryForJson().get("diskStatisticsBefore")).containsKey("ioRate"));
+    assertFalse(withoutIOGoal.getProposalSummary().contains("Disk I/O balance"));
   }
 
   @Test

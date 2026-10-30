@@ -401,6 +401,19 @@ disks of each broker, grouped by the metric it is about -- currently the disk us
   Utilizations are percentages of the disk capacity (`%`; `utilizationPct` in JSON). `STD` and `maxSpreadWithinBroker` are
   differences between such percentages, in percentage points (`pp`): e.g. a broker whose disks are at 17.35% and 0.73% has a
   spread of 16.62pp. Disks with no capacity, such as disks being removed, are left out.
+
+  The `DISK IO RATE` lines (`ioRate` in JSON) are the same for the estimated disk I/O rate that
+  `IntraBrokerDiskIORateDistributionGoal` balances: the inbound network rate of the replicas of a disk plus
+  `intra.broker.disk.io.read.weight` times the outbound network rate of its leaders, in KB/s (`rateKBps`). Per-disk I/O is not
+  observable, so they are estimates from network load. Rates are not comparable across brokers, so the I/O balance is given
+  relative to the average of each broker (`ratioPct`):
+  * `unbalanced` (`numUnbalancedDisks`): the disks out of that average times 1 +/- (`intra.broker.disk.io.balance.threshold` - 1)
+    * 0.9;
+  * `maxRatio`: the disk with the highest rate relative to the average of its broker, in percent, with its broker and log directory;
+  * `maxSpreadWithinBroker`: the largest difference between the rates of the disks of a broker, in percentage points of its average;
+  * `AVG`, `MAX`, `MIN`, `STD`: as for the disk usage, in KB/s.
+
+  A broker whose disks have no estimated I/O has no ratio, and its disks count as balanced.
 * The stats of a goal are the stats of the cluster after that goal is optimized -- i.e. after that goal and all the goals before
   it -- not what that goal alone changed. For example, with `rebalance_disk=true`, `IntraBrokerDiskCapacityGoal(NO-ACTION)`
   followed by `unbalanced: 12` means that no disk was above the capacity limit, while 12 disks were unbalanced; then
@@ -409,7 +422,10 @@ disks of each broker, grouped by the metric it is about -- currently the disk us
   response only shows their disk-level stats.
 * The summary shows the disk usage balance before and after the optimization, e.g. `Disk usage balance (before -> after):
   unbalanced disks 12 of 12 -> 0 of 12, max utilization 17.33% -> 6.18%, max spread within a broker 16.62pp -> 2.83pp.`
-  (`diskStatisticsBefore` and `diskStatisticsAfter` in JSON, shaped like `diskStatistics`).
+  (`diskStatisticsBefore` and `diskStatisticsAfter` in JSON, shaped like `diskStatistics`). If
+  `IntraBrokerDiskIORateDistributionGoal` was among the optimized goals, a second line shows the disk I/O balance, e.g.
+  `Disk I/O balance (before -> after): unbalanced disks 8 of 12 -> 2 of 12, max ratio 260.00% -> 118.00%, max spread within a
+  broker 230.00pp -> 40.00pp.`
 * The disk-level stats and the summary cover the brokers the request balances: with `rebalance_disk=true` and
   `destination_broker_ids`, only those brokers (`Disk usage balance of brokers [1, 2] (before -> after): ...`); for
   `remove_disks`, only the brokers in `brokerid_and_logdirs`. Otherwise, all alive brokers.
