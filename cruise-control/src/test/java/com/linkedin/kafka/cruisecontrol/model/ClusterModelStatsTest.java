@@ -214,6 +214,13 @@ public class ClusterModelStatsTest {
     assertEquals(2, stats.diskBalanceStats().usage().numUnbalancedDisks());
     // The count that the stats comparator of the goal uses is unchanged.
     assertEquals(0, stats.numUnbalancedDisks());
+
+    // With disk.low.utilization.threshold=0.6, the broker (at 50%) has the lenient band of the goal: no lower bound, and an upper
+    // bound of max(54.5%, 54%): only the disk at 54.75% is unbalanced.
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnalyzerConfig.DISK_LOW_UTILIZATION_THRESHOLD_CONFIG, "0.6");
+    BalancingConstraint lowUtilizationConstraint = new BalancingConstraint(new KafkaCruiseControlConfig(props));
+    assertEquals(1, clusterModel.getClusterStats(lowUtilizationConstraint).diskBalanceStats().usage().numUnbalancedDisks());
   }
 
   @Test

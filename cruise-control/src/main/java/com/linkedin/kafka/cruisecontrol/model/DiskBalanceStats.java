@@ -56,7 +56,6 @@ public final class DiskBalanceStats {
    * cluster model has no disk information).
    */
   static DiskBalanceStats compute(Iterable<Broker> brokers, BalancingConstraint balancingConstraint) {
-    double balancePercentageWithMargin = IntraBrokerDiskUsageDistributionGoal.balancePercentageWithMargin(balancingConstraint);
     double capacityThreshold = balancingConstraint.capacityThreshold(Resource.DISK);
     int numAliveDisks = 0;
     int numUnbalancedDisks = 0;
@@ -86,8 +85,9 @@ public final class DiskBalanceStats {
       }
       disksByBroker.add(disks);
       double brokerDiskUtilization = totalUtilization / totalCapacity;
-      double upperLimit = brokerDiskUtilization * (1 + balancePercentageWithMargin);
-      double lowerLimit = brokerDiskUtilization * Math.max(0, 1 - balancePercentageWithMargin);
+      // The band of the goal for a manual rebalance, with its low utilization leniency.
+      double upperLimit = IntraBrokerDiskUsageDistributionGoal.balanceThreshold(brokerDiskUtilization, balancingConstraint, false, false);
+      double lowerLimit = IntraBrokerDiskUsageDistributionGoal.balanceThreshold(brokerDiskUtilization, balancingConstraint, false, true);
       double minBrokerDiskUtilization = Double.MAX_VALUE;
       double maxBrokerDiskUtilization = -Double.MAX_VALUE;
       for (Disk disk : disks) {
@@ -173,7 +173,8 @@ public final class DiskBalanceStats {
    *   <li>{@code maxSpreadWithinBroker}: the largest difference between the highest and the lowest utilization percentage of the
    *   disks of a broker, in percentage points, with the broker (if a broker has at least two disks).</li>
    *   <li>The number of unbalanced disks, i.e. the disks that {@link IntraBrokerDiskUsageDistributionGoal} would move replicas
-   *   to or from (see {@link IntraBrokerDiskUsageDistributionGoal#balancePercentageWithMargin(BalancingConstraint)}), and the
+   *   to or from in a manual rebalance (see
+   *   {@link IntraBrokerDiskUsageDistributionGoal#balanceThreshold(double, BalancingConstraint, boolean, boolean)}), and the
    *   number of disks above the capacity limit
    *   ({@link com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig#DISK_CAPACITY_THRESHOLD_CONFIG}).</li>
    * </ul>
