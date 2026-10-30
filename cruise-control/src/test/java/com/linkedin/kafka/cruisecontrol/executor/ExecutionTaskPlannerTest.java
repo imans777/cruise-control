@@ -612,6 +612,47 @@ public class ExecutionTaskPlannerTest {
   }
 
   @Test
+  public void testOneReplicaPerPartitionChainedWithThrottleAwareStrategy() {
+    long throttle = 50L * BYTES_PER_MB;
+    ReplicaPlacementInfo r6 = new ReplicaPlacementInfo(6);
+    ReplicaPlacementInfo r7 = new ReplicaPlacementInfo(7);
+    // Two partitions led by broker 0, each written at 20 MB/s (24 MB/s per new replica, with the margin): an RF3 partition moving
+    // to three new brokers, and an RF2 partition moving one replica.
+    ExecutionProposal rf3 = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 10, _r0, List.of(_r0, _r1, _r2), List.of(_r3, _r4, _r5));
+    ExecutionProposal rf2 = new ExecutionProposal(new TopicPartition(TOPIC1, 1), 10, _r0, List.of(_r0, r6), List.of(_r0, r7));
+    List<ExecutionProposal> proposals = List.of(rf3, rf2);
+    Map<TopicPartition, Double> writeRateByPartition = Map.of(rf3.topicPartition(), 20.0 * BYTES_PER_MB,
+                                                              rf2.topicPartition(), 20.0 * BYTES_PER_MB);
+    KafkaCruiseControlConfig config = new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties());
+
+    // Throttle-aware alone: moving the RF3 partition at once makes broker 0 serve three new replicas (72 MB/s), which its throttle
+    // cannot carry, and broker 0 is not idle once the RF2 movement starts: only the RF2 movement starts.
+    ExecutionTaskPlanner planner = new ExecutionTaskPlanner(null, config);
+    planner.addExecutionProposals(proposals, strategyOptionsFor(proposals), new ThrottleAwareReplicaMovementStrategy());
+    assertEquals(List.of(rf2), proposalsOf(planner.getInterBrokerReplicaMovementTasks(
+        readyBrokers(), Collections.emptySet(), proposals.size(), budget(Collections.emptyList(), writeRateByPartition, throttle))));
+
+    // Chained after OneReplicaPerPartitionMovementStrategy: each step adds one replica, so the budget charges broker 0 one new
+    // replica per partition (48 MB/s), and the first step of the RF3 partition starts with the RF2 movement.
+    planner = new ExecutionTaskPlanner(null, config);
+    planner.addExecutionProposals(proposals, strategyOptionsFor(proposals),
+                                  new OneReplicaPerPartitionMovementStrategy().chain(new ThrottleAwareReplicaMovementStrategy()));
+    assertTrue(planner.isThrottleAware());
+    List<ExecutionTask> inProgressTasks = planner.getInterBrokerReplicaMovementTasks(
+        readyBrokers(), Collections.emptySet(), 8, budget(Collections.emptyList(), writeRateByPartition, throttle));
+    ExecutionProposal firstStep = new ExecutionProposal(rf3.topicPartition(), 10, _r0, List.of(_r0, _r1, _r2), List.of(_r0, _r1, _r3));
+    assertEquals(Set.of(firstStep, rf2), new HashSet<>(proposalsOf(inProgressTasks)));
+    inProgressTasks.forEach(task -> task.inProgress(0L));
+    // The next step waits for the step before it, and nothing else is left.
+    assertTrue(planner.getInterBrokerReplicaMovementTasks(readyBrokers(), Set.of(rf3.topicPartition(), rf2.topicPartition()), 8,
+                                                          budget(inProgressTasks, writeRateByPartition, throttle)).isEmpty());
+    // Once the movements are finished, the next step starts within the budget.
+    assertEquals(List.of(new ExecutionProposal(rf3.topicPartition(), 10, _r0, List.of(_r0, _r1, _r3), List.of(_r0, _r3, _r4))),
+                 proposalsOf(planner.getInterBrokerReplicaMovementTasks(
+                     readyBrokers(), Collections.emptySet(), 8, budget(Collections.emptyList(), writeRateByPartition, throttle))));
+  }
+
+  @Test
   public void testGetIntraBrokerPartitionMovementTasks() {
     ReplicaPlacementInfo r0d0 = new ReplicaPlacementInfo(0, "d0");
     ReplicaPlacementInfo r0d1 = new ReplicaPlacementInfo(0, "d1");
