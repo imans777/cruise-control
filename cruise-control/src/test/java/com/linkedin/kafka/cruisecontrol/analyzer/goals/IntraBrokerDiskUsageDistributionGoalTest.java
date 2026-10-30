@@ -92,6 +92,21 @@ public class IntraBrokerDiskUsageDistributionGoalTest {
   }
 
   @Test
+  public void testBalanceThresholdUsesIntraBrokerDiskBalanceThresholdWithGoalViolationMultiplier() {
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnalyzerConfig.DISK_BALANCE_THRESHOLD_CONFIG, Double.toString(STRICT_BALANCE_THRESHOLD));
+    props.setProperty(AnalyzerConfig.INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG, Double.toString(LOOSE_BALANCE_THRESHOLD));
+    props.setProperty(AnalyzerConfig.GOAL_VIOLATION_DISTRIBUTION_THRESHOLD_MULTIPLIER_CONFIG, "2.0");
+    BalancingConstraint constraint = new BalancingConstraint(new KafkaCruiseControlConfig(props));
+    // A manual rebalance uses the intra-broker threshold (1.5) with the 0.9 margin: 40% x (1 +/- 0.45).
+    assertEquals(0.40 * 1.45, IntraBrokerDiskUsageDistributionGoal.balanceThreshold(0.40, constraint, false, false), DELTA);
+    assertEquals(0.40 * 0.55, IntraBrokerDiskUsageDistributionGoal.balanceThreshold(0.40, constraint, false, true), DELTA);
+    // A goal violation run multiplies the intra-broker threshold, not disk.balance.threshold: 40% x (1 + (3.0 - 1) x 0.9).
+    assertEquals(0.40 * 2.8, IntraBrokerDiskUsageDistributionGoal.balanceThreshold(0.40, constraint, true, false), DELTA);
+    assertEquals(0.0, IntraBrokerDiskUsageDistributionGoal.balanceThreshold(0.40, constraint, true, true), DELTA);
+  }
+
+  @Test
   public void testDiskBalanceStatsUseIntraBrokerDiskBalanceThreshold() {
     // The disk balance stats of rebalance_disk and remove_disks count the disks out of the band that the goal enforces, which
     // is set by the intra-broker disk balance threshold, not by the disk balance threshold across brokers.

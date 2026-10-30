@@ -603,6 +603,31 @@ public final class GoalUtils {
                                                                   boolean isTriggeredByGoalViolation,
                                                                   double balanceMargin,
                                                                   boolean isLowerThreshold) {
+    return computeResourceUtilizationBalanceThreshold(avgUtilizationPercentage, resource, balancingConstraint.resourceBalancePercentage(resource),
+                                                      balancingConstraint, isTriggeredByGoalViolation, balanceMargin, isLowerThreshold);
+  }
+
+  /**
+   * Same as {@link #computeResourceUtilizationBalanceThreshold(double, Resource, BalancingConstraint, boolean, double, boolean)},
+   * with the given balance percentage instead of the one of the resource -- e.g. the intra-broker disk balance percentage of
+   * {@link IntraBrokerDiskUsageDistributionGoal}. The goal violation multiplier and the low utilization leniency still apply.
+   *
+   * @param avgUtilizationPercentage Average utilization.
+   * @param resource {@link Resource}, for its low utilization threshold.
+   * @param balancePercentage The balance percentage, e.g. 1.10.
+   * @param balancingConstraint Balancing constraint
+   * @param isTriggeredByGoalViolation whether this computation is triggered by goal violation.
+   * @param balanceMargin resource distribution goal balance margin
+   * @param isLowerThreshold whether this method calculates resource utilization threshold upper bound or lower bound
+   * @return The utilization upper/lower threshold in percent for the given type of resource
+   */
+  public static double computeResourceUtilizationBalanceThreshold(double avgUtilizationPercentage,
+                                                                  Resource resource,
+                                                                  double balancePercentage,
+                                                                  BalancingConstraint balancingConstraint,
+                                                                  boolean isTriggeredByGoalViolation,
+                                                                  double balanceMargin,
+                                                                  boolean isLowerThreshold) {
 
     if (balanceMargin >= 1) {
       throw new IllegalArgumentException("Balance margin must be less than 1.0. Got: " + balanceMargin);
@@ -614,12 +639,12 @@ public final class GoalUtils {
         return 0.0;
       }
       double balancePercentageWithMargin =
-          balancePercentageWithMargin(isTriggeredByGoalViolation, balancingConstraint, resource, balanceMargin);
+          balancePercentageWithMargin(isTriggeredByGoalViolation, balancingConstraint, balancePercentage, balanceMargin);
       return avgUtilizationPercentage * Math.max(0, (1 - balancePercentageWithMargin));
 
     } else {
       double balancePercentageWithMargin =
-          balancePercentageWithMargin(isTriggeredByGoalViolation, balancingConstraint, resource, balanceMargin);
+          balancePercentageWithMargin(isTriggeredByGoalViolation, balancingConstraint, balancePercentage, balanceMargin);
       double resourceBalanceThreshold = avgUtilizationPercentage * (1 + balancePercentageWithMargin);
       if (isLowUtilization) {
         return Math.max(resourceBalanceThreshold, balancingConstraint.lowUtilizationThreshold(resource) * balanceMargin);
@@ -634,21 +659,21 @@ public final class GoalUtils {
    *
    * @param isTriggeredByGoalViolation whether this computation is triggered by goal violation.
    * @param balancingConstraint Balancing constraint
-   * @param resource Resource for which the balance percentage with margin gets calculated
+   * @param balancePercentage The user specified balance percentage
    * @param balanceMargin resource distribution goal balance margin
    * @return The rebalance threshold with a margin.
    */
   private static double balancePercentageWithMargin(boolean isTriggeredByGoalViolation,
                                                     BalancingConstraint balancingConstraint,
-                                                    Resource resource,
+                                                    double balancePercentage,
                                                     double balanceMargin) {
 
-    double balancePercentage = balancingConstraint.resourceBalancePercentage(resource);
+    double effectiveBalancePercentage = balancePercentage;
     if (isTriggeredByGoalViolation) {
       // Make the balance threshold percentage more lenient in this case
-      balancePercentage *= balancingConstraint.goalViolationDistributionThresholdMultiplier();
+      effectiveBalancePercentage *= balancingConstraint.goalViolationDistributionThresholdMultiplier();
     }
-    return (balancePercentage - 1) * balanceMargin;
+    return (effectiveBalancePercentage - 1) * balanceMargin;
   }
 
   /**
