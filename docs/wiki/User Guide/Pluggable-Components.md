@@ -92,6 +92,12 @@ Sometimes this could result in prolonged execution time due to some long tail ta
 * **PostponeUrpReplicaMovementStrategy**: prioritize replicas for partition having no out-of-sync replica
 * **PrioritizeMinIsrWithOfflineReplicasStrategy**: prioritize tasks with (At/Under)MinISR partitions with offline replicas
 * **ThrottleAwareReplicaMovementStrategy**: if the execution has a replication throttle, start a replica movement only if the replication throttle of its source (i.e. the current leader of the partition) and destination brokers can carry the write rates of the movements in progress on them plus the write rate of the partition, i.e. `(1 + replica.movement.throttle.write.rate.margin) * (write rates in progress + write rate of the partition) <= throttle`, so that movements whose combined write rate exceeds the throttle do not stall the execution. A partition with a write rate higher than the throttle starts alone once no movement is in progress on its brokers and no movement that fits can start, so that it neither waits forever nor holds up the movements that fit. It does not change the order of tasks. While replication throttle adjustment is enabled (`concurrency.adjuster.replication.throttle.enabled`), the adjuster keeps the throttle of each broker at least at what its in-progress movements need, so the strategy budgets each broker at its network headroom instead of the execution's replication throttle, and charges each movement the throttle the adjuster keeps for it
+* **OneReplicaPerPartitionMovementStrategy**: move at most one replica of each partition at a time. Instead of moving a
+  partition to its new replicas at once (e.g. `[0, 1, 2] -> [3, 4, 5]`, during which the partition lives on six brokers and its
+  leader serves five replication streams), the movement is split into sequential steps that each add exactly one new replica
+  (`[0, 1, 2] -> [0, 1, 3] -> [0, 3, 4] -> [3, 4, 5]`). The old leader is kept until the last step. This reduces the load
+  (e.g. disk IO) on the brokers hosting a partition during its movement, at the cost of a longer execution. Each step is tracked
+  as a separate partition movement, and stopping the execution leaves a partition at its last completed step.
 
 The strategies can be chained to use and can be dynamically set using `replica_movement_strategies` in corresponding request(e.g. [rebalance request](https://github.com/cruise-control-for-kafka/cruise-control/wiki/REST-APIs#trigger-a-workload-balance)).
 
