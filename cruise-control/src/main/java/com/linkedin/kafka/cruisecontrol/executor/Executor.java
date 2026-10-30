@@ -941,6 +941,7 @@ public class Executor {
                                              Map<Integer, Long> neededLeaderThrottleByBroker,
                                              Map<Integer, Long> neededFollowerThrottleByBroker) {
       Map<TopicPartition, ExecutionProposal> movementsAtNeed = new HashMap<>();
+      Map<TopicPartition, Long> executionIdByPartition = new HashMap<>();
       Set<TopicPartition> inProgress = new HashSet<>();
       Set<Integer> brokersToDescribe = new HashSet<>();
       Map<TopicPartition, List<Integer>> newReplicasOutOfSyncByPartition = new HashMap<>();
@@ -960,6 +961,7 @@ public class Executor {
                              throttleHelper.followerThrottleRate(brokerId), neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L)));
         if (atNeed) {
           movementsAtNeed.put(proposal.topicPartition(), proposal);
+          executionIdByPartition.put(proposal.topicPartition(), task.executionId());
           newReplicasOutOfSyncByPartition.put(proposal.topicPartition(), newReplicasOutOfSync);
           brokersToDescribe.add(leader);
           brokersToDescribe.addAll(newReplicasOutOfSync);
@@ -988,6 +990,7 @@ public class Executor {
             .mapToLong(brokerId -> replicaSizeByBroker.getOrDefault(brokerId, Collections.emptyMap()).getOrDefault(tp, 0L))
             .min().orElse(0L);
         MovementProgress progress = _movementProgressByPartition.computeIfAbsent(tp, k -> new MovementProgress());
+        progress.track(executionIdByPartition.get(tp));
         long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBpsByPartition.getOrDefault(tp, 0.0)),
                                          progress.escalatedNeed());
         if (progress.recordLag(leaderSize - smallestNewReplicaSize, true, neededPerReplica)) {

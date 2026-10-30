@@ -341,6 +341,25 @@ public final class ExecutionUtils {
     private long _bestLagBytes = Long.MAX_VALUE;
     private int _runsWithoutProgress = 0;
     private long _escalatedNeed = 0L;
+    // The execution id of the task whose movement is tracked: with OneReplicaPerPartitionMovementStrategy, the steps of a partition
+    // are separate tasks.
+    private long _executionId = -1L;
+
+    /**
+     * Track the movement of the given task. A new task of the same partition (the next step of
+     * {@link com.linkedin.kafka.cruisecontrol.executor.strategy.OneReplicaPerPartitionMovementStrategy}) starts with an empty new
+     * replica, so its progress is measured afresh -- otherwise it inherits the lag of the step before it (about 0), looks like it
+     * makes no progress, and is escalated spuriously. The escalated need of the partition is kept.
+     *
+     * @param executionId The execution id of the task.
+     */
+    void track(long executionId) {
+      if (executionId != _executionId) {
+        _executionId = executionId;
+        _bestLagBytes = Long.MAX_VALUE;
+        _runsWithoutProgress = 0;
+      }
+    }
 
     /**
      * Record the lag of the new replicas of the movement, i.e. the leader size minus the size of the furthest-behind new replica.

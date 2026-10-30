@@ -663,6 +663,44 @@ public class ConcurrencyAdjusterTest {
   }
 
   @Test
+  public void testMovementProgressOfConsecutiveSteps() {
+    long mb = MB_IN_BYTES;
+    // Step 1 of a partition (OneReplicaPerPartitionMovementStrategy) catches up: its lag shrinks to about 0.
+    ExecutionUtils.MovementProgress progress = new ExecutionUtils.MovementProgress();
+    progress.track(1L);
+    for (long lag = 60; lag > 0; lag -= 20) {
+      assertFalse(progress.recordLag(lag * mb, true, mb));
+    }
+    assertFalse(progress.recordLag(0L, true, mb));
+    // Step 2 starts with an empty new replica: its lag is large but shrinking, which is progress, not a stall.
+    progress.track(2L);
+    assertFalse(progress.recordLag(60 * mb, true, mb));
+    assertFalse(progress.recordLag(50 * mb, true, mb));
+    assertFalse(progress.recordLag(40 * mb, true, mb));
+    assertEquals(0L, progress.escalatedNeed());
+    // Without track(2L), step 2 would inherit step 1's best lag (0) and be escalated after two runs.
+    ExecutionUtils.MovementProgress untracked = new ExecutionUtils.MovementProgress();
+    untracked.recordLag(0L, true, mb);
+    assertFalse(untracked.recordLag(60 * mb, true, mb));
+    assertTrue(untracked.recordLag(50 * mb, true, mb));
+
+    // An escalated need is kept for the next step of the same partition, while its progress is measured afresh.
+    progress = new ExecutionUtils.MovementProgress();
+    progress.track(3L);
+    progress.recordLag(40 * mb, true, mb);
+    progress.recordLag(40 * mb, true, mb);
+    assertTrue(progress.recordLag(40 * mb, true, mb));
+    assertEquals(2 * mb, progress.escalatedNeed());
+    progress.track(4L);
+    assertFalse(progress.recordLag(60 * mb, true, 2 * mb));
+    assertEquals(2 * mb, progress.escalatedNeed());
+    // The same task again changes nothing.
+    progress.track(4L);
+    assertFalse(progress.recordLag(60 * mb, true, 2 * mb));
+    assertTrue(progress.recordLag(60 * mb, true, 2 * mb));
+  }
+
+  @Test
   public void testNeededReplicationThrottleByPartition() {
     TopicPartition tp0 = new TopicPartition(TOPIC1, 0);
     TopicPartition tp1 = new TopicPartition(TOPIC1, 1);
