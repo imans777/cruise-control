@@ -174,7 +174,7 @@ public class RemoveDisksRunnableTest {
     assertTrue(response.contains("DISKS:{alive: 1}"));
     assertFalse(response.contains("AVG:{cpu"));
     // The removed disk is counted before the removal only.
-    assertTrue(response, response.contains("Disk usage balance (before -> after): unbalanced disks 2 of 2 -> 0 of 1, max utilization "
+    assertTrue(response, response.contains("Disk usage balance of brokers [0] (before -> after): unbalanced disks 2 of 2 -> 0 of 1, max utilization "
                                            + "50.00% -> 50.00%, max spread within a broker 50.00pp -> 0.00pp."));
   }
 

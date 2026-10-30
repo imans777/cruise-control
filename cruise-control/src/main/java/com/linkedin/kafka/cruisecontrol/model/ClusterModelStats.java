@@ -85,9 +85,13 @@ public class ClusterModelStats {
    * @param clusterModel        The state of the cluster.
    * @param balancingConstraint Balancing constraint.
    * @param optimizationOptions Options to take into account while populating stats.
+   * @param diskStatsBrokerIds  The ids of the brokers to compute the disk balance stats over, or an empty set for all alive brokers.
    * @return Analysis stats with this cluster and given balancing constraint.
    */
-  ClusterModelStats populate(ClusterModel clusterModel, BalancingConstraint balancingConstraint, OptimizationOptions optimizationOptions) {
+  ClusterModelStats populate(ClusterModel clusterModel,
+                             BalancingConstraint balancingConstraint,
+                             OptimizationOptions optimizationOptions,
+                             Set<Integer> diskStatsBrokerIds) {
     final SortedSet<Broker> brokers = clusterModel.brokers();
     final Set<Broker> aliveBrokers = clusterModel.aliveBrokers();
     Set<String> topics = clusterModel.topics();
@@ -104,7 +108,10 @@ public class ClusterModelStats {
     _numSnapshotWindows = clusterModel.load().numWindows();
     _monitoredPartitionsRatio = clusterModel.monitoredPartitionsRatio();
     populateStatsForDisks(balancingConstraint, aliveBrokers);
-    _diskBalanceStats = DiskBalanceStats.compute(brokers.stream().filter(Broker::isAlive).collect(Collectors.toList()),
+    _diskBalanceStats = DiskBalanceStats.compute(brokers.stream()
+                                                        .filter(b -> b.isAlive() && (diskStatsBrokerIds.isEmpty()
+                                                                                     || diskStatsBrokerIds.contains(b.id())))
+                                                        .collect(Collectors.toList()),
                                                  balancingConstraint);
     return this;
   }

@@ -446,6 +446,21 @@ public final class GoalUtils {
   }
 
   /**
+   * Get the brokers whose disks a request may change, which the disk balance stats are computed over: if every goal of the
+   * request is an intra-broker goal (rebalance_disk, remove_disks), the intra-broker goals balance only the requested brokers
+   * ({@link OptimizationOptions#requestedDestinationBrokerIds()}), so these are returned. Otherwise, an empty set, i.e. all alive
+   * brokers.
+   *
+   * @param goals The goals of the request.
+   * @param optimizationOptions The optimization options of the request.
+   * @return The ids of the brokers to compute the disk balance stats over, or an empty set for all alive brokers.
+   */
+  public static Set<Integer> diskStatsBrokerIds(Collection<Goal> goals, OptimizationOptions optimizationOptions) {
+    return !goals.isEmpty() && goals.stream().allMatch(Goal::isIntraBrokerGoal) ? optimizationOptions.requestedDestinationBrokerIds()
+                                                                                : Collections.emptySet();
+  }
+
+  /**
    * Get the alive brokers to be balanced by an intra-broker goal. If the given requested broker ids is non-empty (e.g. via
    * {@link OptimizationOptions#requestedDestinationBrokerIds()}), only the alive brokers among them are returned, which
    * limits the intra-broker (i.e. disk) rebalance to the requested brokers.
