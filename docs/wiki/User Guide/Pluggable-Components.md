@@ -60,6 +60,13 @@ The goals in Cruise Control are pluggable with different priorities.
 * **IntraBrokerDiskIORateDistributionGoal**: Attempt to make the estimated disk I/O rate of all the disks within same broker are within a certain range (determined by `intra.broker.disk.io.balance.threshold`, which falls back to `disk.balance.threshold` if not set) around the average disk I/O rate of the disks of the broker. The disk I/O rate of a replica is estimated as `NW_IN + w * NW_OUT`, where `NW_IN` approximates disk writes (for both leader and follower replicas, as each replica writes the produced bytes to its disk), `NW_OUT` approximates disk reads (for leader replicas only), and `w` is `intra.broker.disk.io.read.weight` (default: `1.0`). Consider lowering `w` (e.g. `0.3`) if most reads are served from the page cache (e.g. consumers reading from the tail of the log), so that disks hosting write-heavy followers are not considered as loaded as disks hosting leaders of topics with many consumers. This goal is not used by default; to use it when `rebalance_disk` parameter is set to `true` in [rebalance request](https://github.com/linkedin/cruise-control/wiki/REST-APIs#trigger-a-workload-balance), add it to `intra.broker.goals` before `IntraBrokerDiskUsageDistributionGoal`, e.g. in the order `IntraBrokerDiskCapacityGoal`, `IntraBrokerDiskIORateDistributionGoal`, `IntraBrokerDiskUsageDistributionGoal`. Goals are optimized in the order of priority, and a goal can only take actions that the goals optimized before it accept. Placed after `IntraBrokerDiskUsageDistributionGoal`, this goal can do little, since most of its moves would push the disk usage of a disk out of the limits of `IntraBrokerDiskUsageDistributionGoal`. Placed before it, disk I/O balance takes precedence over disk usage balance, so `IntraBrokerDiskUsageDistributionGoal` may end up violated. Not available in `kafka_0_11_and_1_0` branch.
 
 * **BrokerSetAwareGoal**: BrokerSet is defined as a subset of brokers in the cluster. This Goal will Attempt to make the replica movements constrained within the boundary of a BrokerSet.
+  The [replica to broker set mapping policy](#replica-to-broker-set-mapping-policy) decides which broker set each replica belongs to, or that a replica is not bound to any broker set. The goal:
+    * moves a replica that is outside its broker set, or offline, to an alive broker of its broker set, and fails the optimization if it cannot;
+    * rejects any later move or swap that would take a replica out of its broker set (leadership moves are always accepted);
+    * after optimization, checks that each topic whose replicas are all bound lives inside one broker set, and that each bound replica lives in its own broker set;
+    * leaves replicas that are not bound to any broker set alone: they are moved only if they are offline (to any alive broker), are never vetoed and are never checked.
+
+  Topics in `excluded_topics`, `topics.excluded.from.partition.movement` or `topics.with.min.leaders.per.broker` are neither moved nor checked by this goal. Put this goal first in `default.goals` and `hard.goals`, so that later goals are vetoed instead of undone.
 
 ## Anomaly Notifier
 The anomaly notifier is a communication channel between Cruise Control and users.
@@ -118,3 +125,38 @@ The broker set resolver is the way for Cruise Control to get the broker set info
 
 ## Default Broker Set Assignment Policy
 The default broker set assignment policy handles the case where a broker id is not provided with any mapping to a broker set. There is a default NoOpDefaultBrokerSetAssignmentPolicy that can be used if there is no default mapping and any mismatch will result in fast failure. Users can have a customized implementation to provide a default treatment for unmapped brokers.
+
+## Replica To Broker Set Mapping Policy
+The replica to broker set mapping policy (`replica.to.broker.set.mapping.policy.class`) maps each replica to the broker set that BrokerSetAwareGoal keeps it in. A policy may return `null` for a replica, which leaves that replica unconstrained. The built-in policies are:
+* **TopicNameHashBrokerSetMappingPolicy** (default): maps all replicas of a topic to a broker set chosen by a consistent hash of the topic name over the sorted broker set ids. Every topic is bound to a broker set.
+* **ReplicaToOriginalBrokerSetMappingPolicy**: maps a replica to the broker set of the broker that originally hosts it, i.e. it keeps each replica in the broker set it is already in.
+* **TopicPatternBrokerSetMappingPolicy**: maps all replicas of a topic to the broker set whose optional `topicPattern` (a regular expression in `broker.set.config.file`) fully matches the topic name, and leaves topics that match no pattern unconstrained. The file is re-read on each optimization, so changes apply without a restart. The optimization fails if a pattern does not compile, if a topic matches the patterns of more than one broker set, or if a matched broker set is not known to the broker set resolver.
+
+### Example: keep a topic on the 10G brokers
+In a cluster where broker 1 has a 1G network and brokers 2 and 3 have a 10G network, the following keeps the replicas of topic `hot` and of topics starting with `orders-` on brokers 2 and 3, while all other topics stay free to move anywhere. Broker 1 is not listed, so the default NoOpBrokerSetAssignmentPolicy puts it in the `unmapped` broker set.
+
+`config/brokerSets.json`:
+```json
+{
+  "brokerSets": [
+    {
+      "brokerSetId": "10G",
+      "brokerIds": [2, 3],
+      "topicPattern": "hot|orders-.*",
+      "doc": "Topics matching topicPattern may only live on brokers 2 and 3"
+    }
+  ]
+}
+```
+
+`config/cruisecontrol.properties`:
+```properties
+replica.to.broker.set.mapping.policy.class=com.linkedin.kafka.cruisecontrol.config.TopicPatternBrokerSetMappingPolicy
+broker.set.config.file=config/brokerSets.json
+# BrokerSetAwareGoal FIRST, so later goals are vetoed instead of undone
+default.goals=com.linkedin.kafka.cruisecontrol.analyzer.goals.BrokerSetAwareGoal,<the existing default goals>
+hard.goals=com.linkedin.kafka.cruisecontrol.analyzer.goals.BrokerSetAwareGoal,<the existing hard goals>
+# also add it to anomaly.detection.goals / self.healing.goals if self-healing must keep the pin
+```
+
+With this configuration every rebalance moves the replicas of the pinned topics off broker 1 and never moves them back. If the pinned broker set cannot host a replica (for example, too few alive brokers for the replication factor, too few racks for RackAwareGoal, all of its brokers excluded, or `destination_broker_ids` / `add_broker` limiting the destinations to brokers outside the set), the optimization fails with an error that names the broker set.
