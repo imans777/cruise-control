@@ -27,7 +27,6 @@ import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.SortedSet;
-import java.util.TreeSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -68,6 +67,7 @@ public class IntraBrokerDiskIORateDistributionGoal extends AbstractGoal {
   // Estimated disk I/O rate of alive disks, which is kept up to date with the actions applied by this goal.
   private final Map<Disk, Double> _diskIORateByDisk;
   private double _readWeight;
+  private Set<Integer> _requestedBrokerIds = Collections.emptySet();
 
   /**
    * Constructor for Intra-Broker Disk I/O Rate Distribution Goal.
@@ -102,6 +102,7 @@ public class IntraBrokerDiskIORateDistributionGoal extends AbstractGoal {
    */
   @Override
   protected void initGoalState(ClusterModel clusterModel, OptimizationOptions optimizationOptions) {
+    _requestedBrokerIds = optimizationOptions.requestedDestinationBrokerIds();
     _readWeight = _balancingConstraint.diskIOReadWeight();
     _balanceUpperThresholdByBroker.clear();
     _balanceLowerThresholdByBroker.clear();
@@ -183,6 +184,7 @@ public class IntraBrokerDiskIORateDistributionGoal extends AbstractGoal {
    * Get brokers in the cluster so that the rebalance process will go over to apply balancing actions to replicas
    * they contain.
    * Note this goal moves replica between disks within broker, therefore it is unable to heal dead broker.
+   * If {@link OptimizationOptions#requestedDestinationBrokerIds()} is non-empty, only the requested alive brokers are balanced.
    *
    * @param clusterModel The state of the cluster.
    * @return A collection of brokers that the rebalance process will go over to apply balancing actions to replicas
@@ -190,7 +192,7 @@ public class IntraBrokerDiskIORateDistributionGoal extends AbstractGoal {
    */
   @Override
   protected SortedSet<Broker> brokersToBalance(ClusterModel clusterModel) {
-    return new TreeSet<>(clusterModel.aliveBrokers());
+    return GoalUtils.aliveBrokersForIntraBrokerGoal(clusterModel, _requestedBrokerIds);
   }
 
   /**
