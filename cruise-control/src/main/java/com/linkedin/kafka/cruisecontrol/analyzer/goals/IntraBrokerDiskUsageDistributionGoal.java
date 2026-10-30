@@ -101,7 +101,7 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
    */
   @Override
   protected void initGoalState(ClusterModel clusterModel, OptimizationOptions optimizationOptions) {
-    double balancePercentageWithMargin = balancePercentageWithMargin(_balancingConstraint);
+    double balancePercentageWithMargin = (_balancingConstraint.intraBrokerDiskBalancePercentage() - 1) * BALANCE_MARGIN;
     for (Broker broker : brokersToBalance(clusterModel)) {
       double averageDiskUtilization = averageDiskUtilizationPercentage(broker);
       _balanceUpperThresholdByBroker.put(broker, averageDiskUtilization * (1 + balancePercentageWithMargin));

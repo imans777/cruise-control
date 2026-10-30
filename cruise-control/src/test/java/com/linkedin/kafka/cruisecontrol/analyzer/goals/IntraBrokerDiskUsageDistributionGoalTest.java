@@ -25,16 +25,20 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigException;
 import org.junit.Test;
 
 import static com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUnitTestUtils.getAggregatedMetricValues;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 
 /**
- * Unit test for {@link IntraBrokerDiskUsageDistributionGoal}.
+ * Unit test for {@link IntraBrokerDiskUsageDistributionGoal} and its balance threshold
+ * {@link AnalyzerConfig#INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG}.
  */
 public class IntraBrokerDiskUsageDistributionGoalTest {
   private static final String TOPIC = "T";
@@ -45,9 +49,58 @@ public class IntraBrokerDiskUsageDistributionGoalTest {
   // With the balance margin of the goal, a threshold of 1.10 keeps disks within [0.91, 1.09] x the average disk utilization.
   private static final double DISK_BALANCE_THRESHOLD = 1.10;
   private static final double DELTA = 1e-6;
+  private static final double STRICT_BALANCE_THRESHOLD = 1.02;
+  private static final double LOOSE_BALANCE_THRESHOLD = 1.5;
   private static final OptimizationOptions OPTIMIZATION_OPTIONS = new OptimizationOptions(Collections.emptySet(),
                                                                                           Collections.emptySet(),
                                                                                           Collections.emptySet());
+
+  @Test
+  public void testIntraBrokerDiskBalanceThresholdFallsBackToDiskBalanceThreshold() {
+    BalancingConstraint constraint = balancingConstraint(LOOSE_BALANCE_THRESHOLD, null);
+    assertEquals(LOOSE_BALANCE_THRESHOLD, constraint.intraBrokerDiskBalancePercentage(), 0.0);
+  }
+
+  @Test
+  public void testIntraBrokerDiskBalanceThresholdIsIndependentOfDiskBalanceThreshold() {
+    BalancingConstraint constraint = balancingConstraint(LOOSE_BALANCE_THRESHOLD, STRICT_BALANCE_THRESHOLD);
+    assertEquals(STRICT_BALANCE_THRESHOLD, constraint.intraBrokerDiskBalancePercentage(), 0.0);
+    assertEquals(LOOSE_BALANCE_THRESHOLD, constraint.resourceBalancePercentage(Resource.DISK), 0.0);
+  }
+
+  @Test
+  public void testInvalidIntraBrokerDiskBalanceThreshold() {
+    assertThrows(ConfigException.class, () -> balancingConstraint(LOOSE_BALANCE_THRESHOLD, 0.9));
+  }
+
+  @Test
+  public void testGoalUsesLooseIntraBrokerDiskBalanceThreshold() throws Exception {
+    // Disk balance threshold across brokers is strict, but intra-broker disk balance threshold is loose.
+    BalancingConstraint constraint = balancingConstraint(STRICT_BALANCE_THRESHOLD, LOOSE_BALANCE_THRESHOLD);
+    ClusterModel clusterModel = DeterministicCluster.unbalanced4();
+    assertEquals(0, clusterModel.getClusterStats(constraint, OPTIMIZATION_OPTIONS).numUnbalancedDisks());
+
+    Map<TopicPartition, String> logDirsBefore = logDirByPartition(clusterModel);
+    IntraBrokerDiskUsageDistributionGoal goal = new IntraBrokerDiskUsageDistributionGoal(constraint);
+    assertTrue(goal.optimize(clusterModel, Collections.emptySet(), OPTIMIZATION_OPTIONS));
+    // Disks are balanced wrt the intra-broker disk balance threshold, hence no replica should be moved.
+    assertEquals(logDirsBefore, logDirByPartition(clusterModel));
+  }
+
+  @Test
+  public void testGoalUsesStrictIntraBrokerDiskBalanceThreshold() throws Exception {
+    // Disk balance threshold across brokers is loose, but intra-broker disk balance threshold is strict.
+    BalancingConstraint constraint = balancingConstraint(LOOSE_BALANCE_THRESHOLD, STRICT_BALANCE_THRESHOLD);
+    ClusterModel clusterModel = DeterministicCluster.unbalanced4();
+    assertTrue(clusterModel.getClusterStats(constraint, OPTIMIZATION_OPTIONS).numUnbalancedDisks() > 0);
+
+    Map<TopicPartition, String> logDirsBefore = logDirByPartition(clusterModel);
+    IntraBrokerDiskUsageDistributionGoal goal = new IntraBrokerDiskUsageDistributionGoal(constraint);
+    assertTrue(goal.optimize(clusterModel, Collections.emptySet(), OPTIMIZATION_OPTIONS));
+    // Disks are unbalanced wrt the intra-broker disk balance threshold, hence replicas should be moved between disks.
+    assertNotEquals(logDirsBefore, logDirByPartition(clusterModel));
+    assertEquals(0, clusterModel.getClusterStats(constraint, OPTIMIZATION_OPTIONS).numUnbalancedDisks());
+  }
 
   /**
    * A single broker with three disks of capacity 100,000 each (average utilization 40%, balanced range [36.4%, 43.6%]):
@@ -157,6 +210,23 @@ public class IntraBrokerDiskUsageDistributionGoalTest {
     Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
     props.setProperty(AnalyzerConfig.DISK_BALANCE_THRESHOLD_CONFIG, Double.toString(DISK_BALANCE_THRESHOLD));
     return new BalancingConstraint(new KafkaCruiseControlConfig(props));
+  }
+
+  private static BalancingConstraint balancingConstraint(double diskBalanceThreshold, Double intraBrokerDiskBalanceThreshold) {
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnalyzerConfig.DISK_BALANCE_THRESHOLD_CONFIG, Double.toString(diskBalanceThreshold));
+    if (intraBrokerDiskBalanceThreshold != null) {
+      props.setProperty(AnalyzerConfig.INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG, Double.toString(intraBrokerDiskBalanceThreshold));
+    }
+    return new BalancingConstraint(new KafkaCruiseControlConfig(props));
+  }
+
+  private static Map<TopicPartition, String> logDirByPartition(ClusterModel clusterModel) {
+    Map<TopicPartition, String> logDirByPartition = new HashMap<>();
+    for (Replica replica : clusterModel.leaderReplicas()) {
+      logDirByPartition.put(replica.topicPartition(), replica.disk().logDir());
+    }
+    return logDirByPartition;
   }
 
   /**
