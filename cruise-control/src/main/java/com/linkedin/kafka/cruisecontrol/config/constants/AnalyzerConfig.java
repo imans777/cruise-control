@@ -75,7 +75,9 @@ public final class AnalyzerConfig {
       + "disk utilization percentage of the cluster (i.e. total disk usage divided by total disk capacity) -- "
       + "hence, brokers with more capacity are expected to take proportionally more load. Note that a large value "
       + "does not allow a fixed ratio between the loads of brokers; instead, it disables the balancing for disk "
-      + "utilization.";
+      + "utilization. Unless intra.broker.disk.balance.threshold is set, this value also bounds the utilization percentage of "
+      + "each disk relative to the one of its broker (IntraBrokerDiskUsageDistributionGoal), and through it the estimated "
+      + "disk I/O rate of each disk (IntraBrokerDiskIORateDistributionGoal) unless intra.broker.disk.io.balance.threshold is set.";
 
   /**
    * <code>intra.broker.disk.balance.threshold</code>
@@ -84,8 +86,9 @@ public final class AnalyzerConfig {
   public static final Double DEFAULT_INTRA_BROKER_DISK_BALANCE_THRESHOLD = null;
   public static final String INTRA_BROKER_DISK_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for disk utilization "
       + "across the disks of the same broker, used by intra-broker disk goals (e.g. IntraBrokerDiskUsageDistributionGoal). "
-      + "For example, 1.10 means the highest disk usage of a disk should not be above 1.10x of average disk utilization of "
-      + "all the disks of its broker. If not set, the value of " + DISK_BALANCE_THRESHOLD_CONFIG + " is used.";
+      + "For example, 1.10 means the utilization percentage of each disk should be within 0.90x and 1.10x of the utilization "
+      + "percentage of its broker (the goal applies a balance margin of 0.9, i.e. 0.91x-1.09x). If not set, the value of "
+      + DISK_BALANCE_THRESHOLD_CONFIG + " is used.";
 
   /**
    * <code>network.inbound.balance.threshold</code>
