@@ -122,7 +122,8 @@ DiskUsageStats:
       $ref: '#/DiskUtilizationValue'
     numUnbalancedDisks:
       description: Number of disks whose utilization is out of the balance range of their broker that IntraBrokerDiskUsageDistributionGoal
-        enforces, i.e. the utilization of the broker times 1 +/- (disk.balance.threshold - 1) * 0.9.
+        enforces, i.e. the utilization of the broker times 1 +/- (intra.broker.disk.balance.threshold - 1) * 0.9, where
+        intra.broker.disk.balance.threshold defaults to disk.balance.threshold.
       type: integer
       format: int32
     numDisksAboveCapacityLimit:

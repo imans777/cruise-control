@@ -388,7 +388,8 @@ disks of each broker, grouped by the metric it is about -- currently the disk us
 * The stats of each goal include disk-level stats (`diskStatistics` in JSON): the number of alive disks (`DISKS:{alive: ...}`,
   `numAliveDisks`), and the `DISK USAGE` lines:
   * `unbalanced` (`numUnbalancedDisks`): the number of disks that `IntraBrokerDiskUsageDistributionGoal` would move replicas to
-    or from, i.e. whose utilization is out of the utilization of their broker times 1 +/- (`disk.balance.threshold` - 1) * 0.9;
+    or from, i.e. whose utilization is out of the utilization of their broker times 1 +/- (`intra.broker.disk.balance.threshold` - 1)
+    * 0.9, where `intra.broker.disk.balance.threshold` defaults to `disk.balance.threshold`;
   * `aboveCapacityLimit` (`numDisksAboveCapacityLimit`): the number of disks whose utilization is above `disk.capacity.threshold`;
   * `maxSpreadWithinBroker`: the largest difference between the utilization of the disks of a broker, and that broker;
   * `AVG`, `MAX` and `MIN`: the average, highest and lowest utilization of a disk -- `MAX` and `MIN` with the broker and log

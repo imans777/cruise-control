@@ -83,15 +83,17 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
 
   /**
    * To avoid churns, we add a balance margin to the user specified rebalance threshold. e.g. when user sets the
-   * threshold to be resourceBalancePercentage, we use (resourceBalancePercentage-1)*balanceMargin instead. The utilization
-   * percentage of a disk is balanced if it is within this fraction of the utilization percentage of its broker -- e.g. 0.09
-   * for a threshold of 1.10, i.e. between 0.91 and 1.09 times the utilization percentage of its broker.
+   * threshold to be intraBrokerDiskBalancePercentage, we use (intraBrokerDiskBalancePercentage-1)*balanceMargin instead. The
+   * utilization percentage of a disk is balanced if it is within this fraction of the utilization percentage of its broker -- e.g.
+   * 0.09 for a threshold of 1.10, i.e. between 0.91 and 1.09 times the utilization percentage of its broker. The threshold is
+   * {@link com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig#INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG}, which
+   * defaults to {@link com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig#DISK_BALANCE_THRESHOLD_CONFIG}.
    *
    * @param balancingConstraint Balancing constraint.
    * @return The relative distance from the utilization percentage of its broker within which a disk is balanced.
    */
   public static double balancePercentageWithMargin(BalancingConstraint balancingConstraint) {
-    return (balancingConstraint.resourceBalancePercentage(RESOURCE) - 1) * BALANCE_MARGIN;
+    return (balancingConstraint.intraBrokerDiskBalancePercentage() - 1) * BALANCE_MARGIN;
   }
 
   /**
@@ -101,7 +103,7 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
    */
   @Override
   protected void initGoalState(ClusterModel clusterModel, OptimizationOptions optimizationOptions) {
-    double balancePercentageWithMargin = (_balancingConstraint.intraBrokerDiskBalancePercentage() - 1) * BALANCE_MARGIN;
+    double balancePercentageWithMargin = balancePercentageWithMargin(_balancingConstraint);
     for (Broker broker : brokersToBalance(clusterModel)) {
       double averageDiskUtilization = averageDiskUtilizationPercentage(broker);
       _balanceUpperThresholdByBroker.put(broker, averageDiskUtilization * (1 + balancePercentageWithMargin));

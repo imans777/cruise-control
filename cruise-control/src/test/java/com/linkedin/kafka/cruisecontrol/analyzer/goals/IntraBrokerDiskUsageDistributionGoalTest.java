@@ -88,6 +88,21 @@ public class IntraBrokerDiskUsageDistributionGoalTest {
   }
 
   @Test
+  public void testDiskBalanceStatsUseIntraBrokerDiskBalanceThreshold() {
+    // The disk balance stats of rebalance_disk and remove_disks count the disks out of the band that the goal enforces, which
+    // is set by the intra-broker disk balance threshold, not by the disk balance threshold across brokers.
+    BalancingConstraint looseIntraBroker = balancingConstraint(STRICT_BALANCE_THRESHOLD, LOOSE_BALANCE_THRESHOLD);
+    assertEquals((LOOSE_BALANCE_THRESHOLD - 1) * 0.9, IntraBrokerDiskUsageDistributionGoal.balancePercentageWithMargin(looseIntraBroker),
+                 DELTA);
+    assertEquals(0, DeterministicCluster.unbalanced4().getClusterStats(looseIntraBroker, OPTIMIZATION_OPTIONS)
+                                        .diskBalanceStats().usage().numUnbalancedDisks());
+
+    BalancingConstraint strictIntraBroker = balancingConstraint(LOOSE_BALANCE_THRESHOLD, STRICT_BALANCE_THRESHOLD);
+    assertTrue(DeterministicCluster.unbalanced4().getClusterStats(strictIntraBroker, OPTIMIZATION_OPTIONS)
+                                   .diskBalanceStats().usage().numUnbalancedDisks() > 0);
+  }
+
+  @Test
   public void testGoalUsesStrictIntraBrokerDiskBalanceThreshold() throws Exception {
     // Disk balance threshold across brokers is loose, but intra-broker disk balance threshold is strict.
     BalancingConstraint constraint = balancingConstraint(LOOSE_BALANCE_THRESHOLD, STRICT_BALANCE_THRESHOLD);
