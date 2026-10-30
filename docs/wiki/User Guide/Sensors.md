@@ -59,9 +59,9 @@ Cruise Control metrics are useful to monitor the state of Cruise Control itself.
 | The rate of completed inter-broker partition movements                                               | kafka.cruisecontrol:name=Executor.inter-broker-partition-movement-rate                         |
 | The rate of completed intra-broker partition movements                                               | kafka.cruisecontrol:name=Executor.intra-broker-partition-movement-rate                         |
 | The rate of completed leadership movements                                                           | kafka.cruisecontrol:name=Executor.leadership-movement-rate                                     |
-| The rate of finished partition data movement in MB                                                   | kafka.cruisecontrol:name=Executor.partition-data-movement-rate-MB                              |
+| The rate of partition data movement in MB, including data moved by in-progress partition movements   | kafka.cruisecontrol:name=Executor.partition-data-movement-rate-MB                              |
 | The average number of finished partition movements per second in the latest replica movement phase   | kafka.cruisecontrol:name=Executor.partition-movement-count-per-second                          |
-| The average finished partition data movement in MB per second in the latest replica movement phase   | kafka.cruisecontrol:name=Executor.partition-movement-MB-per-second                             |
+| The average partition data movement (incl. in-progress) in MB per second in the latest phase         | kafka.cruisecontrol:name=Executor.partition-movement-MB-per-second                             |
 | Max inter-broker partition movement concurrency of all brokers                                       | kafka.cruisecontrol:name=Executor.inter-broker-partition-movements-max-concurrency             |
 | Min inter-broker partition movement concurrency of all brokers                                       | kafka.cruisecontrol:name=Executor.inter-broker-partition-movements-min-concurrency             |
 | Average inter-broker partition movement concurrency of all brokers                                   | kafka.cruisecontrol:name=Executor.inter-broker-partition-movements-avg-concurrency             |
@@ -77,6 +77,11 @@ reset to 0 once the execution finishes. They can be combined to monitor the prog
 inter-broker replica movements is `completed-MB / total-MB`, and its remaining time can be estimated as
 `(remaining-MB + in-execution-MB) / partition-movement-MB-per-second`. `finished-MB - completed-MB` is the data of the aborted and dead
 tasks, e.g. the in-progress movements that were rolled back when the execution was stopped.
+
+With partition movement progress tracking enabled (`partition.movement.progress.tracking.enabled`, the default), the data that
+in-progress partition movements have moved so far -- measured as the growth of their new replicas -- is marked in
+`partition-data-movement-rate-MB` as it is observed and included in `partition-movement-MB-per-second`, rather than only the data of
+finished partition movements. With it disabled, both count finished partition movements only.
 
 
 ### LoadMonitor Sensors
