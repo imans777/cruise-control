@@ -102,6 +102,7 @@ public class RemoveDisksRunnable extends GoalBasedOperationRunnable {
                 _excludeRecentlyDemotedBrokers,
                 _excludeRecentlyRemovedBrokers,
                 _excludedTopics,
+                _includedTopics,
                 // The brokers whose disks are removed: only they are balanced, and the disk balance stats cover only them.
                 _brokerIdAndLogdirs.keySet(),
                 false,
