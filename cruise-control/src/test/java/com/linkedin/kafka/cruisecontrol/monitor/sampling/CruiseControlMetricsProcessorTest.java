@@ -2,8 +2,24 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.monitor.sampling;
 
+import com.linkedin.kafka.cruisecontrol.config.AutoDiscoveryBrokerCapacityConfigResolver;
+import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityConfigFileResolver;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityConfigResolver;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.exception.BrokerCapacityResolutionException;
@@ -19,6 +35,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -34,12 +51,15 @@ import org.junit.Test;
 import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC1;
 import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC2;
 import static com.linkedin.kafka.cruisecontrol.metricsreporter.metric.RawMetricType.*;
+import static com.linkedin.kafka.cruisecontrol.monitor.MonitorUtils.BROKER_CAPACITY_FETCH_TIMEOUT_MS;
 import static com.linkedin.kafka.cruisecontrol.monitor.MonitorUtils.EMPTY_BROKER_CAPACITY;
 import static com.linkedin.kafka.cruisecontrol.monitor.metricdefinition.KafkaMetricDef.*;
 import static com.linkedin.kafka.cruisecontrol.model.ModelUtils.estimateLeaderCpuUtilPerCore;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 
@@ -226,6 +246,75 @@ public class CruiseControlMetricsProcessorTest {
     }
 
     assertFalse(samples.partitionMetricSamples().isEmpty());
+  }
+
+  @Test
+  public void testCapacityMetricsReachListener() {
+    AutoDiscoveryBrokerCapacityConfigResolver resolver = new AutoDiscoveryBrokerCapacityConfigResolver();
+    resolver.configure(Collections.emptyMap());
+    CruiseControlMetricsProcessor processor = new CruiseControlMetricsProcessor(resolver, false);
+    getCruiseControlMetrics().forEach(processor::addMetric);
+    // The brokers report only their CPU cores. Their full capacity is unknown, but sampling needs only the CPU cores.
+    processor.addMetric(new BrokerMetric(RawMetricType.BROKER_CPU_CORES, _time.milliseconds(), BROKER_ID_0, MOCK_NUM_CPU_CORES));
+    processor.addMetric(new BrokerMetric(RawMetricType.BROKER_CPU_CORES, _time.milliseconds(), BROKER_ID_1, MOCK_NUM_CPU_CORES));
+
+    MetricSampler.Samples samples = processor.process(getCluster(), TEST_PARTITIONS, MetricSampler.SamplingMode.ALL);
+    assertEquals(Map.of(BROKER_ID_0, MOCK_NUM_CPU_CORES, BROKER_ID_1, MOCK_NUM_CPU_CORES), processor.cachedNumCoresByBroker());
+    assertEquals(4, samples.partitionMetricSamples().size());
+    assertEquals(2, samples.brokerMetricSamples().size());
+    for (PartitionMetricSample sample : samples.partitionMetricSamples()) {
+      assertEquals(CPU_UTIL.get(sample.entity().tp()), sample.metricValue(KafkaMetricDef.commonMetricDefId(CPU_USAGE)), DELTA);
+    }
+    assertThrows(BrokerCapacityResolutionException.class,
+                 () -> resolver.capacityForBroker("", "", BROKER_ID_0, BROKER_CAPACITY_FETCH_TIMEOUT_MS, true));
+  }
+
+  @Test
+  public void testCapacityMetricsIgnoredWithoutListener() throws TimeoutException, BrokerCapacityResolutionException {
+    CruiseControlMetricsProcessor processor = new CruiseControlMetricsProcessor(mockBrokerCapacityConfigResolver(), false);
+    getCruiseControlMetrics().forEach(processor::addMetric);
+    processor.addMetric(new BrokerMetric(RawMetricType.BROKER_CPU_CORES, _time.milliseconds(), BROKER_ID_0, 2.0));
+    processor.addMetric(new BrokerMetric(RawMetricType.BROKER_NW_IN_CAPACITY, _time.milliseconds(), BROKER_ID_0, 1.25e9));
+
+    MetricSampler.Samples samples = processor.process(getCluster(), TEST_PARTITIONS, MetricSampler.SamplingMode.ALL);
+    assertEquals(4, samples.partitionMetricSamples().size());
+    assertEquals(2, samples.brokerMetricSamples().size());
+    // The number of cores still comes from the resolver.
+    assertEquals(MOCK_NUM_CPU_CORES, processor.cachedNumCoresByBroker().get(BROKER_ID_0), DELTA);
+  }
+
+  @Test
+  public void testCapacityOnlyRound() throws BrokerCapacityResolutionException {
+    AutoDiscoveryBrokerCapacityConfigResolver resolver = new AutoDiscoveryBrokerCapacityConfigResolver();
+    resolver.configure(Collections.emptyMap());
+    CruiseControlMetricsProcessor processor = new CruiseControlMetricsProcessor(resolver, false);
+    processor.addMetric(new BrokerMetric(RawMetricType.BROKER_CPU_CORES, _time.milliseconds(), BROKER_ID_0, MOCK_NUM_CPU_CORES));
+
+    MetricSampler.Samples samples = processor.process(getCluster(), TEST_PARTITIONS, MetricSampler.SamplingMode.ALL);
+    assertTrue(samples.partitionMetricSamples().isEmpty());
+    assertTrue(samples.brokerMetricSamples().isEmpty());
+    assertEquals(MOCK_NUM_CPU_CORES, resolver.numCpuCores("", "", BROKER_ID_0, false), DELTA);
+  }
+
+  @Test
+  public void testDiscoveredCoresReplaceCachedCores() {
+    AutoDiscoveryBrokerCapacityConfigResolver resolver = new AutoDiscoveryBrokerCapacityConfigResolver();
+    String capacityFile =
+        Objects.requireNonNull(getClass().getClassLoader().getResource("testCapacityConfigAutoDiscovery.json")).getFile();
+    resolver.configure(Map.of(BrokerCapacityConfigFileResolver.CAPACITY_CONFIG_FILE, capacityFile));
+    CruiseControlMetricsProcessor processor = new CruiseControlMetricsProcessor(resolver, true);
+
+    // Without discovered CPU cores, the brokers get the CPU cores of the default entry of the capacity file.
+    getCruiseControlMetrics().forEach(processor::addMetric);
+    processor.process(getCluster(), TEST_PARTITIONS, MetricSampler.SamplingMode.ALL);
+    assertEquals(Map.of(BROKER_ID_0, 4.0, BROKER_ID_1, 4.0), processor.cachedNumCoresByBroker());
+    processor.clear();
+
+    // Once broker 0 reports its CPU cores, they replace the cached value.
+    getCruiseControlMetrics().forEach(processor::addMetric);
+    processor.addMetric(new BrokerMetric(RawMetricType.BROKER_CPU_CORES, _time.milliseconds(), BROKER_ID_0, MOCK_NUM_CPU_CORES));
+    processor.process(getCluster(), TEST_PARTITIONS, MetricSampler.SamplingMode.ALL);
+    assertEquals(Map.of(BROKER_ID_0, MOCK_NUM_CPU_CORES, BROKER_ID_1, 4.0), processor.cachedNumCoresByBroker());
   }
 
   @Test

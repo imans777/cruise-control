@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.metricsreporter;
 
 import java.util.HashSet;
@@ -57,6 +71,23 @@ public class CruiseControlMetricsReporterConfig extends AbstractConfig {
   public static final String CRUISE_CONTROL_METRICS_REPORTER_KUBERNETES_MODE_CONFIG = PREFIX + "kubernetes.mode";
   public static final String CRUISE_CONTROL_METRICS_REPORTER_KUBERNETES_MODE_DOC = "Cruise Control metrics reporter will report "
       + "metrics using methods that are aware of container boundaries.";
+  public static final String CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_ENABLED_CONFIG = PREFIX + "capacity.discovery.enabled";
+  public static final String CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_ENABLED_DOC = "Whether the Cruise Control metrics "
+      + "reporter also reports the capacity of the broker: the number of CPU cores available to the broker process and its "
+      + "network capacity. Cruise Control uses these metrics when broker.capacity.config.resolver.class is set to "
+      + "com.linkedin.kafka.cruisecontrol.config.AutoDiscoveryBrokerCapacityConfigResolver. Upgrade Cruise Control before "
+      + "enabling it, because older versions of Cruise Control cannot parse these metrics.";
+  public static final String CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_INTERFACE_CONFIG =
+      PREFIX + "capacity.discovery.network.interface";
+  public static final String CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_INTERFACE_DOC = "The name of the network "
+      + "interface, e.g. eth0, whose link speed is reported as the network capacity of the broker. If empty, the fastest "
+      + "network interface that is up and is not a loopback interface is used.";
+  public static final String CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_BYTES_PER_SEC_CONFIG =
+      PREFIX + "capacity.discovery.network.bytes.per.sec";
+  public static final String CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_BYTES_PER_SEC_DOC = "The network capacity "
+      + "of the broker in bytes per second, reported for both inbound and outbound traffic. A positive value overrides the "
+      + "link speed read from the network interface, e.g. on virtual machines or in containers whose network interface does "
+      + "not report a speed, or when the usable bandwidth is lower than the link speed.";
   // Default values
   public static final String DEFAULT_CRUISE_CONTROL_METRICS_TOPIC = "__CruiseControlMetrics";
   public static final Integer DEFAULT_CRUISE_CONTROL_METRICS_TOPIC_NUM_PARTITIONS = -1;
@@ -73,6 +104,9 @@ public class CruiseControlMetricsReporterConfig extends AbstractConfig {
   public static final int DEFAULT_CRUISE_CONTROL_METRICS_BATCH_SIZE = 800 * 1000;
   public static final boolean DEFAULT_CRUISE_CONTROL_METRICS_REPORTER_KUBERNETES_MODE = false;
   public static final int DEFAULT_CRUISE_CONTROL_METRICS_REPORTER_CREATE_RETRIES = 2;
+  public static final boolean DEFAULT_CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_ENABLED = false;
+  public static final String DEFAULT_CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_INTERFACE = "";
+  public static final long DEFAULT_CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_BYTES_PER_SEC = -1L;
 
   public CruiseControlMetricsReporterConfig(Map<?, ?> originals, boolean doLog) {
     super(CONFIG, originals, doLog);
@@ -155,7 +189,22 @@ public class CruiseControlMetricsReporterConfig extends AbstractConfig {
                 ConfigDef.Type.INT,
                 DEFAULT_CRUISE_CONTROL_METRICS_BATCH_SIZE,
                 ConfigDef.Importance.LOW,
-                CRUISE_CONTROL_METRICS_REPORTER_BATCH_SIZE_DOC);
+                CRUISE_CONTROL_METRICS_REPORTER_BATCH_SIZE_DOC)
+        .define(CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_ENABLED_CONFIG,
+                ConfigDef.Type.BOOLEAN,
+                DEFAULT_CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_ENABLED,
+                ConfigDef.Importance.LOW,
+                CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_ENABLED_DOC)
+        .define(CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_INTERFACE_CONFIG,
+                ConfigDef.Type.STRING,
+                DEFAULT_CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_INTERFACE,
+                ConfigDef.Importance.LOW,
+                CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_INTERFACE_DOC)
+        .define(CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_BYTES_PER_SEC_CONFIG,
+                ConfigDef.Type.LONG,
+                DEFAULT_CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_BYTES_PER_SEC,
+                ConfigDef.Importance.LOW,
+                CRUISE_CONTROL_METRICS_REPORTER_CAPACITY_DISCOVERY_NETWORK_BYTES_PER_SEC_DOC);
   }
 
   /**
