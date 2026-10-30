@@ -10,6 +10,7 @@ import com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskUsageDistributionGoal
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.Goal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskCapacityGoal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskIORateDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskUsageDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.async.progress.OperationProgress;
 import com.linkedin.kafka.cruisecontrol.common.DeterministicCluster;
@@ -88,6 +89,22 @@ public class IntraBrokerDiskRebalanceScopeTest {
                                                           false, Collections.singleton(0));
     assertEquals(Collections.singleton(0), GoalUtils.diskStatsBrokerIds(diskGoals(), options));
     assertEquals(Collections.emptySet(), GoalUtils.diskStatsBrokerIds(List.of(configure(new DiskUsageDistributionGoal())), options));
+  }
+
+  @Test
+  public void testDiskIORateGoalOnRequestedBrokers() throws KafkaCruiseControlException {
+    // All replicas, with the same network load, are on the first disk of each broker: the disk I/O rate is unbalanced on both.
+    List<Goal> ioGoal = Collections.singletonList(configure(new IntraBrokerDiskIORateDistributionGoal()));
+    ClusterModel clusterModel = clusterWithAllReplicasOnFirstDisk(BALANCED_REPLICA_DISK_LOAD, BALANCED_REPLICA_DISK_LOAD);
+    assertEquals(Set.of(0, 1), brokersWithReplicasToMoveBetweenDisks(optimize(clusterModel, Collections.emptySet(), ioGoal)));
+
+    for (int requestedBrokerId : Arrays.asList(0, 1)) {
+      clusterModel = clusterWithAllReplicasOnFirstDisk(BALANCED_REPLICA_DISK_LOAD, BALANCED_REPLICA_DISK_LOAD);
+      Set<ExecutionProposal> proposals = optimize(clusterModel, Collections.singleton(requestedBrokerId), ioGoal);
+      assertEquals(Collections.singleton(requestedBrokerId), brokersWithReplicasToMoveBetweenDisks(proposals));
+      int otherBrokerId = 1 - requestedBrokerId;
+      assertEquals(NUM_REPLICAS_PER_BROKER, clusterModel.broker(otherBrokerId).disk(TestConstants.LOGDIR0).replicas().size());
+    }
   }
 
   @Test
