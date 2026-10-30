@@ -793,7 +793,7 @@ Supported parameters are:
 | disable_concurrency_adjuster_for              | list      | disable concurrency adjuster for given concurrency types                  | N/A                   | yes       |
 | enable_concurrency_adjuster_for               | list      | enable concurrency adjuster for given concurrency types                   | N/A                   | yes       |
 | min_isr_based_concurrency_adjustment          | boolean   | enable (true) or disable (false) MinISR-based concurrency adjustment      | N/A                   | yes       |
-| replication_throttle_adjustment               | boolean   | enable (true) or disable (false) replication throttle adjustment          | N/A                   | yes       |
+| replication_throttle_adjustment               | boolean   | enable (true) or disable (false) replication throttle adjustment; disabling it during an execution makes a `replication_throttle` set during it hold (see below) | N/A                   | yes       |
 | reason                                        | string    | reason for the request                                                    | "No reason provided"  | yes       | 
 
 To Enable/disable self-healing, send POST request like:
@@ -818,7 +818,14 @@ Three things to know about the value:
 * `replication_throttle=0` is **not** "no throttle". Kafka reads it as a quota of zero bytes per second, so the throttled replica movements stop making progress until the throttle is changed again -- which makes it a way to pause an ongoing execution's replica movements, but a surprising one if `null` was meant. There is no timeout on an inter-broker replica movement, so a movement halted this way is waited on indefinitely.
 * The request **returns once the new rate has been verified on every participating broker and topic**, which can take tens of seconds: the throttle configs are written and read back one entity at a time, and a config write is not necessarily visible to the next read.
 
-The throttle in force for the ongoing execution is reported as `ongoingReplicationThrottle` by `GET /kafkacruisecontrol/state?substates=executor`.
+The throttle in force for the ongoing execution is reported as `ongoingReplicationThrottle` by `GET /kafkacruisecontrol/state?substates=executor`. While the concurrency adjuster adjusts replication throttles (`concurrency.adjuster.replication.throttle.enabled`, or `replication_throttle_adjustment=true`), this is the base rate, which the adjuster may override per broker; the rates in force on each broker are reported as `ongoingReplicationThrottleByBroker` (`json=true`).
+
+With replication throttle adjustment enabled, the adjuster owns the rates:
+
+* `replication_throttle=X` puts X on every broker of the ongoing execution right away, replacing the rates the adjuster set; the adjuster may then move it again at its next run.
+* To make a throttle stick, turn the adjuster off: `POST /kafkacruisecontrol/admin?replication_throttle_adjustment=false`. If a `replication_throttle` was set during the ongoing execution, it is applied again on every broker of the execution and holds for the rest of it, whichever of the two requests came first (both parameters may also be in one request). Without one, the rates stay at the adjuster's last values.
+* `replication_throttle=null` is rejected (400) while the adjuster is on: turn `replication_throttle_adjustment` off first.
+* The switch stays off until `replication_throttle_adjustment=true` is sent: later executions run without the adjuster too. A restart reverts it to `concurrency.adjuster.replication.throttle.enabled`, as for every `admin` toggle; set that config to `false` to keep it off across restarts.
 
 To change the log dir throttle of an ongoing execution, send POST request like:
 

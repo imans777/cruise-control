@@ -129,12 +129,19 @@ class ReplicationThrottleHelper {
    * movement that completes concurrently might be removed by {@link #clearThrottles(List, List)} and then set again by this
    * update, which would leave them in place after the execution.</p>
    *
+   * <p>The new rate applies to every broker: it replaces the rates adjusted per broker by
+   * {@link #updateThrottleRates(Map, Map)}.</p>
+   *
    * @param throttleRate The new replication throttle rate in bytes per second.
    * @param inProgressProposals Supplies the proposals of the in-progress inter-broker replica movements.
    */
   synchronized void updateThrottleRate(long throttleRate, Supplier<List<ExecutionProposal>> inProgressProposals)
   throws ExecutionException, InterruptedException, TimeoutException {
     _throttleRate = throttleRate;
+    // The new rate replaces the rates that the concurrency adjuster set per broker, which would otherwise be written back by the
+    // next batch of throttles (decision D2: the adjuster, while on, may then move the rate again).
+    _leaderThrottleRateByBroker.clear();
+    _followerThrottleRateByBroker.clear();
     setThrottles(inProgressProposals.get());
   }
 

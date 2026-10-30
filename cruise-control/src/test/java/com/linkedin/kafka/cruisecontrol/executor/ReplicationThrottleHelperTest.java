@@ -563,6 +563,36 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
   }
 
   @Test
+  public void testUpdatingThrottleRateReplacesAdjustedRates() throws Exception {
+    createTopics();
+
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, 100L);
+    ExecutionProposal proposal = new ExecutionProposal(new TopicPartition(TOPIC0, 0), 100, new ReplicaPlacementInfo(0),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+    throttleHelper.setThrottles(Collections.singletonList(proposal));
+    // The concurrency adjuster adjusts the rates of broker 1.
+    throttleHelper.updateThrottleRates(1, 200L, 300L);
+    assertExpectedThrottledRatesForBroker(1, 200L, 300L);
+
+    // An operator's rate (admin?replication_throttle) replaces the adjusted rates on every broker (decision D2), also for the
+    // upcoming batches of throttles.
+    throttleHelper.updateThrottleRate(400L, () -> Collections.singletonList(proposal));
+    assertEquals(400L, throttleHelper.leaderThrottleRate(1).longValue());
+    assertEquals(400L, throttleHelper.followerThrottleRate(1).longValue());
+    for (int i = 0; i < 3; i++) {
+      assertExpectedThrottledRateForBroker(i, 400L);
+    }
+    throttleHelper.setThrottles(Collections.singletonList(proposal));
+    assertExpectedThrottledRateForBroker(1, 400L);
+
+    // The adjuster may move it again afterwards.
+    throttleHelper.updateThrottleRates(1, 500L, 600L);
+    assertExpectedThrottledRatesForBroker(1, 500L, 600L);
+    throttleHelper.clearThrottles(Collections.singletonList(completedTaskForProposal(0, proposal)), Collections.emptyList());
+  }
+
+  @Test
   public void testThrottleRateDoesNotWaitForTheLockOfTheHelper() throws Exception {
     // The executor state reads the rate while setting, clearing or updating the throttles holds the lock of the helper for as
     // long as it takes to alter and verify the configs.

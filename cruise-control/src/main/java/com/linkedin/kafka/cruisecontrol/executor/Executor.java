@@ -184,6 +184,10 @@ public class Executor {
   private volatile ReplicationThrottleHelper _replicationThrottleHelper;
   // Held by the concurrency adjuster while it applies replication throttle updates, after checking that the adjustment is enabled.
   private final Object _replicationThrottleUpdateLock = new Object();
+  // The replication throttle that the operator set during the ongoing execution (admin?replication_throttle), or null. Decision
+  // D2: while the concurrency adjuster adjusts replication throttles, it may override this throttle; once replication throttle
+  // adjustment is turned off, this throttle is applied again and holds for the rest of the execution.
+  private volatile Long _operatorReplicationThrottle = null;
   private final TopicMinIsrCache _topicMinIsrCache;
   private final long _minExecutionProgressCheckIntervalMs;
   private final long _slowTaskAlertingBackoffTimeMs;
@@ -1430,7 +1434,10 @@ public class Executor {
   /**
    * Enable or disable replication throttle adjustment by the concurrency adjuster. Disabling it waits for a throttle update that is
    * already in progress (if any) to complete, so no throttle is changed by the concurrency adjuster once this method returns: during
-   * an execution, the replication throttles stay at their last values until the execution ends.
+   * an execution, the replication throttles stay at their last values until the execution ends -- unless the operator set a
+   * replication throttle during the execution (see {@link #updateOngoingExecutionReplicationThrottle(long)}), which is then applied
+   * again on every throttled broker and holds for the rest of the execution (decision D2). The switch stays as set until it is
+   * set again (a restart reverts it to the config).
    *
    * @param isReplicationThrottleAdjusterEnabled {@code true} to enable replication throttle adjustment, {@code false} otherwise.
    * @return {@code true} if replication throttle adjustment was enabled before, {@code false} otherwise.
@@ -1443,6 +1450,11 @@ public class Executor {
       // update is in progress and none will be applied.
       synchronized (_replicationThrottleUpdateLock) {
         LOG.debug("No replication throttle update is in progress.");
+      }
+      Long operatorReplicationThrottle = _operatorReplicationThrottle;
+      if (operatorReplicationThrottle != null && updateOngoingExecutionReplicationThrottle(operatorReplicationThrottle)) {
+        LOG.info("Replication throttle adjustment is disabled: the replication throttle {} bytes/sec set during the ongoing execution "
+                 + "is applied again, and holds for the rest of the execution.", operatorReplicationThrottle);
       }
     }
     return oldValue;
@@ -1737,6 +1749,7 @@ public class Executor {
                                                     + "still carry the previous rate.", newThrottleRate), e);
     }
     LOG.info("Replication throttle of the ongoing execution is updated to {} bytes/sec.", newThrottleRate);
+    _operatorReplicationThrottle = newThrottleRate;
     return true;
   }
 
@@ -1754,6 +1767,11 @@ public class Executor {
       LOG.info("Skip removing the replication throttle since there is no ongoing inter-broker replica movement.");
       return DynamicThrottleResult.NO_ONGOING_MOVEMENT;
     }
+    if (_replicationThrottleAdjusterEnabled) {
+      // The adjuster sets a throttle on every throttled broker, and its updates fail once the execution is not throttled.
+      LOG.info("Skip removing the replication throttle since replication throttle adjustment is enabled.");
+      return DynamicThrottleResult.ADJUSTER_ENABLED;
+    }
     boolean removed;
     try {
       removed = throttleHelper.removeThrottleRate(() -> inExecutionTasks().stream()
@@ -1766,6 +1784,7 @@ public class Executor {
       throw new IllegalStateException("Failed to remove the replication throttle of the in-progress inter-broker replica"
                                       + " movements. The upcoming inter-broker replica movements are not throttled.", e);
     }
+    _operatorReplicationThrottle = null;
     if (removed) {
       LOG.info("Replication throttle of the ongoing execution is removed.");
       return DynamicThrottleResult.REMOVED;
@@ -2221,6 +2240,7 @@ public class Executor {
       _recentlyDemotedBrokers = recentlyDemotedBrokers();
       _recentlyRemovedBrokers = recentlyRemovedBrokers();
       _replicationThrottle = replicationThrottle;
+      _operatorReplicationThrottle = null;
       _logDirThrottleHelper = new LogDirThrottleHelper(_adminClient, logDirThrottle, _appliedLogDirThrottles);
       _isTriggeredByUserRequest = isTriggeredByUserRequest;
       _lastSlowTaskReportingTimeMs = -1L;

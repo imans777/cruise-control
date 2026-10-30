@@ -15,5 +15,10 @@ public enum DynamicThrottleResult {
   /** There is an ongoing execution of the relevant movement type, but it is not throttled, so there was nothing to remove. */
   NOT_THROTTLED,
   /** There is no ongoing replica movement of the relevant type to remove a throttle from. */
-  NO_ONGOING_MOVEMENT
+  NO_ONGOING_MOVEMENT,
+  /**
+   * The replication throttle adjustment of the concurrency adjuster is enabled, so it sets a throttle on every throttled broker:
+   * it must be turned off before the replication throttle can be removed.
+   */
+  ADJUSTER_ENABLED
 }
