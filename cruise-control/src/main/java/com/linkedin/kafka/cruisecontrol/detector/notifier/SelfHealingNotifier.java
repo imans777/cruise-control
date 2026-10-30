@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.detector.notifier;
 
 import com.linkedin.cruisecontrol.detector.Anomaly;
@@ -30,7 +44,16 @@ import static com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorUtils.has
  * <ul>
  * <li>The goal violations will trigger an immediate fix.</li>
  * <li>The metric anomalies will trigger an immediate fix.</li>
- * <li>The disk failures will trigger an immediate fix.</li>
+ * <li>The disk failures are handled in the following way:
+ *   <ol>
+ *     <li>If a disk failure is first detected at timestamp <b>T</b>, an alert will be triggered.</li>
+ *     <li>If the disk is still failed at <b>T</b> + disk.failure.self.healing.threshold.ms (default: 0, i.e. an immediate fix),
+ *      an auto remediation will be performed. The remediation moves all offline replicas in the cluster, including the ones
+ *      of disks that failed later.</li>
+ *     <li>Disk failures whose offline replicas cannot be moved (i.e. all belong to partitions without a leader) are alerted, but
+ *      not fixed.</li>
+ *   </ol>
+ * </li>
  * <li>The topic anomalies will trigger an immediate fix.</li>
  * <li>The maintenance events will trigger an immediate fix.</li>
  * <li>The broker failures are handled in the following way:
@@ -65,8 +88,10 @@ public class SelfHealingNotifier implements AnomalyNotifier {
   public static final String SELF_HEALING_TOPIC_ANOMALY_ENABLED_CONFIG = "self.healing.topic.anomaly.enabled";
   public static final String SELF_HEALING_MAINTENANCE_EVENT_ENABLED_CONFIG = "self.healing.maintenance.event.enabled";
   public static final String BROKER_FAILURE_SELF_HEALING_THRESHOLD_MS_CONFIG = "broker.failure.self.healing.threshold.ms";
+  public static final String DISK_FAILURE_SELF_HEALING_THRESHOLD_MS_CONFIG = "disk.failure.self.healing.threshold.ms";
   static final long DEFAULT_ALERT_THRESHOLD_MS = TimeUnit.MINUTES.toMillis(15);
   static final long DEFAULT_AUTO_FIX_THRESHOLD_MS = TimeUnit.MINUTES.toMillis(30);
+  static final long DEFAULT_DISK_FAILURE_AUTO_FIX_THRESHOLD_MS = 0L;
 
   private static final Logger LOG = LoggerFactory.getLogger(SelfHealingNotifier.class);
   protected final Time _time;
@@ -76,8 +101,11 @@ public class SelfHealingNotifier implements AnomalyNotifier {
   protected final Map<AnomalyType, Long> _selfHealingEnabledHistoricalDurationMs;
   protected long _brokerFailureAlertThresholdMs;
   protected long _selfHealingThresholdMs;
+  protected long _diskFailureSelfHealingThresholdMs;
   // A cache that keeps the most recent broker failure for each broker.
   protected final Map<Boolean, Map<Integer, Long>> _latestFailedBrokersByAutoFixTriggered;
+  // A cache that keeps the most recent disk failure for each disk, grouped by broker.
+  protected final Map<Boolean, Map<Integer, Map<String, Long>>> _latestFailedDisksByAutoFixTriggered;
 
   public SelfHealingNotifier() {
     this(Time.SYSTEM);
@@ -100,6 +128,9 @@ public class SelfHealingNotifier implements AnomalyNotifier {
     _latestFailedBrokersByAutoFixTriggered = new HashMap<>();
     _latestFailedBrokersByAutoFixTriggered.put(true, new HashMap<>());
     _latestFailedBrokersByAutoFixTriggered.put(false, new HashMap<>());
+    _latestFailedDisksByAutoFixTriggered = new HashMap<>();
+    _latestFailedDisksByAutoFixTriggered.put(true, new HashMap<>());
+    _latestFailedDisksByAutoFixTriggered.put(false, new HashMap<>());
   }
 
   @Override
@@ -143,8 +174,27 @@ public class SelfHealingNotifier implements AnomalyNotifier {
 
   @Override
   public AnomalyNotificationResult onDiskFailure(DiskFailures diskFailures) {
-    alert(diskFailures, _selfHealingEnabled.get(KafkaAnomalyType.DISK_FAILURE), _time.milliseconds(), KafkaAnomalyType.DISK_FAILURE);
-    return _selfHealingEnabled.get(KafkaAnomalyType.DISK_FAILURE) ? AnomalyNotificationResult.fix() : AnomalyNotificationResult.ignore();
+    long earliestFailureTimeMs = Long.MAX_VALUE;
+    for (Map<String, Long> failedDisks : diskFailures.failedDisks().values()) {
+      for (long t : failedDisks.values()) {
+        earliestFailureTimeMs = Math.min(earliestFailureTimeMs, t);
+      }
+    }
+    long nowMs = _time.milliseconds();
+    long selfHealingTimeMs = earliestFailureTimeMs + _diskFailureSelfHealingThresholdMs;
+    boolean autoFixTriggered = _selfHealingEnabled.get(KafkaAnomalyType.DISK_FAILURE) && diskFailures.fixable();
+    if (autoFixTriggered && nowMs < selfHealingTimeMs) {
+      // Not reaching self-healing threshold yet. Alert but do not fix.
+      if (hasNewFailureToAlert(diskFailures, false)) {
+        alert(diskFailures, false, selfHealingTimeMs, KafkaAnomalyType.DISK_FAILURE);
+      }
+      return AnomalyNotificationResult.check(selfHealingTimeMs - nowMs);
+    }
+    // Reached self-healing threshold, or the disk failures will not be fixed. Alert and fix if self-healing is triggered.
+    if (hasNewFailureToAlert(diskFailures, autoFixTriggered)) {
+      alert(diskFailures, autoFixTriggered, selfHealingTimeMs, KafkaAnomalyType.DISK_FAILURE);
+    }
+    return autoFixTriggered ? AnomalyNotificationResult.fix() : AnomalyNotificationResult.ignore();
   }
 
   @Override
@@ -224,6 +274,30 @@ public class SelfHealingNotifier implements AnomalyNotifier {
     return containsNewAlert;
   }
 
+  /**
+   * Check whether the given disk failures with the corresponding autoFixTriggered contains a new failure to alert.
+   *
+   * @param diskFailures The detected disk failures
+   * @param autoFixTriggered {@code true} if auto fix has been triggered, {@code false} otherwise.
+   * @return {@code true} if any of the disk failures with the corresponding autoFixTriggered has not been alerted, {@code false} otherwise.
+   */
+  private boolean hasNewFailureToAlert(DiskFailures diskFailures, boolean autoFixTriggered) {
+    Map<Integer, Map<String, Long>> failedDisksByBroker = _latestFailedDisksByAutoFixTriggered.get(autoFixTriggered);
+    boolean containsNewAlert = false;
+
+    for (Map.Entry<Integer, Map<String, Long>> entry : diskFailures.failedDisks().entrySet()) {
+      Map<String, Long> failedDisks = failedDisksByBroker.computeIfAbsent(entry.getKey(), broker -> new HashMap<>());
+      for (Map.Entry<String, Long> failedDisk : entry.getValue().entrySet()) {
+        Long failureTime = failedDisks.put(failedDisk.getKey(), failedDisk.getValue());
+        if (failureTime == null || failureTime.longValue() != failedDisk.getValue().longValue()) {
+          containsNewAlert = true;
+        }
+      }
+    }
+
+    return containsNewAlert;
+  }
+
   @Override
   public AnomalyNotificationResult onBrokerFailure(BrokerFailures brokerFailures) {
     long earliestFailureTimeMs = Long.MAX_VALUE;
@@ -279,6 +353,13 @@ public class SelfHealingNotifier implements AnomalyNotifier {
     _brokerFailureAlertThresholdMs = alertThreshold == null ? DEFAULT_ALERT_THRESHOLD_MS : Long.parseLong(alertThreshold);
     String fixThreshold = (String) config.get(BROKER_FAILURE_SELF_HEALING_THRESHOLD_MS_CONFIG);
     _selfHealingThresholdMs = fixThreshold == null ? DEFAULT_AUTO_FIX_THRESHOLD_MS : Long.parseLong(fixThreshold);
+    String diskFailureFixThreshold = (String) config.get(DISK_FAILURE_SELF_HEALING_THRESHOLD_MS_CONFIG);
+    _diskFailureSelfHealingThresholdMs = diskFailureFixThreshold == null ? DEFAULT_DISK_FAILURE_AUTO_FIX_THRESHOLD_MS
+                                                                         : Long.parseLong(diskFailureFixThreshold);
+    if (_diskFailureSelfHealingThresholdMs < 0) {
+      throw new IllegalArgumentException(String.format("The disk failure auto fix threshold %d cannot be negative.",
+                                                       _diskFailureSelfHealingThresholdMs));
+    }
     if (_brokerFailureAlertThresholdMs > _selfHealingThresholdMs) {
       throw new IllegalArgumentException(String.format("The failure detection threshold %d cannot be larger than "
                                                        + "the auto fix threshold. %d",

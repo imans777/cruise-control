@@ -2,6 +2,20 @@
  * Copyright 2019 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.config.constants;
 
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskCapacityGoal;
@@ -125,6 +139,15 @@ public final class AnomalyDetectorConfig {
   public static final String DEFAULT_FAILED_BROKERS_FILE_PATH = "fileStore/failedBrokers.txt";
   public static final String FAILED_BROKERS_FILE_PATH_DOC = "The file path to store the failed broker list. This is to "
       + "persist the broker failure time in case Cruise Control failed and restarted when some brokers are down.";
+
+  /**
+   * <code>failed.disks.file.path</code>
+   */
+  public static final String FAILED_DISKS_FILE_PATH_CONFIG = "failed.disks.file.path";
+  public static final String DEFAULT_FAILED_DISKS_FILE_PATH = "fileStore/failedDisks.txt";
+  public static final String FAILED_DISKS_FILE_PATH_DOC = "The file path to store the failed disks whose self-healing is "
+      + "pending. This is to persist the disk failure time in case Cruise Control failed and restarted when some disks are "
+      + "failed, so that disk.failure.self.healing.threshold.ms keeps counting from the time the disk failure was first detected.";
 
   /**
    * <code>fixable.failed.broker.count.threshold</code>
@@ -363,6 +386,11 @@ public final class AnomalyDetectorConfig {
                             DEFAULT_FAILED_BROKERS_FILE_PATH,
                             ConfigDef.Importance.LOW,
                             FAILED_BROKERS_FILE_PATH_DOC)
+                    .define(FAILED_DISKS_FILE_PATH_CONFIG,
+                            ConfigDef.Type.STRING,
+                            DEFAULT_FAILED_DISKS_FILE_PATH,
+                            ConfigDef.Importance.LOW,
+                            FAILED_DISKS_FILE_PATH_DOC)
                     .define(FIXABLE_FAILED_BROKER_COUNT_THRESHOLD_CONFIG,
                             ConfigDef.Type.SHORT,
                             DEFAULT_FIXABLE_FAILED_BROKER_COUNT_THRESHOLD,

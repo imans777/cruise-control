@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.monitor;
 
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.AggregatedMetricValues;
@@ -322,13 +336,31 @@ public final class MonitorUtils {
 
   /**
    * @param cluster Kafka cluster.
-   * @return All the brokers that host at least one offline replica.
+   * @return All the brokers that host at least one offline replica of a partition with a leader.
    */
-  static Set<Integer> brokersWithOfflineReplicas(Cluster cluster) {
+  public static Set<Integer> brokersWithOfflineReplicas(Cluster cluster) {
     Set<Integer> brokersWithOfflineReplicas = new HashSet<>();
     for (String topic : cluster.topics()) {
       for (PartitionInfo partition : cluster.partitionsForTopic(topic)) {
         if (partition.leader() != null) {
+          brokersWithOfflineReplicas.addAll(Arrays.stream(partition.offlineReplicas()).map(Node::id).collect(Collectors.toSet()));
+        }
+      }
+    }
+    return brokersWithOfflineReplicas;
+  }
+
+  /**
+   * Offline replicas of a partition without a leader cannot be moved, and are left out of the cluster model.
+   *
+   * @param cluster Kafka cluster.
+   * @return All the brokers that host at least one offline replica of a partition without a leader.
+   */
+  public static Set<Integer> brokersWithOfflineReplicasOfLeaderlessPartitions(Cluster cluster) {
+    Set<Integer> brokersWithOfflineReplicas = new HashSet<>();
+    for (String topic : cluster.topics()) {
+      for (PartitionInfo partition : cluster.partitionsForTopic(topic)) {
+        if (partition.leader() == null) {
           brokersWithOfflineReplicas.addAll(Arrays.stream(partition.offlineReplicas()).map(Node::id).collect(Collectors.toSet()));
         }
       }
