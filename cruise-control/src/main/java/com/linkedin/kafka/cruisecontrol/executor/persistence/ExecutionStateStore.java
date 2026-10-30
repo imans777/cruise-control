@@ -45,6 +45,26 @@ public interface ExecutionStateStore extends CruiseControlConfigurable {
   void delete() throws IOException;
 
   /**
+   * Atomically replace the stored retained replication throttles -- i.e. the throttles that executions set, but could not
+   * remove yet (e.g. of an unavailable broker) -- with the given JSON document (see
+   * {@link PersistedExecutionStateSerde#retainedThrottlesToJson}). They outlive the execution that set them, so they are stored
+   * separately from the execution state. A store that does not persist them ignores the call.
+   *
+   * @param json Retained replication throttles to store, or {@code null} to delete the stored ones.
+   * @throws IOException If the retained replication throttles cannot be stored.
+   */
+  default void saveRetainedThrottles(String json) throws IOException { }
+
+  /**
+   * @return The stored retained replication throttles (see {@link #saveRetainedThrottles(String)}), or {@link Optional#empty()}
+   * if there are none.
+   * @throws IOException If the stored retained replication throttles cannot be read.
+   */
+  default Optional<String> loadRetainedThrottles() throws IOException {
+    return Optional.empty();
+  }
+
+  /**
    * Release any resources held by the store.
    */
   default void close() { }

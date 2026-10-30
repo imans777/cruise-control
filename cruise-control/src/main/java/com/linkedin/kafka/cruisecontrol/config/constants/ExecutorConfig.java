@@ -746,7 +746,9 @@ public final class ExecutorConfig {
       + " original parameters. Tasks that were in progress when Cruise Control stopped and are still being executed by Kafka are"
       + " monitored until completion rather than being submitted again; tasks that were completed in the meantime are skipped."
       + " If disabled (or the execution cannot be resumed), Cruise Control waits for the interrupted in-progress tasks to finish and"
-      + " removes the replication throttles left behind by the interrupted execution.";
+      + " removes the throttles left behind by the interrupted execution. If enabled, a graceful shutdown leaves the in-flight"
+      + " movements of the ongoing execution and their throttles to Kafka (as a crash would), so that the restart adopts them rather"
+      + " than copying them again; stop the execution before the shutdown to end it for good.";
 
   /**
    * <code>executor.state.checkpoint.interval.ms</code>

@@ -688,8 +688,8 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     for (int i = 0; i < clusterSize(); i++) {
       assertExpectedThrottledRateForBroker(i, throttleRate);
     }
-    assertExpectedThrottledReplicas(TOPIC0, "0:0,0:1,0:2");
-    assertExpectedThrottledReplicas(TOPIC1, "0:1,0:2,0:3");
+    assertExpectedThrottledReplicas(TOPIC0, "0:0,0:1,0:2", "0:2");
+    assertExpectedThrottledReplicas(TOPIC1, "0:1,0:2,0:3", "0:3");
 
     // Brokers of the in-progress proposal retain their throttled rate.
     throttleHelper.clearThrottlesForProposals(Collections.singletonList(finishedProposal), Collections.singletonList(inProgressProposal));
@@ -698,7 +698,7 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     assertExpectedThrottledRateForBroker(2, throttleRate);
     assertExpectedThrottledRateForBroker(3, throttleRate);
     assertExpectedThrottledReplicas(TOPIC0, "");
-    assertExpectedThrottledReplicas(TOPIC1, "0:1,0:2,0:3");
+    assertExpectedThrottledReplicas(TOPIC1, "0:1,0:2,0:3", "0:3");
 
     throttleHelper.clearThrottlesForProposals(Collections.singletonList(inProgressProposal), Collections.emptyList());
     for (int i = 0; i < clusterSize(); i++) {
@@ -1344,7 +1344,7 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     changeBrokerConfigs(executionThrottleHelper, 1, ops);
 
     ReplicationThrottleHelper cleanupThrottleHelper =
-        ReplicationThrottleHelper.forInterruptedExecution(_adminClient, throttleRate, Collections.emptySet(), 5);
+        ReplicationThrottleHelper.forInterruptedExecution(_adminClient, throttleRate, 5, new ReplicationThrottleHelper.AppliedThrottles());
     cleanupThrottleHelper.clearThrottlesForProposals(Collections.singletonList(proposal), Collections.emptyList());
     assertExpectedThrottledRateForBroker(0, null);
     assertExpectedThrottledRateForBroker(2, null);

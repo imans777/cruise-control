@@ -107,8 +107,10 @@ The Execution State Store persists the state of the ongoing execution -- i.e. th
 latest state of each execution task. The state is updated continuously while the execution makes progress: when it starts, right before
 a batch of tasks is submitted to Kafka (so that every task that Kafka may be executing is recorded as in progress), whenever a task
 finishes, and at least every `executor.state.checkpoint.interval.ms` while nothing changes. The state is deleted once the execution
-finishes (i.e. completes, is stopped, or fails), and retained if Cruise Control is shut down or crashes during the execution. The
-state also carries runtime changes made with the `admin` endpoint and the user task that started the execution.
+finishes (i.e. completes, is stopped, or fails), and retained if Cruise Control is shut down or crashes during the execution. With
+`resume.interrupted.execution.on.startup` enabled, a graceful shutdown leaves the in-flight movements and their throttles to Kafka, as
+a crash would, so that the restart adopts them. The state also carries runtime changes made with the `admin` endpoint and the user
+task that started the execution.
 
 Upon startup, Cruise Control reconciles the persisted state (if any) with the current state of the cluster -- e.g. a task that was in
 progress is checked for whether Kafka is still executing it, has completed it, or has not started it. Then, it either resumes the
