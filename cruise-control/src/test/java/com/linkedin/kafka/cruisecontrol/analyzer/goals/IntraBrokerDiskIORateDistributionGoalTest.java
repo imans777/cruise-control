@@ -219,6 +219,18 @@ public class IntraBrokerDiskIORateDistributionGoalTest {
   }
 
   @Test
+  public void testDiskIOBalanceThresholdUsesGoalViolationMultiplier() {
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnalyzerConfig.INTRA_BROKER_DISK_IO_BALANCE_THRESHOLD_CONFIG, "1.2");
+    props.setProperty(AnalyzerConfig.GOAL_VIOLATION_DISTRIBUTION_THRESHOLD_MULTIPLIER_CONFIG, "2.0");
+    BalancingConstraint constraint = new BalancingConstraint(new KafkaCruiseControlConfig(props));
+    // A manual rebalance (and the ioRate stats) use (1.2 - 1) x 0.9; goal violation detection and self-healing (1.2 x 2.0 - 1) x 0.9.
+    assertEquals(0.2 * 0.9, IntraBrokerDiskIORateDistributionGoal.balancePercentageWithMargin(constraint), DELTA);
+    assertEquals(0.2 * 0.9, IntraBrokerDiskIORateDistributionGoal.balancePercentageWithMargin(constraint, false), DELTA);
+    assertEquals(1.4 * 0.9, IntraBrokerDiskIORateDistributionGoal.balancePercentageWithMargin(constraint, true), DELTA);
+  }
+
+  @Test
   public void testInvalidDiskIOBalanceThreshold() {
     assertThrows(ConfigException.class, () -> balancingConstraint(1.0, LOOSE_BALANCE_THRESHOLD, 0.9));
   }

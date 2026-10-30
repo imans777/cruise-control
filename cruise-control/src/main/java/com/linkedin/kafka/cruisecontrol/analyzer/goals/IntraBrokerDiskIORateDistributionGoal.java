@@ -108,7 +108,23 @@ public class IntraBrokerDiskIORateDistributionGoal extends AbstractGoal {
    * @return The relative distance from the average I/O rate of the disks of its broker within which a disk is balanced.
    */
   public static double balancePercentageWithMargin(BalancingConstraint balancingConstraint) {
-    return (balancingConstraint.intraBrokerDiskIOBalancePercentage() - 1) * BALANCE_MARGIN;
+    return balancePercentageWithMargin(balancingConstraint, false);
+  }
+
+  /**
+   * @param balancingConstraint Balancing constraint.
+   * @param isTriggeredByGoalViolation {@code true} if the optimization is triggered by goal violation: as for the other intra- and
+   *                                   inter-broker distribution goals, the threshold is then multiplied by
+   *                                   {@link BalancingConstraint#goalViolationDistributionThresholdMultiplier()}.
+   * @return The relative distance from the average I/O rate of the disks of its broker within which a disk is balanced.
+   * @see #balancePercentageWithMargin(BalancingConstraint)
+   */
+  public static double balancePercentageWithMargin(BalancingConstraint balancingConstraint, boolean isTriggeredByGoalViolation) {
+    double balancePercentage = balancingConstraint.intraBrokerDiskIOBalancePercentage();
+    if (isTriggeredByGoalViolation) {
+      balancePercentage *= balancingConstraint.goalViolationDistributionThresholdMultiplier();
+    }
+    return (balancePercentage - 1) * BALANCE_MARGIN;
   }
 
   /**
@@ -126,7 +142,7 @@ public class IntraBrokerDiskIORateDistributionGoal extends AbstractGoal {
     _balanceLowerThresholdByBroker.clear();
     _averageDiskIORateByBroker.clear();
     _diskIORateByDisk.clear();
-    double balancePercentageWithMargin = balancePercentageWithMargin(_balancingConstraint);
+    double balancePercentageWithMargin = balancePercentageWithMargin(_balancingConstraint, optimizationOptions.isTriggeredByGoalViolation());
     for (Broker broker : brokersToBalance(clusterModel)) {
       double totalDiskIORate = 0;
       int numAliveDisks = 0;
