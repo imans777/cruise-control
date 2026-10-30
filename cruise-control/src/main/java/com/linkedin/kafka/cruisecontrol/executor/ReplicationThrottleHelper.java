@@ -27,9 +27,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -66,12 +69,22 @@ class ReplicationThrottleHelper {
   // TOPIC resources are routed to a single broker, so an unbounded batch could produce an
   // oversized request on clusters with a very large number of topics.
   static final int MAX_RESOURCES_PER_ADMIN_REQUEST = 500;
+  // The concurrency adjuster verifies its throttle rate updates while holding the lock of the helper, which the executor needs to
+  // set and clear throttles: a small budget (~2 minutes with the backoff above) bounds how long an update can block them.
+  static final int THROTTLE_RATE_UPDATE_RETRIES = 5;
 
   private final Admin _adminClient;
+  // The initial throttle rate, which is used for brokers whose throttle rate has not been adjusted.
   private final Long _throttleRate;
   private final int _retries;
   private final Set<Integer> _deadBrokers;
   private final AppliedThrottles _appliedThrottles;
+  // Leader and follower throttle rates of brokers that have been adjusted during the execution (e.g. by the concurrency adjuster).
+  private final ConcurrentMap<Integer, Long> _leaderThrottleRateByBroker;
+  private final ConcurrentMap<Integer, Long> _followerThrottleRateByBroker;
+  // Brokers whose throttle rate has been set by this helper and not yet removed. Written under the lock of this helper, concurrent
+  // for the unsynchronized read of the executor state (see #throttleRateByBroker()).
+  private final Set<Integer> _throttledBrokers;
 
   ReplicationThrottleHelper(Admin adminClient, Long throttleRate) {
     this(adminClient, throttleRate, RETRIES);
@@ -97,9 +110,12 @@ class ReplicationThrottleHelper {
     this._retries = retries;
     this._deadBrokers = deadBrokers;
     this._appliedThrottles = appliedThrottles;
+    this._leaderThrottleRateByBroker = new ConcurrentHashMap<>();
+    this._followerThrottleRateByBroker = new ConcurrentHashMap<>();
+    this._throttledBrokers = ConcurrentHashMap.newKeySet();
   }
 
-  void setThrottles(List<ExecutionProposal> proposals)
+  synchronized void setThrottles(List<ExecutionProposal> proposals)
   throws ExecutionException, InterruptedException, TimeoutException {
     if (throttlingEnabled()) {
       List<ExecutionProposal> replicaMovementProposals = proposalsWithDataMovement(proposals);
@@ -128,7 +144,7 @@ class ReplicationThrottleHelper {
         for (int brokerId : participatingBrokers) {
           ConfigResource cf = new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(brokerId));
           Config config = brokerFutures.get(cf).get(CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-          List<AlterConfigOp> ops = buildSetThrottleRateOps(config, brokerId);
+          List<AlterConfigOp> ops = throttledRateOps(brokerId, config);
           if (!ops.isEmpty()) {
             brokerOps.put(cf, ops);
           }
@@ -138,6 +154,7 @@ class ReplicationThrottleHelper {
           LOG.info("Updating throttle rate on {} out of {} brokers", brokerOps.size(), participatingBrokers.size());
           batchAlterBrokerConfigs(brokerOps);
         }
+        _throttledBrokers.addAll(participatingBrokers);
       }
 
       // Batch set topic throttled replicas.
@@ -189,7 +206,7 @@ class ReplicationThrottleHelper {
   }
 
   // clear throttles for a specific list of execution tasks
-  void clearThrottles(List<ExecutionTask> completedTasks, List<ExecutionTask> inProgressTasks) throws InterruptedException {
+  synchronized void clearThrottles(List<ExecutionTask> completedTasks, List<ExecutionTask> inProgressTasks) throws InterruptedException {
     if (throttlingEnabled()) {
       List<ExecutionProposal> completedProposals =
         completedTasks
@@ -236,7 +253,7 @@ class ReplicationThrottleHelper {
    *
    * @param partitionsBeingReassigned Partitions that are being reassigned.
    */
-  void clearLeftoverThrottles(Set<TopicPartition> partitionsBeingReassigned)
+  synchronized void clearLeftoverThrottles(Set<TopicPartition> partitionsBeingReassigned)
   throws ExecutionException, InterruptedException, TimeoutException {
     if (_appliedThrottles.isEmpty()) {
       return;
@@ -283,6 +300,7 @@ class ReplicationThrottleHelper {
     for (int broker : brokers) {
       if (!failedBrokers.contains(broker)) {
         _appliedThrottles._brokers.remove(broker);
+        _throttledBrokers.remove(broker);
       }
     }
     proposalsByTopic.forEach((topic, topicProposals) -> {
@@ -457,17 +475,25 @@ class ReplicationThrottleHelper {
 
   // --- Ops builders extracted from the old single-resource methods ---
 
-  private List<AlterConfigOp> buildSetThrottleRateOps(Config brokerConfigs, int brokerId) {
+  /**
+   * @param brokerId Broker id.
+   * @param brokerConfigs Current configs of the broker.
+   * @return The operations that set the leader and follower throttle rates of the given broker to the rates of this helper (adjusted
+   * for the broker, if so), for the rates that differ from the current configs.
+   */
+  private List<AlterConfigOp> throttledRateOps(int brokerId, Config brokerConfigs) {
     if (_throttleRate == null) {
       throw new IllegalStateException("Throttle rate cannot be null");
     }
+    Map<String, Long> throttleRateByConfigKey = Map.of(LEADER_REPLICATION_THROTTLED_RATE_CONFIG, leaderThrottleRate(brokerId),
+                                                       FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, followerThrottleRate(brokerId));
     List<AlterConfigOp> ops = new ArrayList<>();
-    for (String replicaThrottleRateConfigKey : Arrays.asList(LEADER_REPLICATION_THROTTLED_RATE_CONFIG,
-            FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG)) {
+    for (String replicaThrottleRateConfigKey : Arrays.asList(LEADER_REPLICATION_THROTTLED_RATE_CONFIG, FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG)) {
+      String throttleRate = String.valueOf(throttleRateByConfigKey.get(replicaThrottleRateConfigKey));
       ConfigEntry currThrottleRate = brokerConfigs.get(replicaThrottleRateConfigKey);
-      if (currThrottleRate == null || !currThrottleRate.value().equals(String.valueOf(_throttleRate))) {
-        LOG.debug("Setting {} to {} bytes/second for broker {}", replicaThrottleRateConfigKey, _throttleRate, brokerId);
-        ops.add(new AlterConfigOp(new ConfigEntry(replicaThrottleRateConfigKey, String.valueOf(_throttleRate)), AlterConfigOp.OpType.SET));
+      if (currThrottleRate == null || !currThrottleRate.value().equals(throttleRate)) {
+        LOG.debug("Setting {} to {} bytes/second for broker {}", replicaThrottleRateConfigKey, throttleRate, brokerId);
+        ops.add(new AlterConfigOp(new ConfigEntry(replicaThrottleRateConfigKey, throttleRate), AlterConfigOp.OpType.SET));
       }
     }
     return ops;
@@ -675,6 +701,19 @@ class ReplicationThrottleHelper {
    */
   Set<ConfigResource> verifyBatchConfigs(Map<ConfigResource, Collection<AlterConfigOp>> allOps,
                                          Map<ConfigResource, Map<String, String>> deletedValuesByResource) {
+    return verifyBatchConfigs(allOps, deletedValuesByResource, _retries);
+  }
+
+  /**
+   * @param allOps the map of config resources to their expected alter operations
+   * @param deletedValuesByResource the values of the configs that the operations delete, as read before deleting them (if known)
+   * @param retries the number of verification attempts
+   * @return the resources that could not be verified (all pending ones if the verification is interrupted)
+   * @see #verifyBatchConfigs(Map, Map)
+   */
+  private Set<ConfigResource> verifyBatchConfigs(Map<ConfigResource, Collection<AlterConfigOp>> allOps,
+                                                 Map<ConfigResource, Map<String, String>> deletedValuesByResource,
+                                                 int retries) {
     // Resources that still await verification. Verified resources and confirmed-deleted topics are
     // removed as verification progresses.
     Map<ConfigResource, Map<String, String>> pendingByResource = new HashMap<>();
@@ -711,7 +750,7 @@ class ReplicationThrottleHelper {
               pendingIter.remove();
             } else {
               LOG.warn("Attempt {}/{}: configs {} are not applied to {} yet, current values: {}. If this persists, check whether "
-                       + "these configs are being changed outside of Cruise Control.", attempt, _retries, entry.getValue(), cf,
+                       + "these configs are being changed outside of Cruise Control.", attempt, retries, entry.getValue(), cf,
                        currentValues(config, entry.getValue().keySet()));
             }
           } catch (ExecutionException | TimeoutException e) {
@@ -736,7 +775,7 @@ class ReplicationThrottleHelper {
         Thread.currentThread().interrupt();
         return false;
       }
-    }, RETRY_BACKOFF_SCALE_MS, RETRY_BACKOFF_BASE, _retries, MAX_RETRY_SLEEP_MS);
+    }, RETRY_BACKOFF_SCALE_MS, RETRY_BACKOFF_BASE, retries, MAX_RETRY_SLEEP_MS);
     // Verified, unless the verification ran out of attempts or was interrupted with resources still pending.
     return verified && !Thread.currentThread().isInterrupted() ? Collections.emptySet() : new HashSet<>(pendingByResource.keySet());
   }
@@ -804,8 +843,126 @@ class ReplicationThrottleHelper {
     return chunks;
   }
 
-  private boolean throttlingEnabled() {
+  boolean throttlingEnabled() {
     return _throttleRate != null;
+  }
+
+  /**
+   * @return A snapshot of the brokers whose throttle rate has been set by this helper and not yet removed.
+   */
+  synchronized Set<Integer> throttledBrokers() {
+    return new TreeSet<>(_throttledBrokers);
+  }
+
+  /**
+   * Not synchronized: the executor state reads it while setting, clearing or updating the throttles may hold the lock of this helper
+   * for as long as it takes to alter and verify the broker configs.
+   *
+   * @return The leader and follower throttle rates (bytes/sec) of the brokers whose throttle rate has been set by this helper and not
+   * yet removed, by broker id; empty if no broker is throttled.
+   */
+  SortedMap<Integer, ExecutorState.BrokerReplicationThrottle> throttleRateByBroker() {
+    SortedMap<Integer, ExecutorState.BrokerReplicationThrottle> throttleRateByBroker = new TreeMap<>();
+    for (int brokerId : _throttledBrokers) {
+      Long leaderThrottleRate = leaderThrottleRate(brokerId);
+      Long followerThrottleRate = followerThrottleRate(brokerId);
+      if (leaderThrottleRate != null && followerThrottleRate != null) {
+        throttleRateByBroker.put(brokerId, new ExecutorState.BrokerReplicationThrottle(leaderThrottleRate, followerThrottleRate));
+      }
+    }
+    return throttleRateByBroker;
+  }
+
+  /**
+   * @param brokerId Broker id.
+   * @return The leader throttle rate (bytes/sec) that is (or will be) set on the given broker, or {@code null} if throttling is disabled.
+   */
+  Long leaderThrottleRate(int brokerId) {
+    return _leaderThrottleRateByBroker.getOrDefault(brokerId, _throttleRate);
+  }
+
+  /**
+   * @param brokerId Broker id.
+   * @return The follower throttle rate (bytes/sec) that is (or will be) set on the given broker, or {@code null} if throttling is disabled.
+   */
+  Long followerThrottleRate(int brokerId) {
+    return _followerThrottleRateByBroker.getOrDefault(brokerId, _throttleRate);
+  }
+
+  /**
+   * Update the leader and follower throttle rates of the given broker -- see {@link #updateThrottleRates(Map, Map)}.
+   *
+   * @param brokerId Broker id.
+   * @param leaderThrottleRate The new leader throttle rate (bytes/sec).
+   * @param followerThrottleRate The new follower throttle rate (bytes/sec).
+   */
+  synchronized void updateThrottleRates(int brokerId, long leaderThrottleRate, long followerThrottleRate)
+      throws ExecutionException, InterruptedException, TimeoutException {
+    updateThrottleRates(Map.of(brokerId, leaderThrottleRate), Map.of(brokerId, followerThrottleRate));
+  }
+
+  /**
+   * Update the leader and follower throttle rates of the given brokers. The new rates are applied right away to the brokers that
+   * are currently throttled by this helper, in one batch (describe, alter, verify), with a small verification budget
+   * ({@link #THROTTLE_RATE_UPDATE_RETRIES}) because the caller holds the lock of this helper. The rates of the other brokers are
+   * applied once they participate in a subsequent batch of throttled replica movements -- i.e. the throttle is never set on a
+   * broker whose throttle has been removed.
+   *
+   * @param leaderThrottleRateByBroker The new leader throttle rate (bytes/sec) by broker.
+   * @param followerThrottleRateByBroker The new follower throttle rate (bytes/sec) by broker.
+   */
+  synchronized void updateThrottleRates(Map<Integer, Long> leaderThrottleRateByBroker, Map<Integer, Long> followerThrottleRateByBroker)
+      throws ExecutionException, InterruptedException, TimeoutException {
+    if (!throttlingEnabled()) {
+      throw new IllegalStateException("Cannot update throttle rates when throttling is disabled.");
+    }
+    _leaderThrottleRateByBroker.putAll(leaderThrottleRateByBroker);
+    _followerThrottleRateByBroker.putAll(followerThrottleRateByBroker);
+    Set<Integer> brokersToUpdate = new TreeSet<>(leaderThrottleRateByBroker.keySet());
+    brokersToUpdate.addAll(followerThrottleRateByBroker.keySet());
+    brokersToUpdate.retainAll(_throttledBrokers);
+    if (brokersToUpdate.isEmpty()) {
+      return;
+    }
+    List<ConfigResource> resources = brokersToUpdate.stream()
+        .map(brokerId -> new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(brokerId)))
+        .collect(Collectors.toList());
+    // A broker that cannot be described or updated (e.g. it died during the execution) is skipped, so it does not block the others.
+    Map<ConfigResource, KafkaFuture<Config>> configFutureByResource = describeConfigsInChunks(resources);
+    Map<ConfigResource, Collection<AlterConfigOp>> opsByResource = new HashMap<>();
+    for (ConfigResource resource : resources) {
+      Config brokerConfigs;
+      try {
+        brokerConfigs = configFutureByResource.get(resource).get(CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+      } catch (ExecutionException | TimeoutException e) {
+        LOG.warn("Skip updating the replication throttle of broker {}: failed to describe its configs.", resource.name(), e);
+        continue;
+      }
+      List<AlterConfigOp> ops = throttledRateOps(Integer.parseInt(resource.name()), brokerConfigs);
+      if (!ops.isEmpty()) {
+        opsByResource.put(resource, ops);
+      }
+    }
+    if (opsByResource.isEmpty()) {
+      return;
+    }
+    Map<ConfigResource, KafkaFuture<Void>> alterFutureByResource = new HashMap<>(opsByResource.size());
+    for (Map<ConfigResource, Collection<AlterConfigOp>> chunkOps : partitionOps(opsByResource)) {
+      alterFutureByResource.putAll(alterConfigs(chunkOps));
+    }
+    for (ConfigResource resource : new ArrayList<>(opsByResource.keySet())) {
+      try {
+        alterFutureByResource.get(resource).get(CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+      } catch (ExecutionException | TimeoutException e) {
+        LOG.warn("Failed to update the replication throttle of broker {}.", resource.name(), e);
+        opsByResource.remove(resource);
+      }
+    }
+    Set<ConfigResource> unverified = verifyBatchConfigs(opsByResource, Collections.emptyMap(), THROTTLE_RATE_UPDATE_RETRIES);
+    if (!unverified.isEmpty() && !Thread.currentThread().isInterrupted()) {
+      throw new IllegalStateException("The following replication throttle rate updates were not applied within the time limit: "
+                                      + unverified);
+    }
   }
 
   /**
