@@ -56,6 +56,7 @@ public final class PersistedExecutionStateSerde {
   static final String REPLICATION_THROTTLE = "replicationThrottle";
   static final String KAFKA_ASSIGNER_MODE = "kafkaAssignerMode";
   static final String SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT = "skipInterBrokerReplicaConcurrencyAdjustment";
+  static final String REPLICATION_THROTTLE_ADJUSTED = "replicationThrottleAdjusted";
   static final String PROPOSALS = "proposals";
   static final String TOPIC = "topic";
   static final String PARTITION = "partition";
@@ -131,6 +132,7 @@ public final class PersistedExecutionStateSerde {
     json.name(REPLICATION_THROTTLE).value(state.replicationThrottle());
     json.name(KAFKA_ASSIGNER_MODE).value(state.kafkaAssignerMode());
     json.name(SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).value(state.skipInterBrokerReplicaConcurrencyAdjustment());
+    json.name(REPLICATION_THROTTLE_ADJUSTED).value(state.replicationThrottleAdjusted());
     json.endObject();
 
     ReplicaPlacementFingerprint fingerprint = state.outsideExecutionFingerprint();
@@ -216,7 +218,8 @@ public final class PersistedExecutionStateSerde {
              .replicaMovementStrategy(optionalString(parameters, REPLICA_MOVEMENT_STRATEGY))
              .replicationThrottle(optionalLong(parameters, REPLICATION_THROTTLE))
              .kafkaAssignerMode(required(parameters, KAFKA_ASSIGNER_MODE).getAsBoolean())
-             .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean());
+             .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean())
+             .replicationThrottleAdjusted(optionalBoolean(parameters, REPLICATION_THROTTLE_ADJUSTED));
       // Fields added in version 2 are optional, so that a version 1 state can still be recovered (but not resumed).
       JsonElement cleanupOnly = optional(root, CLEANUP_ONLY);
       builder.cleanupOnly(cleanupOnly != null && cleanupOnly.getAsBoolean());
@@ -418,6 +421,11 @@ public final class PersistedExecutionStateSerde {
   private static Integer optionalInteger(JsonObject json, String name) {
     JsonElement element = optional(json, name);
     return element == null ? null : element.getAsInt();
+  }
+
+  private static boolean optionalBoolean(JsonObject json, String name) {
+    JsonElement element = optional(json, name);
+    return element != null && element.getAsBoolean();
   }
 
   private static Long optionalLong(JsonObject json, String name) {

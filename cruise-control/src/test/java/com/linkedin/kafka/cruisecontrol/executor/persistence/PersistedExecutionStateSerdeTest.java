@@ -62,6 +62,7 @@ public class PersistedExecutionStateSerdeTest {
         .replicaMovementStrategy("PostponeUrpReplicaMovementStrategy,BaseReplicaMovementStrategy")
         .replicationThrottle(1000000L)
         .skipInterBrokerReplicaConcurrencyAdjustment(true)
+        .replicationThrottleAdjusted(true)
         .cleanupOnly(true)
         .outsideExecutionFingerprint(new ReplicaPlacementFingerprint(-42L, 7, Map.of(0, 5, 1, 9)))
         .logDirFingerprintByBroker(Map.of(1, 123L, 2, -456L))
@@ -109,6 +110,7 @@ public class PersistedExecutionStateSerdeTest {
     assertEquals(expected.replicationThrottle(), actual.replicationThrottle());
     assertEquals(expected.kafkaAssignerMode(), actual.kafkaAssignerMode());
     assertEquals(expected.skipInterBrokerReplicaConcurrencyAdjustment(), actual.skipInterBrokerReplicaConcurrencyAdjustment());
+    assertEquals(expected.replicationThrottleAdjusted(), actual.replicationThrottleAdjusted());
     assertEquals(expected.cleanupOnly(), actual.cleanupOnly());
     assertEquals(expected.outsideExecutionFingerprint(), actual.outsideExecutionFingerprint());
     assertEquals(expected.logDirFingerprintByBroker(), actual.logDirFingerprintByBroker());

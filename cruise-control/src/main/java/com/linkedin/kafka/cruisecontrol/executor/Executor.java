@@ -778,17 +778,24 @@ public class Executor {
    * is not alive, or a removal that does not read back -- is handed over to the record of the throttles that executions set but could
    * not remove yet, which is persisted and swept until they are removed, also across restarts.
    *
+   * <p>If the concurrency adjuster managed the replication throttle of the interrupted execution (PR #13), its brokers carry
+   * per-broker rates that no single value matches: their rates are removed whatever their value -- under decision D2 the adjuster
+   * overrides an operator's rate anyway.</p>
+   *
    * @param uuid UUID of the interrupted execution.
    * @param throttleRate The replication throttle of the interrupted execution.
+   * @param throttleAdjusted {@code true} if the concurrency adjuster managed the replication throttle of the interrupted execution.
    * @param interruptedThrottles The throttles of the interrupted execution to remove.
    * @return Descriptions of the throttled rates that were kept (set by someone else) or retained (to be removed later).
    */
-  private List<String> removeThrottlesOfInterruptedExecution(String uuid, Long throttleRate,
+  private List<String> removeThrottlesOfInterruptedExecution(String uuid, Long throttleRate, boolean throttleAdjusted,
                                                              ReplicationThrottleHelper.AppliedThrottles interruptedThrottles)
       throws InterruptedException {
-    ReplicationThrottleHelper throttleHelper =
-        ReplicationThrottleHelper.forInterruptedExecution(_adminClient, throttleRate, INTERRUPTED_EXECUTION_CONFIG_CHANGE_RETRIES,
-                                                          interruptedThrottles);
+    ReplicationThrottleHelper throttleHelper = throttleAdjusted
+        ? new ReplicationThrottleHelper(_adminClient, null, INTERRUPTED_EXECUTION_CONFIG_CHANGE_RETRIES, Collections.emptySet(),
+                                        interruptedThrottles)
+        : ReplicationThrottleHelper.forInterruptedExecution(_adminClient, throttleRate, INTERRUPTED_EXECUTION_CONFIG_CHANGE_RETRIES,
+                                                            interruptedThrottles);
     try {
       throttleHelper.clearLeftoverThrottles(ExecutionUtils.partitionsBeingReassigned(_adminClient));
     } catch (ExecutionException | TimeoutException | RuntimeException e) {
@@ -1761,6 +1768,7 @@ public class Executor {
         .executionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs)
         .replicaMovementStrategy(replicaMovementStrategy == null ? null : replicaMovementStrategy.name())
         .replicationThrottle(replicationThrottle)
+        .replicationThrottleAdjusted(_replicationThrottleAdjusterEnabled)
         .kafkaAssignerMode(isKafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(skipInterBrokerReplicaConcurrencyAdjustment)
         .build();
@@ -1898,6 +1906,7 @@ public class Executor {
         .executionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs)
         .replicaMovementStrategy(replicaMovementStrategy == null ? null : replicaMovementStrategy.name())
         .replicationThrottle(replicationThrottle)
+        .replicationThrottleAdjusted(_replicationThrottleAdjusterEnabled)
         .kafkaAssignerMode(false)
         .skipInterBrokerReplicaConcurrencyAdjustment(true)
         .build();
@@ -2739,7 +2748,8 @@ public class Executor {
             ExecutionRecoveryUtils.logDirFingerprintByBroker(logDirsByBroker, persistedLogDirFingerprints.keySet(), partitionsOfExecution)));
       }
     }
-    if (state.replicationThrottle() != null) {
+    // The concurrency adjuster sets per-broker rates that no single value matches, and overrides an operator's rate anyway (D2).
+    if (state.replicationThrottle() != null && !state.replicationThrottleAdjusted()) {
       Set<Integer> brokers = new TreeSet<>();
       recoveryPlan.actionByTask().forEach((task, action) -> {
         if (task.type() == INTER_BROKER_REPLICA_ACTION
@@ -2791,8 +2801,9 @@ public class Executor {
     List<ExecutionProposal> finishedProposals = interBrokerReplicaProposals(state, partitionsToResume);
     List<ExecutionProposal> adoptedProposals = recoveryPlan.adoptedInterBrokerPartitions().stream().map(tp -> state.proposals().get(tp))
                                                            .collect(Collectors.toList());
-    if (state.replicationThrottle() != null && !finishedProposals.isEmpty()) {
-      _proposalExecutor.execute(new FinishedMovementThrottleCleanupRunnable(state.uuid(), state.replicationThrottle(), finishedProposals,
+    if (isReplicationThrottled(state) && !finishedProposals.isEmpty()) {
+      _proposalExecutor.execute(new FinishedMovementThrottleCleanupRunnable(state.uuid(), state.replicationThrottle(),
+                                                                           state.replicationThrottleAdjusted(), finishedProposals,
                                                                            adoptedProposals));
     }
 
@@ -2940,6 +2951,15 @@ public class Executor {
   }
 
   /**
+   * @param state Persisted state of an execution.
+   * @return {@code true} if the execution throttled its inter-broker replica movements: with a replication throttle, or through
+   * the concurrency adjuster (which throttles an execution without one, see PR #13).
+   */
+  private static boolean isReplicationThrottled(PersistedExecutionState state) {
+    return state.replicationThrottle() != null || state.replicationThrottleAdjusted();
+  }
+
+  /**
    * @param proposals Inter-broker replica proposals.
    * @return The given proposals that move data -- i.e. whose replicas are throttled (see {@link ReplicationThrottleHelper#hasDataMovement}).
    */
@@ -2960,15 +2980,18 @@ public class Executor {
   private class FinishedMovementThrottleCleanupRunnable implements Runnable {
     private final String _interruptedExecutionUuid;
     private final Long _replicationThrottle;
+    private final boolean _replicationThrottleAdjusted;
     private final List<ExecutionProposal> _finishedProposals;
     private final List<ExecutionProposal> _adoptedProposals;
 
     FinishedMovementThrottleCleanupRunnable(String interruptedExecutionUuid,
                                             Long replicationThrottle,
+                                            boolean replicationThrottleAdjusted,
                                             List<ExecutionProposal> finishedProposals,
                                             List<ExecutionProposal> adoptedProposals) {
       _interruptedExecutionUuid = interruptedExecutionUuid;
       _replicationThrottle = replicationThrottle;
+      _replicationThrottleAdjusted = replicationThrottleAdjusted;
       _finishedProposals = finishedProposals;
       _adoptedProposals = adoptedProposals;
     }
@@ -2986,7 +3009,7 @@ public class Executor {
         ReplicationThrottleHelper.AppliedThrottles finishedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
         finishedThrottles.add(brokers, finishedProposals);
         List<String> keptThrottles = removeThrottlesOfInterruptedExecution(_interruptedExecutionUuid, _replicationThrottle,
-                                                                           finishedThrottles);
+                                                                           _replicationThrottleAdjusted, finishedThrottles);
         if (!keptThrottles.isEmpty()) {
           LOG.info("Interrupted execution {}: Throttled rates that were not removed: {}", _interruptedExecutionUuid, keptThrottles);
         }
@@ -3036,7 +3059,7 @@ public class Executor {
           _recovery.setStatus(InterruptedExecutionRecovery.Status.RETAINED_FOR_RESTART);
           return;
         }
-        if (_state.replicationThrottle() != null && !proposals.isEmpty()) {
+        if (isReplicationThrottled(_state) && !proposals.isEmpty()) {
           _recovery.setStatus(InterruptedExecutionRecovery.Status.REMOVING_THROTTLES);
           LOG.info("Interrupted execution {}: Removing leftover replication throttles of {} partition(s).", uuid, proposals.size());
           // What cannot be removed now (e.g. of a broker that is not alive) is retained and removed later, also across restarts.
@@ -3044,7 +3067,8 @@ public class Executor {
           List<ExecutionProposal> throttledProposals = dataMovementProposals(proposals);
           ReplicationThrottleHelper.AppliedThrottles interruptedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
           interruptedThrottles.add(participatingBrokers(throttledProposals), throttledProposals);
-          _recovery.setKeptThrottles(removeThrottlesOfInterruptedExecution(uuid, _state.replicationThrottle(), interruptedThrottles));
+          _recovery.setKeptThrottles(removeThrottlesOfInterruptedExecution(uuid, _state.replicationThrottle(),
+                                                                           _state.replicationThrottleAdjusted(), interruptedThrottles));
         }
         deletePersistedExecutionState(uuid);
         _recovery.setStatus(InterruptedExecutionRecovery.Status.CLEANED_UP);

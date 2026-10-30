@@ -734,6 +734,28 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
   }
 
   @Test
+  public void testRecoveryRemovesThrottlesSetByTheConcurrencyAdjuster() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    // An execution without a replication throttle, which the concurrency adjuster throttled with per-broker rates (PR #13).
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, 100_000L);
+    throttleHelper.setThrottles(List.of(proposal));
+    throttleHelper.updateThrottleRates(1, 200_000L, 300_000L);
+    assertTrue(hasThrottles());
+    _store.save(interruptedExecutionState(null, List.of(proposal)).toBuilder().replicationThrottleAdjusted(true).build());
+
+    AnomalyDetectorManager anomalyDetectorManager = mockAnomalyDetectorManager(null);
+    Executor executor = newExecutor(false, null, new RecordingNotifier(), anomalyDetectorManager);
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitUntilTrue(() -> _store.state() == null, "The interrupted execution is not cleaned up", WAIT_TIME_MS, 100L);
+    waitForExecutionToFinish(executor);
+    // No replication throttle was persisted, but the execution was throttled: its rates -- whatever their per-broker values -- and
+    // its throttled replicas are removed.
+    assertFalse(hasThrottles());
+    EasyMock.verify(anomalyDetectorManager);
+  }
+
+  @Test
   public void testResumeIsRefusedIfReplicasOutsideTheExecutionMoved() throws Exception {
     createTopic(Map.of(0, List.of(0, 1), 1, List.of(2, 1)));
     ExecutionProposal proposal = proposal(TP0, List.of(0, 1), List.of(0, 2));
