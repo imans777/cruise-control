@@ -341,6 +341,35 @@ public class LoadMonitorTest {
                                                 new ModelCompletenessRequirements(2, 1.0, false), true, false, new OperationProgress()));
   }
 
+  // Test build cluster model for JBOD broker, where a disk in the capacity config is not among the Kafka logdirs.
+  @Test
+  public void testJbodClusterModelIgnoresDisksMissingFromKafkaLogDirs()
+      throws NotEnoughValidWindowsException, TimeoutException, BrokerCapacityResolutionException {
+    TestContext context = prepareContext(NUM_WINDOWS, "testCapacityConfigJBODWithExcludedDisk.json");
+    LoadMonitor loadMonitor = context.loadmonitor();
+    KafkaPartitionMetricSampleAggregator aggregator = context.aggregator();
+
+    CruiseControlUnitTestUtils.populateSampleAggregator(3, 4, aggregator, PE_T0P0, 0, WINDOW_MS, METRIC_DEF);
+    CruiseControlUnitTestUtils.populateSampleAggregator(3, 4, aggregator, PE_T0P1, 0, WINDOW_MS, METRIC_DEF);
+    CruiseControlUnitTestUtils.populateSampleAggregator(3, 4, aggregator, PE_T1P0, 0, WINDOW_MS, METRIC_DEF);
+    CruiseControlUnitTestUtils.populateSampleAggregator(3, 4, aggregator, PE_T1P1, 0, WINDOW_MS, METRIC_DEF);
+
+    ClusterModel clusterModel = loadMonitor.clusterModel(DEFAULT_START_TIME_FOR_CLUSTER_MODEL, Long.MAX_VALUE,
+                                                         new ModelCompletenessRequirements(2, 1.0, false),
+                                                         true,
+                                                         true,
+                                                         new OperationProgress());
+
+    // Disk /tmp/kafka-logs-3 of broker 1 is in the capacity config, but not in the Kafka logdirs; hence it is ignored.
+    assertNull(clusterModel.broker(1).disk("/tmp/kafka-logs-3"));
+    assertEquals(2, clusterModel.broker(1).disks().size());
+    assertEquals(350000 + 550000, clusterModel.broker(1).capacityFor(Resource.DISK), 0.0);
+    assertEquals(2000000 + 350000 + 550000, clusterModel.capacityFor(Resource.DISK), 0.0);
+    assertEquals(4, clusterModel.broker(0).disk("/tmp/kafka-logs").replicas().size());
+    assertEquals(3, clusterModel.broker(1).disk("/tmp/kafka-logs-1").replicas().size());
+    assertEquals(1, clusterModel.broker(1).disk("/tmp/kafka-logs-2").replicas().size());
+  }
+
   // Not enough snapshot windows and some partitions are missing from all snapshot windows.
   @Test
   public void testClusterModelWithInvalidPartitionAndInsufficientSnapshotWindows()
