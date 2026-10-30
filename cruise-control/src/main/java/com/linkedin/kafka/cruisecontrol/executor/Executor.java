@@ -1019,6 +1019,7 @@ public class Executor {
         int leader = movementLeader(entry.getValue().proposal(), cluster);
         List<Integer> outOfSyncReplicas = outOfSyncReplicasByPartition.get(tp);
         MovementProgress progress = _movementProgressByPartition.computeIfAbsent(tp, k -> new MovementProgress());
+        progress.track(entry.getValue().executionId());
         progress.retainReplicas(outOfSyncReplicas);
         Map<TopicPartition, Long> leaderSizes = replicaSizeByBroker.get(leader);
         Long leaderSize = leaderSizes == null ? null : leaderSizes.get(tp);

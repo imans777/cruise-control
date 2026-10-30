@@ -908,6 +908,45 @@ public class ConcurrencyAdjusterTest {
   }
 
   @Test
+  public void testMovementProgressOfConsecutiveSteps() {
+    long mb = MB_IN_BYTES;
+    int window = ExecutionUtils.REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS;
+    // Step 1 of a partition (OneReplicaPerPartitionMovementStrategy) catches up: its lag shrinks to 0.
+    ExecutionUtils.MovementProgress progress = new ExecutionUtils.MovementProgress();
+    progress.track(1L);
+    for (int run = 0; run < window; run++) {
+      progress.recordLag(1, run * 10_000L, (window - 1 - run) * 20 * mb, 0L);
+    }
+    assertFalse(progress.stalled(1));
+    // Step 2 starts with an empty new replica: its lag is large but shrinking, which is progress, not a stall.
+    progress.track(2L);
+    assertEquals(-1L, progress.lag(1));
+    for (int run = 0; run < window; run++) {
+      progress.recordLag(1, (window + run) * 10_000L, (60 - 10 * run) * mb, 0L);
+    }
+    assertFalse(progress.stalled(1));
+    // Without track(2L), step 2 would mix with step 1's lags (about 0), and look stalled.
+    ExecutionUtils.MovementProgress untracked = new ExecutionUtils.MovementProgress();
+    for (int run = 0; run < window; run++) {
+      untracked.recordLag(1, run * 10_000L, run < window / 2 ? 0L : (60 - 10 * run) * mb, 0L);
+    }
+    assertTrue(untracked.stalled(1));
+
+    // An escalated need is kept for the next step of the same partition, while its progress is measured afresh.
+    progress = new ExecutionUtils.MovementProgress();
+    progress.track(3L);
+    assertEquals(2 * mb, progress.escalate(mb));
+    progress.recordLag(1, 0L, 40 * mb, 0L);
+    progress.track(4L);
+    assertEquals(2 * mb, progress.escalatedNeed());
+    assertEquals(-1L, progress.lag(1));
+    // The same task again changes nothing.
+    progress.recordLag(1, 0L, 40 * mb, 0L);
+    progress.track(4L);
+    assertEquals(40 * mb, progress.lag(1));
+  }
+
+  @Test
   public void testReplicationThrottleUse() {
     double mb = MB_IN_BYTES;
     ExecutionUtils.ReplicationThrottleUse use = new ExecutionUtils.ReplicationThrottleUse();

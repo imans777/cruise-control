@@ -441,7 +441,26 @@ public final class ExecutionUtils {
     // The samples {time (ms), lag (bytes), size (bytes)} of each out-of-sync replica by broker, oldest first.
     private final Map<Integer, ArrayDeque<long[]>> _lagSamplesByBroker = new HashMap<>();
     private long _escalatedNeed = 0L;
+    // The execution id of the task whose movement is tracked: with OneReplicaPerPartitionMovementStrategy, the steps of a partition
+    // are separate tasks.
+    private long _executionId = -1L;
     private boolean _stallReported = false;
+
+    /**
+     * Track the movement of the given task. A new task of the same partition (the next step of
+     * {@link com.linkedin.kafka.cruisecontrol.executor.strategy.OneReplicaPerPartitionMovementStrategy}) starts with an empty new
+     * replica, so its progress is measured afresh -- otherwise it inherits the lag of the step before it (about 0), looks like it
+     * makes no progress, and is escalated spuriously. The escalated need of the partition is kept.
+     *
+     * @param executionId The execution id of the task.
+     */
+    void track(long executionId) {
+      if (executionId != _executionId) {
+        _executionId = executionId;
+        _lagSamplesByBroker.clear();
+        _stallReported = false;
+      }
+    }
 
     /**
      * Forget the replicas that are no longer out of sync -- e.g. a kept replica that is back in the ISR.
