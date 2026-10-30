@@ -66,7 +66,7 @@ The goals in Cruise Control are pluggable with different priorities.
     * after optimization, checks that each topic whose replicas are all bound lives inside one broker set, and that each bound replica lives in its own broker set;
     * leaves replicas that are not bound to any broker set alone: they are moved only if they are offline (to any alive broker), are never vetoed and are never checked.
 
-  Topics in `excluded_topics`, `topics.excluded.from.partition.movement` or `topics.with.min.leaders.per.broker` are neither moved nor checked by this goal. Put this goal first in `default.goals` and `hard.goals`, so that later goals are vetoed instead of undone.
+  Topics in `excluded_topics`, `topics.excluded.from.partition.movement` or `topics.with.min.leaders.per.broker`, or not matching `included_topics`, are neither moved nor checked by this goal. `included_topics` overrides the config exclusion: a topic in `topics.excluded.from.partition.movement` (e.g. one that fits in no broker set) that `included_topics` names is checked again, and with the Hash or Original policy the run then fails with "not brokerSet-aware". Put this goal first in `default.goals` and `hard.goals`, so that later goals are vetoed instead of undone.
 
 ## Anomaly Notifier
 The anomaly notifier is a communication channel between Cruise Control and users.
