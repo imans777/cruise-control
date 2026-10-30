@@ -100,13 +100,31 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
   }
 
   /**
-   * Initialize the utilization thresholds of each broker around the average utilization of its disks.
-   * To avoid churns, we add a balance margin to the user specified rebalance threshold. e.g. when user sets the
-   * threshold to be resourceBalancePercentage, we use (resourceBalancePercentage-1)*balanceMargin instead.
-   * As the inter-broker resource distribution goals do, the threshold is (1) multiplied by the goal violation distribution
-   * threshold multiplier if the optimization is triggered by goal violation, and (2) more lenient for brokers whose average
-   * disk utilization is not above the low utilization threshold. See
-   * {@link GoalUtils#computeResourceUtilizationBalanceThreshold(double, Resource, BalancingConstraint, boolean, double, boolean)}.
+   * The upper or lower bound of the balance range of the disks of a broker: to avoid churns, we add a balance margin to the user
+   * specified threshold, i.e. for a threshold of intraBrokerDiskBalancePercentage, we use
+   * (intraBrokerDiskBalancePercentage-1)*balanceMargin around the average utilization of the disks of the broker (see
+   * {@link #balancePercentageWithMargin(BalancingConstraint)}). As the inter-broker resource distribution goals do, the threshold
+   * is (1) multiplied by the goal violation distribution threshold multiplier if the optimization is triggered by goal violation,
+   * and (2) more lenient for brokers whose average disk utilization is not above the low utilization threshold. See
+   * {@link GoalUtils#computeResourceUtilizationBalanceThreshold(double, Resource, double, BalancingConstraint, boolean, double, boolean)}.
+   *
+   * @param averageDiskUtilization The average utilization percentage of the disks of the broker.
+   * @param balancingConstraint Balancing constraint.
+   * @param isTriggeredByGoalViolation {@code true} if the optimization is triggered by goal violation.
+   * @param isLowerThreshold {@code true} for the lower bound, {@code false} for the upper bound.
+   * @return The bound of the utilization percentage of a disk of the broker.
+   */
+  public static double balanceThreshold(double averageDiskUtilization,
+                                        BalancingConstraint balancingConstraint,
+                                        boolean isTriggeredByGoalViolation,
+                                        boolean isLowerThreshold) {
+    return computeResourceUtilizationBalanceThreshold(averageDiskUtilization, RESOURCE, balancingConstraint.intraBrokerDiskBalancePercentage(),
+                                                      balancingConstraint, isTriggeredByGoalViolation, BALANCE_MARGIN, isLowerThreshold);
+  }
+
+  /**
+   * Initialize the utilization thresholds of each broker around the average utilization of its disks (see
+   * {@link #balanceThreshold(double, BalancingConstraint, boolean, boolean)}).
    * @param clusterModel The state of the cluster.
    * @param optimizationOptions Options to take into account during optimization.
    */
@@ -122,10 +140,10 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
     boolean isTriggeredByGoalViolation = optimizationOptions.isTriggeredByGoalViolation();
     for (Broker broker : brokersToBalance(clusterModel)) {
       double averageDiskUtilization = averageDiskUtilizationPercentage(broker);
-      _balanceUpperThresholdByBroker.put(broker, computeResourceUtilizationBalanceThreshold(
-          averageDiskUtilization, RESOURCE, _balancingConstraint, isTriggeredByGoalViolation, BALANCE_MARGIN, false));
-      _balanceLowerThresholdByBroker.put(broker, computeResourceUtilizationBalanceThreshold(
-          averageDiskUtilization, RESOURCE, _balancingConstraint, isTriggeredByGoalViolation, BALANCE_MARGIN, true));
+      _balanceUpperThresholdByBroker.put(broker, balanceThreshold(averageDiskUtilization, _balancingConstraint,
+                                                                  isTriggeredByGoalViolation, false));
+      _balanceLowerThresholdByBroker.put(broker, balanceThreshold(averageDiskUtilization, _balancingConstraint,
+                                                                  isTriggeredByGoalViolation, true));
     }
 
     // Sort all the replicas for each disk based on disk utilization.
