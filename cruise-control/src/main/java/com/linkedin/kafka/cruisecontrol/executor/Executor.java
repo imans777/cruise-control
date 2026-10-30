@@ -1173,6 +1173,12 @@ public class Executor {
               LOG.info("Replication throttle adjustment was disabled; the replication throttles are left unchanged.");
               return;
             }
+            if (_replicationThrottleHelper != throttleHelper) {
+              // The inter-broker replica movements ended meanwhile, and the end-of-execution sweep may have removed their throttles
+              // already: setting them again here would leave throttles behind that nothing records.
+              LOG.info("The inter-broker replica movements ended while adjusting; the replication throttles are left unchanged.");
+              return;
+            }
             throttleHelper.updateThrottleRates(newLeaderThrottleByBroker, newFollowerThrottleByBroker);
           }
         }
@@ -2272,7 +2278,12 @@ public class Executor {
       try {
         interBrokerMoveReplicas(throttleHelper);
       } finally {
-        _replicationThrottleHelper = null;
+        // Under the lock of the helper, which the concurrency adjuster holds while it updates throttle rates: once the helper is
+        // unset, no update is in flight, and the adjuster re-checks it before updating -- so it cannot set a throttle again that
+        // the end-of-execution sweep (another helper, see #removeLeftoverReplicationThrottles) removes or has removed.
+        synchronized (throttleHelper) {
+          _replicationThrottleHelper = null;
+        }
       }
     }
 
