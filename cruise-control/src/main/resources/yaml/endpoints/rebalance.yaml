@@ -12,6 +12,7 @@ RebalanceEndpoint:
       - name: goals
         in: query
         description: List of goals used to generate proposal, the default goals will be used if this parameter is not specified.
+          With rebalance_disk, only intra-broker goals (intra.broker.goals) are accepted, and intra.broker.goals is the default.
         schema:
           type: array
           items:
@@ -83,6 +84,14 @@ RebalanceEndpoint:
           type: string # topics regex
           default: null
           example: "__CruiseControl.%2A"
+      - name: included_topics
+        in: query
+        description: Specify the only topics whose partitions are allowed to move. Topics not matching this regex are excluded from
+          replica and leadership movement. Mutually exclusive with excluded_topics.
+        schema:
+          type: string # topics regex
+          default: null
+          example: "topic1|topic2"
       - name: use_ready_default_goals
         in: query
         description: Whether to only use ready goals to generate proposal.
@@ -129,11 +138,13 @@ RebalanceEndpoint:
           default: false
       - name: destination_broker_ids
         in: query
-        description: Specify the destination brokers for partitions to move replicas to.
+        description: Specify the destination brokers for partitions to move replicas to. If rebalance_disk is true,
+          limits the disk rebalance to the specified brokers.
         schema:
           type: array
           items:
-            type: string
+            type: integer
+            format: int32
           example: [1,2,3]
       - name: kafka_assigner
         in: query
@@ -143,7 +154,14 @@ RebalanceEndpoint:
           default: false
       - name: rebalance_disk
         in: query
-        description: Whether to balance load between disks within brokers (requires JBOD Kafka deployment).
+        description: Whether to balance load between disks within brokers with the requested intra-broker goals, or intra.broker.goals (requires JBOD Kafka deployment).
+        schema:
+          type: boolean
+          default: false
+      - name: rebalance_disk_broker_by_broker
+        in: query
+        description: Whether to execute the disk rebalance one broker at a time, i.e. finish moving replicas between the
+          disks of a broker before starting on the next broker (requires rebalance_disk to be true).
         schema:
           type: boolean
           default: false
@@ -157,6 +175,13 @@ RebalanceEndpoint:
       - name: replication_throttle
         in: query
         description: Upper bound on the bandwidth in bytes per second used to move replicas.
+        schema:
+          type: integer
+          format: int64
+          minimum: 1
+      - name: log_dir_throttle
+        in: query
+        description: Upper bound on the bandwidth in bytes per second used to move replicas between the disks (logdirs) of a broker.
         schema:
           type: integer
           format: int64

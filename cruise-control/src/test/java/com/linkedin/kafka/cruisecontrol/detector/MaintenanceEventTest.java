@@ -141,6 +141,7 @@ public class MaintenanceEventTest {
                                              EasyMock.eq(null),
                                              EasyMock.eq(false),
                                              EasyMock.anyString(),
+                                             EasyMock.eq(false),
                                              EasyMock.eq(false));
     EasyMock.expect(_optimizerResult.getProposalSummaryForJson()).andReturn(Collections.emptyMap());
     EasyMock.expect(_optimizerResult.statsByGoalName()).andReturn(new LinkedHashMap<>(0)).times(2);
@@ -285,6 +286,7 @@ public class MaintenanceEventTest {
                                              EasyMock.eq(null),
                                              EasyMock.eq(false),
                                              EasyMock.anyString(),
+                                             EasyMock.eq(false),
                                              EasyMock.eq(false));
     EasyMock.expect(_optimizerResult.getProposalSummaryForJson()).andReturn(Collections.emptyMap());
     EasyMock.expect(_optimizerResult.statsByGoalName()).andReturn(new LinkedHashMap<>(0)).times(2);
@@ -372,8 +374,10 @@ public class MaintenanceEventTest {
                                              EasyMock.eq(SELF_HEALING_EXECUTION_PROGRESS_CHECK_INTERVAL_MS),
                                              EasyMock.eq(SELF_HEALING_REPLICA_MOVEMENT_STRATEGY),
                                              EasyMock.eq(null),
+                                             EasyMock.eq(null),
                                              EasyMock.eq(false),
                                              EasyMock.anyString(),
+                                             EasyMock.eq(false),
                                              EasyMock.eq(false));
     EasyMock.expect(_optimizerResult.getProposalSummaryForJson()).andReturn(Collections.emptyMap());
     EasyMock.expect(_optimizerResult.statsByGoalName()).andReturn(new LinkedHashMap<>(0)).times(2);
@@ -519,7 +523,8 @@ public class MaintenanceEventTest {
                                              EasyMock.eq(null),
                                              EasyMock.eq(false),
                                              EasyMock.anyString(),
-                                             EasyMock.eq(true));
+                                             EasyMock.eq(true),
+                                             EasyMock.eq(false));
     EasyMock.expect(_optimizerResult.getProposalSummaryForJson()).andReturn(Collections.emptyMap());
     EasyMock.expect(_optimizerResult.statsByGoalName()).andReturn(new LinkedHashMap<>(0)).times(2);
     EasyMock.expect(_optimizerResult.brokerStatsAfterOptimization()).andReturn(_brokerStats).times(2);

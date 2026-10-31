@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 import static com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig.HARD_GOALS_CONFIG;
@@ -244,6 +245,8 @@ public final class GoalUtils {
    * Get eligible replicas among the given candidate replicas for the proposed swap operation of the source replica.
    * Invariant-1: No replica is eligible if the candidate broker is excluded for leadership and the source replica is the leader.
    * Invariant-2: No replica is eligible if the candidate broker is excluded for replica move.
+   * Invariant-3: If the user explicitly specified the eligible destination brokers, no replica is eligible unless both the
+   * source and the candidate brokers are among the requested destination brokers -- i.e. a swap relocates replicas to both.
    *
    * @param clusterModel The state of the cluster.
    * @param sourceReplica Source replica for intended swap operation.
@@ -269,6 +272,14 @@ public final class GoalUtils {
         && !sourceReplica.isOriginalOffline()) {
       return Collections.emptySortedSet();
     }
+    // A swap relocates replicas to both the source and the destination brokers. Hence, if the user explicitly requested
+    // destination brokers, both brokers must be among them.
+    Broker sourceBroker = sourceReplica.broker();
+    Set<Integer> requestedDestinationBrokerIds = optimizationOptions.requestedDestinationBrokerIds();
+    if (!requestedDestinationBrokerIds.isEmpty()
+        && (!requestedDestinationBrokerIds.contains(sourceBroker.id()) || !requestedDestinationBrokerIds.contains(destinationBroker.id()))) {
+      return Collections.emptySortedSet();
+    }
 
     // CASE#1: All candidate replicas are eligible if any of the following is true:
     // (1) there are no new brokers in the cluster,
@@ -276,8 +287,6 @@ public final class GoalUtils {
     // (3) the intended swap is between replicas of new brokers,
     // (4) the intended swap is between a replica on a new broker, which originally was in the destination broker, and
     // any replica in the destination broker.
-    Broker sourceBroker = sourceReplica.broker();
-
     if (clusterModel.newBrokers().isEmpty()
         || (sourceBroker.isNew() && (destinationBroker.isNew() || sourceReplica.originalBroker() == destinationBroker))) {
       return candidateReplicas;
@@ -379,6 +388,36 @@ public final class GoalUtils {
   }
 
   /**
+   * Get the estimated disk I/O rate of the given replica. The inbound network rate approximates disk writes, which apply
+   * to both leader and follower replicas. The outbound network rate approximates disk reads, which apply to leader
+   * replicas only (i.e. follower replicas have no outbound network load in the cluster model).
+   *
+   * @param replica Replica to query.
+   * @param readWeight Weight of the outbound network rate (i.e. reads) in the estimation.
+   * @return Estimated disk I/O rate of the replica, i.e. inbound network rate + readWeight * outbound network rate.
+   */
+  public static double replicaDiskIORate(Replica replica, double readWeight) {
+    return replica.load().expectedUtilizationFor(Resource.NW_IN)
+           + readWeight * replica.load().expectedUtilizationFor(Resource.NW_OUT);
+  }
+
+  /**
+   * Get the estimated disk I/O rate of the given disk, i.e. the sum of estimated disk I/O rates of its replicas.
+   *
+   * @param disk Disk to query.
+   * @param readWeight Weight of the outbound network rate (i.e. reads) in the estimation.
+   * @return Estimated disk I/O rate of the disk.
+   * @see #replicaDiskIORate(Replica, double)
+   */
+  public static double diskIORate(Disk disk, double readWeight) {
+    double diskIORate = 0;
+    for (Replica replica : disk.replicas()) {
+      diskIORate += replicaDiskIORate(replica, readWeight);
+    }
+    return diskIORate;
+  }
+
+  /**
    * Sort replicas in ascending order of resource quantity present in the broker that they reside in terms of the
    * requested resource.
    *
@@ -442,6 +481,38 @@ public final class GoalUtils {
     offlineReplicas.retainAll(broker.currentOfflineReplicas());
 
     return offlineReplicas;
+  }
+
+  /**
+   * Get the brokers whose disks a request may change, which the disk balance stats are computed over: if every goal of the
+   * request is an intra-broker goal (rebalance_disk, remove_disks), the intra-broker goals balance only the requested brokers
+   * ({@link OptimizationOptions#requestedDestinationBrokerIds()}), so these are returned. Otherwise, an empty set, i.e. all alive
+   * brokers.
+   *
+   * @param goals The goals of the request.
+   * @param optimizationOptions The optimization options of the request.
+   * @return The ids of the brokers to compute the disk balance stats over, or an empty set for all alive brokers.
+   */
+  public static Set<Integer> diskStatsBrokerIds(Collection<Goal> goals, OptimizationOptions optimizationOptions) {
+    return !goals.isEmpty() && goals.stream().allMatch(Goal::isIntraBrokerGoal) ? optimizationOptions.requestedDestinationBrokerIds()
+                                                                                : Collections.emptySet();
+  }
+
+  /**
+   * Get the alive brokers to be balanced by an intra-broker goal. If the given requested broker ids is non-empty (e.g. via
+   * {@link OptimizationOptions#requestedDestinationBrokerIds()}), only the alive brokers among them are returned, which
+   * limits the intra-broker (i.e. disk) rebalance to the requested brokers.
+   *
+   * @param clusterModel The state of the cluster.
+   * @param requestedBrokerIds Ids of brokers to limit the intra-broker rebalance to (if empty, all alive brokers are returned).
+   * @return Alive brokers to be balanced by an intra-broker goal.
+   */
+  public static SortedSet<Broker> aliveBrokersForIntraBrokerGoal(ClusterModel clusterModel, Set<Integer> requestedBrokerIds) {
+    SortedSet<Broker> aliveBrokers = new TreeSet<>(clusterModel.aliveBrokers());
+    if (!requestedBrokerIds.isEmpty()) {
+      aliveBrokers.removeIf(broker -> !requestedBrokerIds.contains(broker.id()));
+    }
+    return aliveBrokers;
   }
 
   /**
@@ -532,6 +603,31 @@ public final class GoalUtils {
                                                                   boolean isTriggeredByGoalViolation,
                                                                   double balanceMargin,
                                                                   boolean isLowerThreshold) {
+    return computeResourceUtilizationBalanceThreshold(avgUtilizationPercentage, resource, balancingConstraint.resourceBalancePercentage(resource),
+                                                      balancingConstraint, isTriggeredByGoalViolation, balanceMargin, isLowerThreshold);
+  }
+
+  /**
+   * Same as {@link #computeResourceUtilizationBalanceThreshold(double, Resource, BalancingConstraint, boolean, double, boolean)},
+   * with the given balance percentage instead of the one of the resource -- e.g. the intra-broker disk balance percentage of
+   * {@link IntraBrokerDiskUsageDistributionGoal}. The goal violation multiplier and the low utilization leniency still apply.
+   *
+   * @param avgUtilizationPercentage Average utilization.
+   * @param resource {@link Resource}, for its low utilization threshold.
+   * @param balancePercentage The balance percentage, e.g. 1.10.
+   * @param balancingConstraint Balancing constraint
+   * @param isTriggeredByGoalViolation whether this computation is triggered by goal violation.
+   * @param balanceMargin resource distribution goal balance margin
+   * @param isLowerThreshold whether this method calculates resource utilization threshold upper bound or lower bound
+   * @return The utilization upper/lower threshold in percent for the given type of resource
+   */
+  public static double computeResourceUtilizationBalanceThreshold(double avgUtilizationPercentage,
+                                                                  Resource resource,
+                                                                  double balancePercentage,
+                                                                  BalancingConstraint balancingConstraint,
+                                                                  boolean isTriggeredByGoalViolation,
+                                                                  double balanceMargin,
+                                                                  boolean isLowerThreshold) {
 
     if (balanceMargin >= 1) {
       throw new IllegalArgumentException("Balance margin must be less than 1.0. Got: " + balanceMargin);
@@ -543,12 +639,12 @@ public final class GoalUtils {
         return 0.0;
       }
       double balancePercentageWithMargin =
-          balancePercentageWithMargin(isTriggeredByGoalViolation, balancingConstraint, resource, balanceMargin);
+          balancePercentageWithMargin(isTriggeredByGoalViolation, balancingConstraint, balancePercentage, balanceMargin);
       return avgUtilizationPercentage * Math.max(0, (1 - balancePercentageWithMargin));
 
     } else {
       double balancePercentageWithMargin =
-          balancePercentageWithMargin(isTriggeredByGoalViolation, balancingConstraint, resource, balanceMargin);
+          balancePercentageWithMargin(isTriggeredByGoalViolation, balancingConstraint, balancePercentage, balanceMargin);
       double resourceBalanceThreshold = avgUtilizationPercentage * (1 + balancePercentageWithMargin);
       if (isLowUtilization) {
         return Math.max(resourceBalanceThreshold, balancingConstraint.lowUtilizationThreshold(resource) * balanceMargin);
@@ -563,21 +659,21 @@ public final class GoalUtils {
    *
    * @param isTriggeredByGoalViolation whether this computation is triggered by goal violation.
    * @param balancingConstraint Balancing constraint
-   * @param resource Resource for which the balance percentage with margin gets calculated
+   * @param balancePercentage The user specified balance percentage
    * @param balanceMargin resource distribution goal balance margin
    * @return The rebalance threshold with a margin.
    */
   private static double balancePercentageWithMargin(boolean isTriggeredByGoalViolation,
                                                     BalancingConstraint balancingConstraint,
-                                                    Resource resource,
+                                                    double balancePercentage,
                                                     double balanceMargin) {
 
-    double balancePercentage = balancingConstraint.resourceBalancePercentage(resource);
+    double effectiveBalancePercentage = balancePercentage;
     if (isTriggeredByGoalViolation) {
       // Make the balance threshold percentage more lenient in this case
-      balancePercentage *= balancingConstraint.goalViolationDistributionThresholdMultiplier();
+      effectiveBalancePercentage *= balancingConstraint.goalViolationDistributionThresholdMultiplier();
     }
-    return (balancePercentage - 1) * balanceMargin;
+    return (effectiveBalancePercentage - 1) * balanceMargin;
   }
 
   /**

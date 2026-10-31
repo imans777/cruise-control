@@ -28,13 +28,14 @@ import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.SortedSet;
-import java.util.TreeSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.ACCEPT;
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.REPLICA_REJECT;
+import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.aliveBrokersForIntraBrokerGoal;
 import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.averageDiskUtilizationPercentage;
+import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.computeResourceUtilizationBalanceThreshold;
 import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.diskUtilizationPercentage;
 import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.replicaSortName;
 import static java.lang.Math.abs;
@@ -52,6 +53,8 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
   private static final Resource RESOURCE = Resource.DISK;
   private final Map<Broker, Double> _balanceUpperThresholdByBroker;
   private final Map<Broker, Double> _balanceLowerThresholdByBroker;
+  // Ids of brokers to limit the rebalance to (if empty, all alive brokers are rebalanced).
+  private Set<Integer> _requestedBrokerIds = Collections.emptySet();
 
   /**
    * Constructor for Resource Distribution Goal.
@@ -76,20 +79,71 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
     return false;
   }
 
+  @Override
+  public boolean isIntraBrokerGoal() {
+    return true;
+  }
+
   /**
-   * Initialize the utilization thresholds.
    * To avoid churns, we add a balance margin to the user specified rebalance threshold. e.g. when user sets the
-   * threshold to be resourceBalancePercentage, we use (resourceBalancePercentage-1)*balanceMargin instead.
+   * threshold to be intraBrokerDiskBalancePercentage, we use (intraBrokerDiskBalancePercentage-1)*balanceMargin instead. The
+   * utilization percentage of a disk is balanced if it is within this fraction of the utilization percentage of its broker -- e.g.
+   * 0.09 for a threshold of 1.10, i.e. between 0.91 and 1.09 times the utilization percentage of its broker. The threshold is
+   * {@link com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig#INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG}, which
+   * defaults to {@link com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig#DISK_BALANCE_THRESHOLD_CONFIG}.
+   *
+   * @param balancingConstraint Balancing constraint.
+   * @return The relative distance from the utilization percentage of its broker within which a disk is balanced.
+   */
+  public static double balancePercentageWithMargin(BalancingConstraint balancingConstraint) {
+    return (balancingConstraint.intraBrokerDiskBalancePercentage() - 1) * BALANCE_MARGIN;
+  }
+
+  /**
+   * The upper or lower bound of the balance range of the disks of a broker: to avoid churns, we add a balance margin to the user
+   * specified threshold, i.e. for a threshold of intraBrokerDiskBalancePercentage, we use
+   * (intraBrokerDiskBalancePercentage-1)*balanceMargin around the average utilization of the disks of the broker (see
+   * {@link #balancePercentageWithMargin(BalancingConstraint)}). As the inter-broker resource distribution goals do, the threshold
+   * is (1) multiplied by the goal violation distribution threshold multiplier if the optimization is triggered by goal violation,
+   * and (2) more lenient for brokers whose average disk utilization is not above the low utilization threshold. See
+   * {@link GoalUtils#computeResourceUtilizationBalanceThreshold(double, Resource, double, BalancingConstraint, boolean, double, boolean)}.
+   *
+   * @param averageDiskUtilization The average utilization percentage of the disks of the broker.
+   * @param balancingConstraint Balancing constraint.
+   * @param isTriggeredByGoalViolation {@code true} if the optimization is triggered by goal violation.
+   * @param isLowerThreshold {@code true} for the lower bound, {@code false} for the upper bound.
+   * @return The bound of the utilization percentage of a disk of the broker.
+   */
+  public static double balanceThreshold(double averageDiskUtilization,
+                                        BalancingConstraint balancingConstraint,
+                                        boolean isTriggeredByGoalViolation,
+                                        boolean isLowerThreshold) {
+    return computeResourceUtilizationBalanceThreshold(averageDiskUtilization, RESOURCE, balancingConstraint.intraBrokerDiskBalancePercentage(),
+                                                      balancingConstraint, isTriggeredByGoalViolation, BALANCE_MARGIN, isLowerThreshold);
+  }
+
+  /**
+   * Initialize the utilization thresholds of each broker around the average utilization of its disks (see
+   * {@link #balanceThreshold(double, BalancingConstraint, boolean, boolean)}).
    * @param clusterModel The state of the cluster.
    * @param optimizationOptions Options to take into account during optimization.
    */
   @Override
   protected void initGoalState(ClusterModel clusterModel, OptimizationOptions optimizationOptions) {
-    double balancePercentageWithMargin = (_balancingConstraint.resourceBalancePercentage(RESOURCE) - 1) * BALANCE_MARGIN;
+    _requestedBrokerIds = optimizationOptions.requestedDestinationBrokerIds();
+    // Thresholds are per-request: a request limited to some brokers must not inherit entries left by an earlier,
+    // wider one, because Broker#equals is on the broker id and stale keys would match. actionAcceptance() relies on
+    // the absence of a broker from these maps to mean that the broker is not balanced by this goal. The same goal instance
+    // may also be optimized multiple times (e.g. by the goal violation detector).
+    _balanceUpperThresholdByBroker.clear();
+    _balanceLowerThresholdByBroker.clear();
+    boolean isTriggeredByGoalViolation = optimizationOptions.isTriggeredByGoalViolation();
     for (Broker broker : brokersToBalance(clusterModel)) {
       double averageDiskUtilization = averageDiskUtilizationPercentage(broker);
-      _balanceUpperThresholdByBroker.put(broker, averageDiskUtilization * (1 + balancePercentageWithMargin));
-      _balanceLowerThresholdByBroker.put(broker, averageDiskUtilization * Math.max(0, (1 - balancePercentageWithMargin)));
+      _balanceUpperThresholdByBroker.put(broker, balanceThreshold(averageDiskUtilization, _balancingConstraint,
+                                                                  isTriggeredByGoalViolation, false));
+      _balanceLowerThresholdByBroker.put(broker, balanceThreshold(averageDiskUtilization, _balancingConstraint,
+                                                                  isTriggeredByGoalViolation, true));
     }
 
     // Sort all the replicas for each disk based on disk utilization.
@@ -149,6 +203,7 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
    * Get brokers in the cluster so that the rebalance process will go over to apply balancing actions to replicas
    * they contain.
    * Note this goal moves replica between disks within broker, therefore it is unable to heal dead broker.
+   * If {@link OptimizationOptions#requestedDestinationBrokerIds()} is non-empty, only the requested alive brokers are balanced.
    *
    * @param clusterModel The state of the cluster.
    * @return A collection of brokers that the rebalance process will go over to apply balancing actions to replicas
@@ -156,7 +211,7 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
    */
   @Override
   protected SortedSet<Broker> brokersToBalance(ClusterModel clusterModel) {
-    return new TreeSet<>(clusterModel.aliveBrokers());
+    return aliveBrokersForIntraBrokerGoal(clusterModel, _requestedBrokerIds);
   }
 
   /**
@@ -164,7 +219,7 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
    * following:
    * (1) If source and destination disks were within the limit before the action, the corresponding limits cannot be
    * violated after the action.
-   * (2) The action cannot increase the utilization difference between disks.
+   * (2) Otherwise, the action cannot increase the utilization difference between disks.
    *
    * @param action Action to be checked for acceptance.
    * @param clusterModel The state of the cluster.
@@ -177,20 +232,38 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
     Broker broker = clusterModel.broker(action.sourceBrokerId());
     Disk sourceDisk = broker.disk(action.sourceBrokerLogdir());
     Disk destinationDisk = broker.disk(action.destinationBrokerLogdir());
-    if (sourceUtilizationDelta == 0) {
-      // No change in terms of load.
+    if (sourceUtilizationDelta == 0 || !_balanceUpperThresholdByBroker.containsKey(broker)) {
+      // No change in terms of load, or the broker is not balanced by this goal.
       return ACCEPT;
     }
     if (isChangeViolatingLimit(sourceUtilizationDelta, sourceDisk, destinationDisk)) {
       return REPLICA_REJECT;
     }
+    if (areBothDisksWithinLimit(sourceUtilizationDelta, sourceDisk, destinationDisk)) {
+      // Both disks remain within the limit after the action.
+      return ACCEPT;
+    }
     return isGettingMoreBalanced(sourceDisk, destinationDisk, sourceUtilizationDelta) ? ACCEPT : REPLICA_REJECT;
   }
 
+  /**
+   * An action is self-satisfied if it changes the load of disks without violating the limits and makes the disks more balanced.
+   *
+   * @param clusterModel The state of the cluster.
+   * @param action Action containing information about potential modification to the given cluster model.
+   * @return {@code true} if the action is self-satisfied, {@code false} otherwise.
+   */
   @Override
   protected boolean selfSatisfied(ClusterModel clusterModel, BalancingAction action) {
     double sourceUtilizationDelta = sourceUtilizationDelta(action, clusterModel);
-    return sourceUtilizationDelta != 0 && actionAcceptance(action, clusterModel) == ACCEPT;
+    if (sourceUtilizationDelta == 0) {
+      return false;
+    }
+    Broker broker = clusterModel.broker(action.sourceBrokerId());
+    Disk sourceDisk = broker.disk(action.sourceBrokerLogdir());
+    Disk destinationDisk = broker.disk(action.destinationBrokerLogdir());
+    return !isChangeViolatingLimit(sourceUtilizationDelta, sourceDisk, destinationDisk)
+           && isGettingMoreBalanced(sourceDisk, destinationDisk, sourceUtilizationDelta);
   }
 
   private double sourceUtilizationDelta(BalancingAction action, ClusterModel clusterModel) {
@@ -214,19 +287,42 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
     };
   }
 
-  private boolean isChangeViolatingLimit(double sourceUtilizationDelta, Disk sourceDisk, Disk destinationDisk) {
+  /**
+   * @param sourceUtilizationDelta The change of utilization on the source disk.
+   * @param sourceDisk Source disk.
+   * @return The utilization that can be added to (if the delta is positive) or removed from (otherwise) the source
+   * disk without violating the corresponding limit, or a negative value if the source disk already violates that limit.
+   */
+  private double sourceDiskAllowance(double sourceUtilizationDelta, Disk sourceDisk) {
     double balanceUpperThreshold = _balanceUpperThresholdByBroker.get(sourceDisk.broker());
     double balanceLowerThreshold = _balanceLowerThresholdByBroker.get(sourceDisk.broker());
-    double sourceDiskAllowance = sourceUtilizationDelta > 0 ? sourceDisk.capacity() * balanceUpperThreshold - sourceDisk.utilization()
-                                                            : sourceDisk.utilization() - sourceDisk.capacity() * balanceLowerThreshold;
-    double destinationDiskAllowance =
-        sourceUtilizationDelta > 0 ? destinationDisk.utilization() - destinationDisk.capacity() * balanceLowerThreshold
-                                   : destinationDisk.capacity() * balanceUpperThreshold - destinationDisk.utilization();
-    if ((sourceDiskAllowance >= 0 && sourceDiskAllowance < abs(sourceUtilizationDelta))
-        || (destinationDiskAllowance >= 0 && destinationDiskAllowance < abs(sourceUtilizationDelta))) {
-      return true;
-    }
-    return false;
+    return sourceUtilizationDelta > 0 ? sourceDisk.capacity() * balanceUpperThreshold - sourceDisk.utilization()
+                                      : sourceDisk.utilization() - sourceDisk.capacity() * balanceLowerThreshold;
+  }
+
+  /**
+   * @param sourceUtilizationDelta The change of utilization on the source disk.
+   * @param destinationDisk Destination disk.
+   * @return The utilization that can be removed from (if the delta is positive) or added to (otherwise) the destination
+   * disk without violating the corresponding limit, or a negative value if the destination disk already violates that limit.
+   */
+  private double destinationDiskAllowance(double sourceUtilizationDelta, Disk destinationDisk) {
+    double balanceUpperThreshold = _balanceUpperThresholdByBroker.get(destinationDisk.broker());
+    double balanceLowerThreshold = _balanceLowerThresholdByBroker.get(destinationDisk.broker());
+    return sourceUtilizationDelta > 0 ? destinationDisk.utilization() - destinationDisk.capacity() * balanceLowerThreshold
+                                      : destinationDisk.capacity() * balanceUpperThreshold - destinationDisk.utilization();
+  }
+
+  private boolean isChangeViolatingLimit(double sourceUtilizationDelta, Disk sourceDisk, Disk destinationDisk) {
+    double sourceDiskAllowance = sourceDiskAllowance(sourceUtilizationDelta, sourceDisk);
+    double destinationDiskAllowance = destinationDiskAllowance(sourceUtilizationDelta, destinationDisk);
+    return (sourceDiskAllowance >= 0 && sourceDiskAllowance < abs(sourceUtilizationDelta))
+           || (destinationDiskAllowance >= 0 && destinationDiskAllowance < abs(sourceUtilizationDelta));
+  }
+
+  private boolean areBothDisksWithinLimit(double sourceUtilizationDelta, Disk sourceDisk, Disk destinationDisk) {
+    return sourceDiskAllowance(sourceUtilizationDelta, sourceDisk) >= 0
+           && destinationDiskAllowance(sourceUtilizationDelta, destinationDisk) >= 0;
   }
 
   private boolean isGettingMoreBalanced(Disk sourceDisk, Disk destinationDisk, double sourceUtilizationDelta) {
@@ -384,17 +480,24 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
                                          OptimizationOptions optimizationOptions) {
     long swapStartTimeMs = System.currentTimeMillis();
     Broker broker = disk.broker();
+    double balanceUpperThreshold = _balanceUpperThresholdByBroker.get(broker);
 
     PriorityQueue<Disk> candidateDiskPQ = new PriorityQueue<>(Comparator.comparingDouble(GoalUtils::diskUtilizationPercentage));
     for (Disk candidateDisk : broker.disks()) {
       // Get candidate disk on broker to try to swap replica with -- sorted in the order of trial (ascending load).
-      if (candidateDisk.isAlive() && diskUtilizationPercentage(candidateDisk) < _balanceUpperThresholdByBroker.get(broker)) {
+      if (candidateDisk.isAlive() && diskUtilizationPercentage(candidateDisk) < balanceUpperThreshold) {
         candidateDiskPQ.add(candidateDisk);
       }
     }
 
     while (!candidateDiskPQ.isEmpty()) {
+      if (remainingPerDiskSwapTimeMs(swapStartTimeMs) <= 0) {
+        LOG.debug("Swap load out timeout for disk {}.", disk.logDir());
+        break;
+      }
+
       Disk candidateDisk = candidateDiskPQ.poll();
+      boolean swapped = false;
       for (Replica sourceReplica : disk.trackedSortedReplicas(replicaSortName(this, true, false)).sortedReplicas(false)) {
         // Try swapping the source with the candidate replicas. Get the swapped in replica if successful, null otherwise.
         Replica swappedIn = maybeSwapReplicaBetweenDisks(clusterModel,
@@ -403,18 +506,22 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
                                                                       .sortedReplicas(false),
                                                          optimizedGoals);
         if (swappedIn != null) {
-          if (diskUtilizationPercentage(disk) < _balanceUpperThresholdByBroker.get(broker)) {
-            // Successfully balanced this broker by swapping in.
+          if (diskUtilizationPercentage(disk) < balanceUpperThreshold) {
+            // Successfully balanced this disk by swapping out.
             return;
           }
+          swapped = true;
           break;
+        } else if (remainingPerDiskSwapTimeMs(swapStartTimeMs) <= 0) {
+          LOG.debug("Swap load out timeout for source replica {} on disk {}.", sourceReplica, disk.logDir());
+          return;
         }
       }
-      if (remainingPerDiskSwapTimeMs(swapStartTimeMs) <= 0) {
-        LOG.debug("Swap load out timeout for disk {}.", disk.logDir());
-        break;
-      }
-      if (diskUtilizationPercentage(candidateDisk) < _balanceUpperThresholdByBroker.get(broker)) {
+
+      // The candidate disk is re-enqueued only if a swap with it succeeded -- i.e. the disks have changed and there might be
+      // other potential candidate replicas on it to swap with. If no swap was possible, retrying the same pair of disks in
+      // the same state would yield the same result, and would only burn CPU until the per disk swap timeout expires.
+      if (swapped && diskUtilizationPercentage(candidateDisk) < balanceUpperThreshold) {
         candidateDiskPQ.add(candidateDisk);
       }
     }
@@ -434,18 +541,25 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
                                         OptimizationOptions optimizationOptions) {
     long swapStartTimeMs = System.currentTimeMillis();
     Broker broker = disk.broker();
+    double balanceLowerThreshold = _balanceLowerThresholdByBroker.get(broker);
 
     PriorityQueue<Disk> candidateDiskPQ = new PriorityQueue<>(
         (d1, d2) -> Double.compare(diskUtilizationPercentage(d2), diskUtilizationPercentage(d1)));
     for (Disk candidateDisk : broker.disks()) {
       // Get candidate disk on broker to try to swap replica with -- sorted in the order of trial (descending load).
-      if (candidateDisk.isAlive() && diskUtilizationPercentage(candidateDisk) > _balanceLowerThresholdByBroker.get(broker)) {
+      if (candidateDisk.isAlive() && diskUtilizationPercentage(candidateDisk) > balanceLowerThreshold) {
         candidateDiskPQ.add(candidateDisk);
       }
     }
 
     while (!candidateDiskPQ.isEmpty()) {
+      if (remainingPerDiskSwapTimeMs(swapStartTimeMs) <= 0) {
+        LOG.debug("Swap load in timeout for disk {}.", disk.logDir());
+        break;
+      }
+
       Disk candidateDisk = candidateDiskPQ.poll();
+      boolean swapped = false;
       for (Replica sourceReplica : disk.trackedSortedReplicas(replicaSortName(this, false, false)).sortedReplicas(false)) {
         // Try swapping the source with the candidate replicas. Get the swapped in replica if successful, null otherwise.
         Replica swappedIn = maybeSwapReplicaBetweenDisks(clusterModel,
@@ -454,18 +568,22 @@ public class IntraBrokerDiskUsageDistributionGoal extends AbstractGoal {
                                                                       .sortedReplicas(false),
                                                          optimizedGoals);
         if (swappedIn != null) {
-          if (diskUtilizationPercentage(disk) > _balanceLowerThresholdByBroker.get(broker)) {
-            // Successfully balanced this broker by swapping in.
+          if (diskUtilizationPercentage(disk) > balanceLowerThreshold) {
+            // Successfully balanced this disk by swapping in.
             return;
           }
+          swapped = true;
           break;
+        } else if (remainingPerDiskSwapTimeMs(swapStartTimeMs) <= 0) {
+          LOG.debug("Swap load in timeout for source replica {} on disk {}.", sourceReplica, disk.logDir());
+          return;
         }
       }
-      if (remainingPerDiskSwapTimeMs(swapStartTimeMs) <= 0) {
-        LOG.debug("Swap load out timeout for disk {}.", disk.logDir());
-        break;
-      }
-      if (diskUtilizationPercentage(candidateDisk) > _balanceLowerThresholdByBroker.get(broker)) {
+
+      // The candidate disk is re-enqueued only if a swap with it succeeded -- i.e. the disks have changed and there might be
+      // other potential candidate replicas on it to swap with. If no swap was possible, retrying the same pair of disks in
+      // the same state would yield the same result, and would only burn CPU until the per disk swap timeout expires.
+      if (swapped && diskUtilizationPercentage(candidateDisk) > balanceLowerThreshold) {
         candidateDiskPQ.add(candidateDisk);
       }
     }

@@ -20,6 +20,7 @@ ExecutorState:
         - STOPPING_EXECUTION
         - INITIALIZING_PROPOSAL_EXECUTION
         - GENERATING_PROPOSALS_FOR_EXECUTION
+        - RECOVERING_INTERRUPTED_EXECUTION
     recentlyDemotedBrokers:
       type: array
       items:
@@ -30,6 +31,23 @@ ExecutorState:
       items:
         type: integer
         format: int32
+    # the throttles in force for the ongoing execution, absent when it is not throttled
+    ongoingReplicationThrottle:
+      type: integer
+      format: int64
+      description: Replication throttle (bytes/second) in force for the ongoing inter-broker replica movements -- the base rate, which the concurrency adjuster may override per broker (see ongoingReplicationThrottleByBroker).
+    ongoingReplicationThrottleByBroker:
+      type: object
+      description: Leader and follower replication throttles (bytes/second) in force on each broker (by broker id) throttled by the ongoing inter-broker replica movements, as the concurrency adjuster may set them per broker.
+      additionalProperties:
+        $ref: '#/BrokerReplicationThrottle'
+    ongoingLogDirThrottleByBroker:
+      type: object
+      description: Log dir throttle (bytes/second) in force on each broker with ongoing intra-broker replica movements.
+      additionalProperties:
+        type: string
+    recovery:
+      $ref: '#/InterruptedExecutionRecovery'
     # leadership information
     numTotalLeadershipMovements:
       type: integer
@@ -116,6 +134,15 @@ ExecutorState:
     totalDataToMove:
       type: integer
       format: int64
+    inProgressMovedData:
+      type: integer
+      format: int64
+    inProgressDataMovementRate:
+      type: number
+      format: double
+    estimatedRemainingTimeMs:
+      type: integer
+      format: int64
     maximumConcurrentPartitionMovementsPerBroker:
       type: integer
       format: int32
@@ -178,6 +205,15 @@ ExecutorState:
     totalIntraBrokerDataToMove:
       type: integer
       format: int64
+    inProgressIntraBrokerMovedData:
+      type: integer
+      format: int64
+    inProgressIntraBrokerDataMovementRate:
+      type: number
+      format: double
+    estimatedIntraBrokerRemainingTimeMs:
+      type: integer
+      format: int64
     maximumConcurrentIntraBrokerPartitionMovementsPerBroker:
       type: integer
       format: int32
@@ -189,6 +225,21 @@ ExecutorState:
       format: int32
     error:
       type: string
+
+BrokerReplicationThrottle:
+  type: object
+  required:
+    - leader
+    - follower
+  properties:
+    leader:
+      type: integer
+      format: int64
+      description: Leader replication throttle (bytes/second).
+    follower:
+      type: integer
+      format: int64
+      description: Follower replication throttle (bytes/second).
 
 ExecutionTask:
   type: object
@@ -222,3 +273,75 @@ ExecutionTask:
     brokerId:
       type: integer
       format: int32
+    movedDataInMB:
+      type: integer
+      format: int64
+    totalDataToMoveInMB:
+      type: integer
+      format: int64
+    dataMovementRateInMBPerSec:
+      type: number
+      format: double
+    dataMovementProgressUpdateTimeMs:
+      type: integer
+      format: int64
+InterruptedExecutionRecovery:
+  type: object
+  description: What happened to the latest execution that was interrupted by a Cruise Control restart -- reported until the next execution starts.
+  required:
+    - uuid
+    - reason
+    - triggeredByUserRequest
+    - startTime
+    - interruptedTime
+    - resumeCount
+    - status
+  properties:
+    uuid:
+      type: string
+    reason:
+      type: string
+    triggeredByUserRequest:
+      type: boolean
+    startTime:
+      type: string
+    interruptedTime:
+      type: string
+    resumeCount:
+      type: integer
+      format: int32
+    status:
+      type: string
+      enum:
+        - DECIDING
+        - RESUMED
+        - WAITING_FOR_IN_FLIGHT_MOVEMENTS
+        - WAITING_FOR_KAFKA
+        - CANCELLING_IN_FLIGHT_MOVEMENTS
+        - REMOVING_THROTTLES
+        - CLEANED_UP
+        - FAILED
+        - RETAINED_FOR_RESTART
+    reasonNotResumed:
+      type: string
+    divergences:
+      type: array
+      items:
+        type: string
+    tasksByRecoveryAction:
+      type: object
+      additionalProperties:
+        type: integer
+        format: int32
+    inFlightPartitionMovements:
+      type: array
+      items:
+        type: string
+    cleanupDeadline:
+      type: string
+    keptThrottles:
+      type: array
+      items:
+        type: string
+    error:
+      type: string

@@ -4,28 +4,41 @@
 
 package com.linkedin.kafka.cruisecontrol.executor;
 
+import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUnitTestUtils;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
+import java.lang.reflect.Constructor;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.stream.Collectors;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult;
 import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.TopicPartitionReplica;
 import org.apache.kafka.common.utils.Time;
+import org.easymock.EasyMock;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.ReplicaLogDirInfo;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertTrue;
 
 
 public class ExecutionTaskManagerTest {
@@ -36,6 +49,7 @@ public class ExecutionTaskManagerTest {
             ConcurrencyType.LEADERSHIP_BROKER, 100, ConcurrencyType.INTRA_BROKER_REPLICA, 2);
   }
   private static ExecutionTaskManager taskManager;
+  private static MetricRegistry metricRegistry;
 
   private Cluster generateExpectedCluster(ExecutionProposal proposal) {
     List<Node> expectedReplicas = new ArrayList<>(proposal.oldReplicas().size());
@@ -65,7 +79,8 @@ public class ExecutionTaskManagerTest {
                    Integer.toString(MOCK_DEFAULT_CONCURRENCY.get(ConcurrencyType.LEADERSHIP_BROKER)));
     properties.put(ExecutorConfig.NUM_CONCURRENT_INTRA_BROKER_PARTITION_MOVEMENTS_CONFIG,
                    Integer.toString(MOCK_DEFAULT_CONCURRENCY.get(ConcurrencyType.INTRA_BROKER_REPLICA)));
-    taskManager = new ExecutionTaskManager(null, new MetricRegistry(), Time.SYSTEM,
+    metricRegistry = new MetricRegistry();
+    taskManager = new ExecutionTaskManager(null, metricRegistry, Time.SYSTEM,
                                            new KafkaCruiseControlConfig(properties));
   }
 
@@ -121,6 +136,245 @@ public class ExecutionTaskManagerTest {
     }
     assertEquals(MOCK_DEFAULT_CONCURRENCY.get(ConcurrencyType.LEADERSHIP_CLUSTER).intValue(),
         taskManager.getExecutionConcurrencyManager().getExecutionClusterLeadershipConcurrency());
+  }
+
+  @Test
+  public void testGetIntraBrokerReplicaMovementTasksInParallel() throws Exception {
+    ExecutionTaskManager intraBrokerTaskManager = intraBrokerTaskManagerWithTwoMovementsOnBrokers0And1();
+    // All brokers execute intra-broker replica movements in parallel.
+    List<ExecutionTask> tasks = intraBrokerTaskManager.getIntraBrokerReplicaMovementTasks();
+    assertEquals(Set.of(0, 1), brokerIds(tasks));
+    assertEquals(4, tasks.size());
+  }
+
+  @Test
+  public void testGetIntraBrokerReplicaMovementTasksBrokerByBroker() throws Exception {
+    ExecutionTaskManager intraBrokerTaskManager = intraBrokerTaskManagerWithTwoMovementsOnBrokers0And1();
+    intraBrokerTaskManager.setIntraBrokerMovementsBrokerByBroker(true);
+
+    // Only broker 0 executes intra-broker replica movements -- up to its concurrency limit.
+    List<ExecutionTask> broker0Tasks = intraBrokerTaskManager.getIntraBrokerReplicaMovementTasks();
+    assertEquals(Collections.singleton(0), brokerIds(broker0Tasks));
+    assertEquals(2, broker0Tasks.size());
+    intraBrokerTaskManager.markTasksInProgress(broker0Tasks);
+
+    // Broker 1 does not start while broker 0 has in-progress intra-broker replica movements.
+    assertTrue(intraBrokerTaskManager.getIntraBrokerReplicaMovementTasks().isEmpty());
+    intraBrokerTaskManager.markTaskDone(broker0Tasks.get(0));
+    assertTrue(intraBrokerTaskManager.getIntraBrokerReplicaMovementTasks().isEmpty());
+    intraBrokerTaskManager.markTaskDone(broker0Tasks.get(1));
+
+    // Broker 1 starts once all intra-broker replica movements of broker 0 are finished.
+    List<ExecutionTask> broker1Tasks = intraBrokerTaskManager.getIntraBrokerReplicaMovementTasks();
+    assertEquals(Collections.singleton(1), brokerIds(broker1Tasks));
+    assertEquals(2, broker1Tasks.size());
+    intraBrokerTaskManager.markTasksInProgress(broker1Tasks);
+    broker1Tasks.forEach(intraBrokerTaskManager::markTaskDone);
+    assertTrue(intraBrokerTaskManager.getIntraBrokerReplicaMovementTasks().isEmpty());
+    assertEquals(0, intraBrokerTaskManager.numRemainingIntraBrokerPartitionMovements());
+
+    // Clearing the task manager resets the broker by broker execution.
+    intraBrokerTaskManager.clear();
+    addIntraBrokerProposalsOnBrokers0And1(intraBrokerTaskManager);
+    assertEquals(Set.of(0, 1), brokerIds(intraBrokerTaskManager.getIntraBrokerReplicaMovementTasks()));
+  }
+
+  private static Set<Integer> brokerIds(List<ExecutionTask> tasks) {
+    return tasks.stream().map(ExecutionTask::brokerId).collect(Collectors.toSet());
+  }
+
+  /**
+   * @return An execution task manager with two intra-broker replica movements on each of brokers 0 and 1, where replicas
+   * currently reside on logdir "d0" and are to be moved to logdir "d1".
+   */
+  private ExecutionTaskManager intraBrokerTaskManagerWithTwoMovementsOnBrokers0And1() throws Exception {
+    List<TopicPartition> partitions = Arrays.asList(new TopicPartition("topic", 0), new TopicPartition("topic", 1));
+    // Mock admin client to report that all replicas currently reside on logdir "d0".
+    Constructor<DescribeReplicaLogDirsResult> resultConstructor = DescribeReplicaLogDirsResult.class.getDeclaredConstructor(Map.class);
+    resultConstructor.setAccessible(true);
+    Constructor<ReplicaLogDirInfo> infoConstructor =
+        ReplicaLogDirInfo.class.getDeclaredConstructor(String.class, long.class, String.class, long.class);
+    infoConstructor.setAccessible(true);
+    Map<TopicPartitionReplica, KafkaFuture<ReplicaLogDirInfo>> futureByReplica = new HashMap<>();
+    for (TopicPartition tp : partitions) {
+      for (int brokerId : Arrays.asList(0, 1)) {
+        futureByReplica.put(new TopicPartitionReplica(tp.topic(), tp.partition(), brokerId),
+                            KafkaFuture.completedFuture(infoConstructor.newInstance("d0", 0L, null, -1L)));
+      }
+    }
+    Admin mockAdminClient = EasyMock.mock(Admin.class);
+    EasyMock.expect(mockAdminClient.describeReplicaLogDirs(EasyMock.anyObject()))
+            .andReturn(resultConstructor.newInstance(futureByReplica)).anyTimes();
+    EasyMock.replay(mockAdminClient);
+
+    Properties properties = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    properties.put(ExecutorConfig.NUM_CONCURRENT_INTRA_BROKER_PARTITION_MOVEMENTS_CONFIG,
+                   Integer.toString(MOCK_DEFAULT_CONCURRENCY.get(ConcurrencyType.INTRA_BROKER_REPLICA)));
+    ExecutionTaskManager intraBrokerTaskManager = new ExecutionTaskManager(mockAdminClient, new MetricRegistry(), Time.SYSTEM,
+                                                                           new KafkaCruiseControlConfig(properties));
+    addIntraBrokerProposalsOnBrokers0And1(intraBrokerTaskManager);
+    return intraBrokerTaskManager;
+  }
+
+  private static void addIntraBrokerProposalsOnBrokers0And1(ExecutionTaskManager intraBrokerTaskManager) {
+    ReplicaPlacementInfo r0d0 = new ReplicaPlacementInfo(0, "d0");
+    ReplicaPlacementInfo r0d1 = new ReplicaPlacementInfo(0, "d1");
+    ReplicaPlacementInfo r1d0 = new ReplicaPlacementInfo(1, "d0");
+    ReplicaPlacementInfo r1d1 = new ReplicaPlacementInfo(1, "d1");
+    List<ExecutionProposal> proposals = new ArrayList<>();
+    for (int partition = 0; partition < 2; partition++) {
+      proposals.add(new ExecutionProposal(new TopicPartition("topic", partition), 10, r0d0,
+                                          Arrays.asList(r0d0, r1d0), Arrays.asList(r0d1, r1d1)));
+    }
+    Cluster emptyCluster = new Cluster(null, Collections.emptyList(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
+    intraBrokerTaskManager.setExecutionModeForTaskTracker(false);
+    intraBrokerTaskManager.addExecutionProposals(proposals, Collections.emptySet(), new StrategyOptions.Builder(emptyCluster).build(), null);
+    intraBrokerTaskManager.getExecutionConcurrencyManager().initialize(Set.of(0, 1), null, null, null, null);
+  }
+
+  @Test
+  public void testInProgressDataMovementProgress() {
+    ReplicaPlacementInfo r0 = new ReplicaPlacementInfo(0);
+    ReplicaPlacementInfo r1 = new ReplicaPlacementInfo(1);
+    ReplicaPlacementInfo r2 = new ReplicaPlacementInfo(2);
+    ExecutionProposal proposal = new ExecutionProposal(new TopicPartition("topic", 0), 10, r2, Arrays.asList(r0, r2), Arrays.asList(r2, r1));
+    StrategyOptions strategyOptions = new StrategyOptions.Builder(generateExpectedCluster(proposal)).build();
+    taskManager.clear();
+    taskManager.addExecutionProposals(Collections.singletonList(proposal), Collections.emptySet(), strategyOptions, null);
+    List<ExecutionTask> tasks = taskManager.getInterBrokerReplicaMovementTasks();
+    assertEquals(1, tasks.size());
+    ExecutionTask task = tasks.get(0);
+    taskManager.markTasksInProgress(tasks);
+    assertEquals(0, taskManager.getExecutionTasksSummary(Collections.emptySet()).inProgressInterBrokerMovedDataInMB());
+
+    Meter dataMovementRateMeter = metricRegistry.meter("Executor." + ExecutionTaskTracker.METER_PARTITION_DATA_MOVEMENT_RATE);
+    long initialMeteredDataMovementInMB = dataMovementRateMeter.getCount();
+    task.updateDataMovementProgress(3 * ExecutionTask.BYTES_IN_MB, 12 * ExecutionTask.BYTES_IN_MB, 0L);
+    // The data movement rate meter is marked as data is moved, rather than when the partition movement finishes.
+    taskManager.markInProgressDataMovement();
+    assertEquals(3L, dataMovementRateMeter.getCount() - initialMeteredDataMovementInMB);
+    taskManager.markInProgressDataMovement();
+    assertEquals(3L, dataMovementRateMeter.getCount() - initialMeteredDataMovementInMB);
+    ExecutionTaskTracker.ExecutionTasksSummary executionTasksSummary = taskManager.getExecutionTasksSummary(Collections.emptySet());
+    assertEquals(3, executionTasksSummary.inProgressInterBrokerMovedDataInMB());
+    assertEquals(0, executionTasksSummary.inProgressIntraBrokerMovedDataInMB());
+    // The data movement rate (hence the remaining time) is unknown until the progress is observed twice.
+    assertEquals(-1.0, executionTasksSummary.inProgressInterBrokerDataMovementRateInMBPerSec(), 1e-9);
+    ExecutorState executorState = interBrokerReplicaMovementInProgressState(executionTasksSummary);
+    Map<String, Object> executorStateJson = executorState.getJsonStructure(false);
+    assertEquals(3L, executorStateJson.get("inProgressMovedData"));
+    assertFalse(executorStateJson.containsKey("inProgressDataMovementRate"));
+    assertFalse(executorStateJson.containsKey("estimatedRemainingTimeMs"));
+    assertTrue(executorState.getPlaintext().contains("moved(3) bytes in MBs by in-progress inter-broker partition movements, "
+                                                     + "data movement rate of in-progress movements: unknown, estimated remaining time: unknown"));
+
+    // 3 MB are moved in 3 seconds: 4 MB of the (estimated) 10 MB remain to be moved at 1 MB/s.
+    task.updateDataMovementProgress(6 * ExecutionTask.BYTES_IN_MB, 12 * ExecutionTask.BYTES_IN_MB, 3000L);
+    taskManager.markInProgressDataMovement();
+    assertEquals(6L, dataMovementRateMeter.getCount() - initialMeteredDataMovementInMB);
+    executionTasksSummary = taskManager.getExecutionTasksSummary(Collections.emptySet());
+    assertEquals(1.0, executionTasksSummary.inProgressInterBrokerDataMovementRateInMBPerSec(), 1e-9);
+    executorState = interBrokerReplicaMovementInProgressState(executionTasksSummary);
+    executorStateJson = executorState.getJsonStructure(false);
+    assertEquals(6L, executorStateJson.get("inProgressMovedData"));
+    assertEquals(1.0, (double) executorStateJson.get("inProgressDataMovementRate"), 1e-9);
+    assertEquals(4000L, executorStateJson.get("estimatedRemainingTimeMs"));
+    assertTrue(executorState.getPlaintext().contains("moved(6) bytes in MBs by in-progress inter-broker partition movements, "
+                                                     + "data movement rate of in-progress movements: 1.00 MB/s, "
+                                                     + "estimated remaining time: 4.00 seconds"));
+
+    // The data movement is stuck: the remaining time is unknown.
+    task.updateDataMovementProgress(6 * ExecutionTask.BYTES_IN_MB, 12 * ExecutionTask.BYTES_IN_MB, 6000L);
+    executorState = interBrokerReplicaMovementInProgressState(taskManager.getExecutionTasksSummary(Collections.emptySet()));
+    executorStateJson = executorState.getJsonStructure(false);
+    assertEquals(0.0, (double) executorStateJson.get("inProgressDataMovementRate"), 1e-9);
+    assertFalse(executorStateJson.containsKey("estimatedRemainingTimeMs"));
+
+    // Moved data of finished tasks is accounted for in finished data movement instead.
+    taskManager.markTaskDone(task);
+    executionTasksSummary = taskManager.getExecutionTasksSummary(Collections.emptySet());
+    assertEquals(0, executionTasksSummary.inProgressInterBrokerMovedDataInMB());
+    assertEquals(10, executionTasksSummary.finishedInterBrokerDataMovementInMB());
+    // Upon finishing, only the data movement that has not been marked yet (i.e. 10 - 6 MB) is marked.
+    assertEquals(10L, dataMovementRateMeter.getCount() - initialMeteredDataMovementInMB);
+  }
+
+  @Test
+  public void testRolledBackDataMovementIsNotMarkedAsMoved() {
+    // E.g. the in-progress movements rolled back when an execution is stopped: PR #2 makes the intra-broker ones dead.
+    Meter dataMovementRateMeter = metricRegistry.meter("Executor." + ExecutionTaskTracker.METER_PARTITION_DATA_MOVEMENT_RATE);
+    for (boolean dead : Arrays.asList(true, false)) {
+      ReplicaPlacementInfo r0 = new ReplicaPlacementInfo(0);
+      ReplicaPlacementInfo r1 = new ReplicaPlacementInfo(1);
+      ReplicaPlacementInfo r2 = new ReplicaPlacementInfo(2);
+      ExecutionProposal proposal = new ExecutionProposal(new TopicPartition("topic", 0), 10, r2, Arrays.asList(r0, r2),
+                                                         Arrays.asList(r2, r1));
+      StrategyOptions strategyOptions = new StrategyOptions.Builder(generateExpectedCluster(proposal)).build();
+      taskManager.clear();
+      taskManager.addExecutionProposals(Collections.singletonList(proposal), Collections.emptySet(), strategyOptions, null);
+      List<ExecutionTask> tasks = taskManager.getInterBrokerReplicaMovementTasks();
+      ExecutionTask task = tasks.get(0);
+      taskManager.markTasksInProgress(tasks);
+      long initialMeteredDataMovementInMB = dataMovementRateMeter.getCount();
+      task.updateDataMovementProgress(3 * ExecutionTask.BYTES_IN_MB, 12 * ExecutionTask.BYTES_IN_MB, 0L);
+      taskManager.markInProgressDataMovement();
+      if (dead) {
+        taskManager.markTaskDead(task);
+      } else {
+        taskManager.markTaskAborting(task);
+        taskManager.markTaskDone(task);
+      }
+      // Only the 3 MB moved before the rollback count as moved data, not the 7 MB the movement never moved.
+      assertEquals(3L, dataMovementRateMeter.getCount() - initialMeteredDataMovementInMB);
+      assertEquals(10, taskManager.finishedInterBrokerDataMovementInMB());
+      assertEquals(0, taskManager.completedInterBrokerDataMovementInMB());
+    }
+  }
+
+  private ExecutorState interBrokerReplicaMovementInProgressState(ExecutionTaskTracker.ExecutionTasksSummary executionTasksSummary) {
+    return ExecutorState.operationInProgress(ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS,
+                                             executionTasksSummary,
+                                             taskManager.getExecutionConcurrencyManager().getExecutionConcurrencySummary(),
+                                             "uuid", "reason", Collections.emptySet(), Collections.emptySet(), true);
+  }
+
+  @Test
+  public void testAdoptInProgressTasks() {
+    ReplicaPlacementInfo r0 = new ReplicaPlacementInfo(0);
+    ReplicaPlacementInfo r1 = new ReplicaPlacementInfo(1);
+    ReplicaPlacementInfo r2 = new ReplicaPlacementInfo(2);
+    TopicPartition adoptedTp = new TopicPartition("topic", 0);
+    TopicPartition pendingTp = new TopicPartition("topic", 1);
+    // Both proposals move the replica on broker 0 to broker 1 without a leader movement.
+    ExecutionProposal adopted = new ExecutionProposal(adoptedTp, 10, r2, Arrays.asList(r2, r0), Arrays.asList(r2, r1));
+    ExecutionProposal pending = new ExecutionProposal(pendingTp, 20, r2, Arrays.asList(r2, r0), Arrays.asList(r2, r1));
+    Node[] replicas = {new Node(2, "null", -1), new Node(0, "null", -1)};
+    Set<PartitionInfo> partitions = Set.of(new PartitionInfo(adoptedTp.topic(), adoptedTp.partition(), replicas[0], replicas, replicas),
+                                           new PartitionInfo(pendingTp.topic(), pendingTp.partition(), replicas[0], replicas, replicas));
+    Cluster cluster = new Cluster(null, Arrays.asList(new Node(0, "null", -1), new Node(1, "null", -1), new Node(2, "null", -1)),
+                                  partitions, Collections.emptySet(), Collections.emptySet());
+
+    taskManager.clear();
+    taskManager.setExecutionModeForTaskTracker(false);
+    taskManager.addExecutionProposals(Arrays.asList(adopted, pending), Collections.emptySet(),
+                                      new StrategyOptions.Builder(cluster).build(), null);
+    taskManager.getExecutionConcurrencyManager().setExecutionConcurrencyForAllBrokersOrCluster(null, ConcurrencyType.INTER_BROKER_REPLICA);
+    long taskStateVersion = taskManager.taskStateVersion();
+
+    List<ExecutionTask> adoptedTasks = taskManager.adoptInProgressTasks(Collections.singleton(adoptedTp), Collections.emptySet());
+    assertEquals(1, adoptedTasks.size());
+    assertEquals(adoptedTp, adoptedTasks.get(0).proposal().topicPartition());
+    assertEquals(ExecutionTaskState.IN_PROGRESS, adoptedTasks.get(0).state());
+    assertNotEquals(taskStateVersion, taskManager.taskStateVersion());
+    assertEquals(Collections.singleton(adoptedTasks.get(0)), taskManager.inExecutionTasks());
+    assertEquals(2, taskManager.allTasks().size());
+
+    // The adopted task is not returned for execution (i.e. it will not be submitted again), but the pending task is.
+    List<ExecutionTask> tasksToExecute = taskManager.getInterBrokerReplicaMovementTasks();
+    assertEquals(1, tasksToExecute.size());
+    assertEquals(pendingTp, tasksToExecute.get(0).proposal().topicPartition());
+    assertEquals(1, taskManager.numRemainingInterBrokerPartitionMovements());
+    taskManager.clear();
   }
 
   private void verifyStateChangeSequence(List<ExecutionTaskState> stateSequence,

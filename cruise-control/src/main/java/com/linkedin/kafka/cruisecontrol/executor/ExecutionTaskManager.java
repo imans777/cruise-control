@@ -9,15 +9,21 @@ import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ExecutionConcurrencyManager;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedSet;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.TopicPartitionReplica;
 import org.apache.kafka.common.utils.Time;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutionTask.TaskType;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutionTaskTracker.ExecutionTasksSummary;
@@ -33,6 +39,7 @@ import static com.linkedin.kafka.cruisecontrol.executor.ExecutionTaskTracker.Exe
  * The execution task manager is thread-safe.
  */
 public class ExecutionTaskManager {
+  private static final Logger LOG = LoggerFactory.getLogger(ExecutionTaskManager.class);
   private final Map<Integer, Integer> _inProgressInterBrokerReplicaMovementsByBrokerId;
   private final Map<Integer, Integer> _inProgressIntraBrokerReplicaMovementsByBrokerId;
   private final Set<TopicPartition> _inProgressPartitionsForInterBrokerMovement;
@@ -41,6 +48,8 @@ public class ExecutionTaskManager {
   private final ExecutionConcurrencyManager _executionConcurrencyManager;
   private final Set<Integer> _brokersToSkipConcurrencyCheck;
   private boolean _isKafkaAssignerMode;
+  private boolean _intraBrokerMovementsBrokerByBroker;
+  private Integer _activeBrokerForIntraBrokerMovements;
 
   /**
    * The constructor of The Execution task manager.
@@ -62,6 +71,8 @@ public class ExecutionTaskManager {
     _executionConcurrencyManager = new ExecutionConcurrencyManager(config);
     _brokersToSkipConcurrencyCheck = new HashSet<>();
     _isKafkaAssignerMode = false;
+    _intraBrokerMovementsBrokerByBroker = false;
+    _activeBrokerForIntraBrokerMovements = null;
   }
 
   public ExecutionConcurrencyManager getExecutionConcurrencyManager() {
@@ -72,20 +83,80 @@ public class ExecutionTaskManager {
    * @return A list of execution tasks that move the replicas cross brokers.
    */
   public synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks() {
+    return getInterBrokerReplicaMovementTasks(null);
+  }
+
+  /**
+   * @param budget The replication throttle budget of brokers, or {@code null} to ignore the replication throttle.
+   * @return A list of execution tasks that move the replicas cross brokers.
+   */
+  synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks(ReplicationThrottleBudget budget) {
     Map<Integer, Integer> brokersReadyForReplicaMovement = brokersReadyForReplicaMovement(_inProgressInterBrokerReplicaMovementsByBrokerId,
                                                                                           ConcurrencyType.INTER_BROKER_REPLICA);
     return _executionTaskPlanner.getInterBrokerReplicaMovementTasks(
         brokersReadyForReplicaMovement, _inProgressPartitionsForInterBrokerMovement,
-        _executionConcurrencyManager.maxClusterInterBrokerPartitionMovements());
+        _executionConcurrencyManager.maxClusterInterBrokerPartitionMovements(), budget);
   }
 
   /**
+   * @return {@code true} if inter-broker replica movements are started within the replication throttle budget of brokers,
+   * {@code false} otherwise.
+   */
+  synchronized boolean isThrottleAware() {
+    return _executionTaskPlanner.isThrottleAware();
+  }
+
+  /**
+   * Get the execution tasks that move the replicas cross disks of the same broker. If intra-broker replica movements are
+   * executed broker by broker (see {@link #setIntraBrokerMovementsBrokerByBroker(boolean)}), only the tasks of a single
+   * broker are returned, and tasks of the next broker are not returned until all movements of the current broker finish.
+   *
    * @return A list of execution tasks that move the replicas cross disks of the same broker.
    */
   public synchronized List<ExecutionTask> getIntraBrokerReplicaMovementTasks() {
     Map<Integer, Integer> brokersReadyForReplicaMovement = brokersReadyForReplicaMovement(_inProgressIntraBrokerReplicaMovementsByBrokerId,
                                                                                           ConcurrencyType.INTRA_BROKER_REPLICA);
+    if (_intraBrokerMovementsBrokerByBroker) {
+      Integer activeBroker = activeBrokerForIntraBrokerMovements();
+      brokersReadyForReplicaMovement.keySet().retainAll(activeBroker == null ? Collections.emptySet()
+                                                                             : Collections.singleton(activeBroker));
+    }
     return _executionTaskPlanner.getIntraBrokerReplicaMovementTasks(brokersReadyForReplicaMovement);
+  }
+
+  /**
+   * The active broker is the broker with in-progress intra-broker replica movements, if any. Otherwise, it is the broker
+   * with the smallest id among the brokers having remaining intra-broker replica movements.
+   *
+   * @return The only broker for which intra-broker replica movements can be executed when movements are executed broker
+   * by broker, or {@code null} if there is no remaining or in-progress intra-broker replica movement.
+   */
+  private Integer activeBrokerForIntraBrokerMovements() {
+    Integer activeBroker = _inProgressIntraBrokerReplicaMovementsByBrokerId.entrySet().stream()
+                                                                           .filter(e -> e.getValue() > 0)
+                                                                           .map(Map.Entry::getKey)
+                                                                           .min(Integer::compare)
+                                                                           .orElse(null);
+    if (activeBroker == null) {
+      SortedSet<Integer> brokersWithRemainingMovements = _executionTaskPlanner.brokersWithRemainingIntraBrokerReplicaMovements();
+      activeBroker = brokersWithRemainingMovements.isEmpty() ? null : brokersWithRemainingMovements.first();
+    }
+    if (activeBroker != null && !activeBroker.equals(_activeBrokerForIntraBrokerMovements)) {
+      LOG.info("Executing intra-broker replica movements of broker {}.", activeBroker);
+    }
+    _activeBrokerForIntraBrokerMovements = activeBroker;
+    return activeBroker;
+  }
+
+  /**
+   * Set whether intra-broker replica movements should be executed one broker at a time. The setting is reset upon
+   * {@link #clear()}.
+   *
+   * @param intraBrokerMovementsBrokerByBroker {@code true} to execute intra-broker replica movements one broker at a time,
+   * {@code false} to execute them on all brokers in parallel.
+   */
+  public synchronized void setIntraBrokerMovementsBrokerByBroker(boolean intraBrokerMovementsBrokerByBroker) {
+    _intraBrokerMovementsBrokerByBroker = intraBrokerMovementsBrokerByBroker;
   }
 
   /**
@@ -188,6 +259,23 @@ public class ExecutionTaskManager {
   }
 
   /**
+   * Adopt the given inter-broker and intra-broker replica movements that are already being executed by Kafka (e.g. submitted
+   * before a Cruise Control restart): The corresponding pending tasks are marked as in progress without being submitted
+   * again, so that the execution only monitors them until completion.
+   *
+   * @param interBrokerPartitions Partitions with an ongoing inter-broker replica movement to adopt.
+   * @param intraBrokerReplicas Replicas with an ongoing intra-broker replica movement to adopt.
+   * @return The adopted tasks.
+   */
+  public synchronized List<ExecutionTask> adoptInProgressTasks(Set<TopicPartition> interBrokerPartitions,
+                                                               Set<TopicPartitionReplica> intraBrokerReplicas) {
+    List<ExecutionTask> adoptedTasks = new ArrayList<>(_executionTaskPlanner.removeInterBrokerReplicaMovementTasks(interBrokerPartitions));
+    adoptedTasks.addAll(_executionTaskPlanner.removeIntraBrokerReplicaMovementTasks(intraBrokerReplicas));
+    markTasksInProgress(adoptedTasks);
+    return adoptedTasks;
+  }
+
+  /**
    * Mark the successful completion of a given task. In-progress execution will yield successful completion.
    * Aborting execution will yield Aborted completion.
    * @param task Execution task to mark.
@@ -264,6 +352,13 @@ public class ExecutionTaskManager {
   }
 
   /**
+   * @return The number of remaining inter-broker replica movements by broker id, sorted by the number of movements in descending order.
+   */
+  public synchronized Map<Integer, Integer> numRemainingInterBrokerReplicaMovementsByBrokerId() {
+    return _executionTaskPlanner.numRemainingInterBrokerReplicaMovementsByBrokerId();
+  }
+
+  /**
    * @return Number of finished inter broker partition movements.
    */
   public synchronized int numFinishedInterBrokerPartitionMovements() {
@@ -275,6 +370,20 @@ public class ExecutionTaskManager {
    */
   public synchronized long finishedInterBrokerDataMovementInMB() {
     return _executionTaskTracker.finishedInterBrokerDataMovementInMB();
+  }
+
+  /**
+   * @return Completed inter broker data movement in MB, which excludes the data of dead and aborted tasks.
+   */
+  public synchronized long completedInterBrokerDataMovementInMB() {
+    return _executionTaskTracker.completedInterBrokerDataMovementInMB();
+  }
+
+  /**
+   * @return Completed intra broker data movement in MB, which excludes the data of dead and aborted tasks.
+   */
+  public synchronized long completedIntraBrokerDataMovementInMB() {
+    return _executionTaskTracker.completedIntraBrokerDataMovementInMB();
   }
 
   /**
@@ -349,15 +458,46 @@ public class ExecutionTaskManager {
   }
 
   /**
+   * @param type Task type.
+   * @return Number of MBs that have already been moved by the in-progress tasks with the given task type.
+   */
+  public synchronized long inProgressMovedDataInMB(TaskType type) {
+    return _executionTaskTracker.inProgressMovedDataInMB(type);
+  }
+
+  /**
+   * Mark the data movement observed for the in-progress replica movement tasks in the partition data movement rate meter.
+   */
+  public synchronized void markInProgressDataMovement() {
+    _executionTaskTracker.markInProgressDataMovement();
+  }
+
+  /**
    * Clear the cached task manager state.
    */
   public synchronized void clear() {
     _brokersToSkipConcurrencyCheck.clear();
+    _intraBrokerMovementsBrokerByBroker = false;
+    _activeBrokerForIntraBrokerMovements = null;
     _inProgressInterBrokerReplicaMovementsByBrokerId.clear();
     _inProgressIntraBrokerReplicaMovementsByBrokerId.clear();
     _inProgressPartitionsForInterBrokerMovement.clear();
     _executionTaskPlanner.clear();
     _executionTaskTracker.clear();
+  }
+
+  /**
+   * @return A number that changes whenever a task is added or changes its state.
+   */
+  public synchronized long taskStateVersion() {
+    return _executionTaskTracker.taskStateVersion();
+  }
+
+  /**
+   * @return All tasks of the current execution regardless of their type and state.
+   */
+  public synchronized List<ExecutionTask> allTasks() {
+    return _executionTaskTracker.allTasks();
   }
 
   /**

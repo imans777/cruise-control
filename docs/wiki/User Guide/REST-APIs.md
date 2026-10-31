@@ -114,12 +114,19 @@ The returned state contains the following information:
 	   `LEADER_MOVEMENT_TASK_IN_PROGRESS` /
 	   `STOPPING_EXECUTION` /
 	   `INITIALIZING_PROPOSAL_EXECUTION` /
-	   `GENERATING_PROPOSALS_FOR_EXECUTION`
+	   `GENERATING_PROPOSALS_FOR_EXECUTION` /
+	   `RECOVERING_INTERRUPTED_EXECUTION`
   * Inter-broker replica movement progress (if state is `INTER_BROKER_REPLICA_MOVEMENT_IN_PROGRESS`)
   * Intra-broker replica movement progress (if state is `INTRA_BROKER_REPLICA_MOVEMENT_IN_PROGRESS`)
   * Leadership movement progress (if state is `LEADERSHIP_MOVEMENT`)
   * movement concurrency
+  * Replication throttles in force on each broker throttled by the ongoing inter-broker replica movements (JSON only:
+    `ongoingReplicationThrottleByBroker`, e.g. `{"1": {"leader": 10485760, "follower": 20971520}}` in bytes/second), per broker
+    and direction since the concurrency adjuster may adjust them (see `concurrency.adjuster.replication.throttle.enabled`)
   * UUID triggers the execution
+  * Recovery of the latest execution interrupted by a Cruise Control restart (if any, until the next execution starts): whether it
+    was resumed or is being cleaned up, why it was not resumed (e.g. how the cluster has changed since), and the in-flight
+    movements and throttled rates of the cleanup
 * **Analyzer State**:
   * isProposalReady: Is there a proposal cached
   * ReadyGoals: A list of goals that are ready for running
@@ -127,6 +134,7 @@ The returned state contains the following information:
   * selfHealingEnabled: Anomaly type for which self healing is enabled
   * selfHealingDisabled: Anomaly type for which self healing is disabled
   * recentGoalViolations: Recently detected goal violations
+  * recentIntraBrokerGoalViolations: Recently detected intra-broker goal violations (i.e. imbalance across the disks of brokers)
   * recentBrokerFailures: Recently detected broker failures
   * recentDiskFailures: Recently detected disk failures
   * recentMetricAnomalies: Recently detected metric anomalies
@@ -159,11 +167,24 @@ If the number of workload snapshots for the given timestamp is not sufficient to
 
 Timestamp for `start`/`end`/`time` is in milliseconds since the epoch; what `System.currentTimeMillis()` returns.  The time zone is the time zone of the Cruise Control server.
 
-If `allow_capacity_estimation` is set to `true`, for brokers missing capacity information Cruise Control will make estimations based on other brokers in the cluster; otherwise an `IllegalStateException` will be thrown and shown in response.
+If `allow_capacity_estimation` is set to `true`, for brokers missing capacity information Cruise Control will make estimations (with the default `BrokerCapacityConfigFileResolver`, from the default broker capacity given for broker id `-1`); otherwise a `BrokerCapacityResolutionException` will be thrown and shown in response.
 
 The response contains both load-per-broker and load-per-host information. This is specifically useful when multiple brokers are hosted by the same machine.
 
+If `populate_disk_info` is set to `true`, the response also shows the load of each disk (log directory) of the brokers:
+its disk usage, the number of leader replicas and replicas on it, and the network traffic of the replicas on it
+(`LEADER_NW_IN`, `FOLLOWER_NW_IN`, `NW_OUT` and `PNW_OUT` in plaintext; `LeaderNwInRate`, `FollowerNwInRate`, `NwOutRate`
+and `PnwOutRate` in JSON). The network traffic of a disk is the produce and consume traffic of the replicas hosted on it,
+derived from the partition metrics collected by Cruise Control -- not the measured I/O of the disk. `PNW_OUT` is the
+outbound traffic the disk would serve if all its replicas were leaders. For the alive disks of a broker, these values add
+up to the values of the broker. Disk capacity, CPU and network capacities are per broker, hence not shown for disks. The
+load of a dead disk is shown as `DEAD`. Brokers that are down and disks that failed do not prevent the response. A broker whose
+capacity is estimated from the default broker capacity gets the per-logdir disk capacities of that entry, so its log
+directories must be the ones listed there.
+
 NOTE: The load shown is only for the load from the valid partitions. i.e the partitions with enough metric samples. So please always check the `LoadMonitor`'s state(via `State` endpoint) to decide whether the workload is representative enough.
+
+With disk information (`populate_disk_info=true` here, and `rebalance_disk=true` or `remove_disks` elsewhere), the disk capacity of a broker only counts its alive disks: a disk of the broker capacity config that Kafka does not report as a log directory of the broker is left out, and a failed disk drops its capacity. The disk usage of the broker still includes the offline replicas of a failed disk, so its disk percentage can exceed 100% until `fix_offline_replicas` moves them.
 
 ### Query partition resource utilization
 The following GET request gives the partition load sorted by the utilization of a given resource:
@@ -186,6 +207,7 @@ Supported parameters are:
 | partition                 | integer/range | partition number(e.g. 10) range(e.g. 1-10) to filter partition load to report                                     | null                          | yes       |
 | min_valid_partition_ratio | double        | minimal valid partition ratio requirement for cluster model                                                       | null                          | yes       |
 | brokerid                  | int           | broker id to to filter partition load to report                                                                   | null                          | yes       |
+| populate_disk_info        | boolean       | whether to show the logdir of the leader and of each follower of the partitions (JBOD only)                       | false                         | yes       |
 | doAs                      | string        | propagated user by the trusted proxy service                                                                      | null                          | yes       |
 | reason                    | string        | reason for the request                                                                                            | "No reason provided"          | yes       | 
 
@@ -196,6 +218,12 @@ By specifying `topic`,`partition` and/or `brokerid` parameter, client can filter
 The `min_valid_partition_ratio` specifies minimal monitored valid partition percentage needed to calculate the partition load. If this parameter is not set in request, the config value `min.valid.partition.ratio` will be used.
 
 The `max_load` parameter specifies whether report the maximal historical value or not. The `avg_load` parameter specifies whether report the average historical value or not. If both are not specified or specified as `false`, for `DISK` resource, latest value will be reported; for `NW_IN`/`NW_OUT`/`CPU` resource, average value will be reported.
+
+If `populate_disk_info` is set to `true`, the response also shows the logdir (disk) of the leader and of each follower of
+the partitions: `LEADER_LOGDIR` and `FOLLOWER_LOGDIRS` in plaintext, and `leaderLogdir` and `followerLogdirs` (in the
+same order as `followers`) in JSON. The logdir of a replica on a dead broker or a failed disk is not known: it is shown as
+`-` in plaintext, and as `null` in `followerLogdirs` (`leaderLogdir` is left out). As with `load`, this requires a JBOD
+Kafka deployment, i.e. per-logdir disk capacities for the brokers.
 
 ### Query partition and replica state
 The following GET request gives partition healthiness on the cluster:
@@ -235,11 +263,12 @@ Supported parameters are:
 | kafka_assigner                    | boolean   | whether to use Kafka assigner mode to generate proposals                              | false                | yes       |
 | allow_capacity_estimation         | boolean   | whether to allow broker capacity to be estimated                                      | true                 | yes       |
 | excluded_topics                   | regex     | regular expression to specify topics excluded from replica and leadership movement    | null                 | yes       |
+| included_topics                   | regex     | regular expression to specify the only topics allowed to move                         | null                 | yes       |
 | use_ready_default_goals           | boolean   | whether to use only ready goals to generate proposals                                 | false                | yes       |
 | exclude_recently_demoted_brokers  | boolean   | whether to allow leader replicas to be moved to recently demoted brokers              | false                | yes       |
 | exclude_recently_removed_brokers  | boolean   | whether allow replicas to be moved to recently removed broker                         | false                | yes       |
-| destination_broker_ids            | boolean   | specify brokers to move replicas to                                                   | available brokers    | yes       |
-| rebalance_disk                    | boolean   | whether to balance load between disks within brokers (requires JBOD Kafka deployment) | false                | yes       |
+| destination_broker_ids            | list      | specify brokers to move replicas to                                                   | available brokers    | yes       |
+| rebalance_disk                    | boolean   | whether to balance load between disks within brokers, with the intra-broker goals in `goals` (default: `intra.broker.goals`) (requires JBOD Kafka deployment) | false                | yes       |
 | json                              | boolean   | return in JSON format or not                                                          | false                | yes       | 
 | verbose                           | boolean   | return detailed state information                                                     | false                | yes       |
 | doAs                              | string    | propagated user by the trusted proxy service                                          | null                 | yes       | 
@@ -263,6 +292,8 @@ If `verbose` is turned on, Cruise Control will return all the generated proposal
 If `kafka_assigner` is turned on, the proposals will be generated in Kafka Assigner mode,i.e. Cruise Control behaves like [kafka assigner tool](https://github.com/linkedin/kafka-tools/wiki/Kafka-Assigner). This mode performs optimizations using the goals specific to Kafka Assigner -- i.e. goals with name `KafkaAssigner*`.
 
 Users can specify `excluded_topics` to prevent certain topics' replicas from moving in the generated proposals.
+
+Alternatively, users can specify `included_topics` to only move replicas of the matching topics in the generated proposals -- i.e. all other topics are excluded from replica and leadership movement. When specified, `included_topics` takes precedence over the topics excluded by default via `topics.excluded.from.partition.movement` config. `included_topics` and `excluded_topics` are mutually exclusive and cannot be specified in the same request.
 
 If `use_ready_default_goals` is turned on, Cruise Control will use whatever ready goals(based on available metric data) to calculate the proposals.
 
@@ -342,14 +373,17 @@ Supported parameters are:
 | concurrent_leader_movements                   | integer   | upper bound of ongoing leadership movements                                                                                           | null                  | yes       | 
 | skip_hard_goal_check                          | boolean   | Whether allow hard goals be skipped in proposal generation                                                                            | false                 | yes       | 
 | excluded_topics                               | regex     | regular expression to specify topics excluded from replica and leadership movement                                                    | null                  | yes       | 
+| included_topics                               | regex     | regular expression to specify the only topics allowed to move (mutually exclusive with `excluded_topics`)                             | null                  | yes       | 
 | use_ready_default_goals                       | boolean   | whether only use ready goals to generate proposal                                                                                     | false                 | yes       | 
 | exclude_recently_demoted_brokers              | boolean   | whether to allow leader replicas to be moved to recently demoted brokers                                                              | false                 | yes       | 
 | exclude_recently_removed_brokers              | boolean   | whether allow replicas to be moved to recently removed broker                                                                         | false                 | yes       | 
 | replica_movement_strategies                   | string    | [replica movement strategy](https://github.com/cruise-control-for-kafka/cruise-control/wiki/Pluggable-Components#replica-movement-strategy) to use    | null                  | yes       | 
 | ignore_proposal_cache                         | boolean   | whether to ignore the cached proposal or not                                                                                          | false                 | yes       | 
 | replication_throttle                          | long      | upper bound on the bandwidth used to move replicas (in bytes per second)                                                              | null                  | yes       | 
+| log_dir_throttle                              | long      | upper bound on the bandwidth used to move replicas between the disks of a broker (in bytes per second)                                | null                  | yes       | 
 | destination_broker_ids                        | list      | specify brokers to move replicas to                                                                                                   | available brokers     | yes       | 
-| rebalance_disk                                | boolean   | whether to balance load between disks within brokers (requires JBOD Kafka deployment)                                                 | false                 | yes       | 
+| rebalance_disk                                | boolean   | whether to balance load between disks within brokers, with the intra-broker goals in `goals` (default: `intra.broker.goals`) (requires JBOD Kafka deployment) | false                 | yes       | 
+| rebalance_disk_broker_by_broker               | boolean   | whether to execute the disk rebalance one broker at a time (requires `rebalance_disk=true`)                                           | false                 | yes       | 
 | json                                          | boolean   | return in JSON format or not                                                                                                          | false                 | yes       | 
 | verbose                                       | boolean   | return detailed state information                                                                                                     | false                 | yes       | 
 | reason                                        | string    | reason for the request                                                                                                                | "No reason provided"  | yes       | 
@@ -360,10 +394,83 @@ Similar to the [GET interface for getting proposals](https://github.com/cruise-c
 
 User can specify goals to use for rebalance via `goals` parameter. When `goals` is provided, the cached proposals will be ignored.
 
+With `rebalance_disk=true`, `goals` only accepts intra-broker goals (the goals listed in `intra.broker.goals`); without `goals`, the goals in `intra.broker.goals` are used, in their order.
+
+If the cluster model has disk information (e.g. with `rebalance_disk=true`), the response also shows the balance between the
+disks of each broker, grouped by the metric it is about -- currently the disk usage (`usage` in JSON):
+
+* The stats of each goal include disk-level stats (`diskStatistics` in JSON): the number of alive disks (`DISKS:{alive: ...}`,
+  `numAliveDisks`), and the `DISK USAGE` lines:
+  * `unbalanced` (`numUnbalancedDisks`): the number of disks that `IntraBrokerDiskUsageDistributionGoal` would move replicas to
+    or from in a manual rebalance, i.e. whose utilization is out of the utilization of their broker times
+    1 +/- (`intra.broker.disk.balance.threshold` - 1) * 0.9, where `intra.broker.disk.balance.threshold` defaults to
+    `disk.balance.threshold`; a broker whose disks average at most `disk.low.utilization.threshold` has the lenient band of the
+    goal (no lower bound, an upper bound of at least `disk.low.utilization.threshold` * 0.9);
+  * `aboveCapacityLimit` (`numDisksAboveCapacityLimit`): the number of disks whose utilization is above `disk.capacity.threshold`;
+  * `maxSpreadWithinBroker`: the largest difference between the utilization of the disks of a broker, and that broker;
+  * `AVG`, `MAX` and `MIN`: the average, highest and lowest utilization of a disk -- `MAX` and `MIN` with the broker and log
+    directory of the disk;
+  * `STD`: the standard deviation of the utilization of each disk from the utilization of its broker, which
+    `IntraBrokerDiskUsageDistributionGoal` reduces.
+
+  Utilizations are percentages of the disk capacity (`%`; `utilizationPct` in JSON). `STD` and `maxSpreadWithinBroker` are
+  differences between such percentages, in percentage points (`pp`): e.g. a broker whose disks are at 17.35% and 0.73% has a
+  spread of 16.62pp. Disks with no capacity, such as disks being removed, are left out.
+
+  The `DISK IO RATE` lines (`ioRate` in JSON) are the same for the estimated disk I/O rate that
+  `IntraBrokerDiskIORateDistributionGoal` balances: the inbound network rate of the replicas of a disk plus
+  `intra.broker.disk.io.read.weight` times the outbound network rate of its leaders, in KB/s (`rateKBps`). Per-disk I/O is not
+  observable, so they are estimates from network load. Rates are not comparable across brokers, so the I/O balance is given
+  relative to the average of each broker (`ratioPct`):
+  * `unbalanced` (`numUnbalancedDisks`): the disks out of that average times 1 +/- (`intra.broker.disk.io.balance.threshold` - 1)
+    * 0.9;
+  * `maxRatio`: the disk with the highest rate relative to the average of its broker, in percent, with its broker and log directory;
+  * `maxSpreadWithinBroker`: the largest difference between the rates of the disks of a broker, in percentage points of its average;
+  * `AVG`, `MAX`, `MIN`, `STD`: as for the disk usage, in KB/s.
+
+  A broker whose disks have no estimated I/O has no ratio, and its disks count as balanced.
+* The stats of a goal are the stats of the cluster after that goal is optimized -- i.e. after that goal and all the goals before
+  it -- not what that goal alone changed. For example, with `rebalance_disk=true`, `IntraBrokerDiskCapacityGoal(NO-ACTION)`
+  followed by `unbalanced: 12` means that no disk was above the capacity limit, while 12 disks were unbalanced; then
+  `IntraBrokerDiskUsageDistributionGoal(FIXED)` followed by `unbalanced: 0` shows the balance after both goals.
+* Intra-broker goals only move replicas between the disks of a broker, so their broker-level stats cannot change: the plaintext
+  response only shows their disk-level stats.
+* The summary shows the disk usage balance before and after the optimization, e.g. `Disk usage balance (before -> after):
+  unbalanced disks 12 of 12 -> 0 of 12, max utilization 17.33% -> 6.18%, max spread within a broker 16.62pp -> 2.83pp.`
+  (`diskStatisticsBefore` and `diskStatisticsAfter` in JSON, shaped like `diskStatistics`). If
+  `IntraBrokerDiskIORateDistributionGoal` was among the optimized goals, a second line shows the disk I/O balance, e.g.
+  `Disk I/O balance (before -> after): unbalanced disks 8 of 12 -> 2 of 12, max ratio 260.00% -> 118.00%, max spread within a
+  broker 230.00pp -> 40.00pp.`
+* The disk-level stats and the summary cover the brokers the request balances: with `rebalance_disk=true` and
+  `destination_broker_ids`, only those brokers (`Disk usage balance of brokers [1, 2] (before -> after): ...`); for
+  `remove_disks`, only the brokers in `brokerid_and_logdirs`. Otherwise, all alive brokers.
+* With `verbose=true`, a proposal that moves replicas between disks shows each replica as `brokerId-logdir` in plaintext (e.g.
+  `[0-/d1, 1-/d1] -> [0-/d2, 1-/d1]`), and the log directory of each replica before and after in JSON (`oldReplicaLogdirs`
+  and `newReplicaLogdirs`, keyed by broker id). A replica whose log directory is not known, e.g. on a dead broker, is shown
+  without it.
+
 When rebalancing a cluster, all the brokers in the cluster(except recently removed/demoted brokers if `exclude_recently_removed_brokers`/`exclude_recently_demoted_brokers` set to `true`) are eligible to give / receive replicas. All the brokers will be throttled during the partition movement. The throttling can be set in two ways.
 
-* By throttling number of replica concurrently moving into a broker. It is gated by the request parameter `concurrent_partition_movements_per_broker` or config value `num.concurrent.partition.movements.per.broker` (if request parameter is not set), `concurrent_intra_partition_movements` or config value `num.concurrent.intra.broker.partition.movements`. Similarly, the number of concurrent partition leadership changes is gated by request parameter `concurrent_leader_movements` or config value `num.concurrent.leader.movements`.
+* By throttling number of replica concurrently moving into a broker. It is gated by the request parameter `concurrent_partition_movements_per_broker` or config value `num.concurrent.partition.movements.per.broker` (if request parameter is not set), `concurrent_intra_broker_partition_movements` or config value `num.concurrent.intra.broker.partition.movements`. Similarly, the number of concurrent partition leadership changes is gated by request parameter `concurrent_leader_movements` or config value `num.concurrent.leader.movements`.
 * By throttling the bandwidth used to move replicas into a broker. It is gated by the request parameter `replication_throttle` or config value `default.replication.throttle` (if request parameter is not set).
+* By throttling the bandwidth used to move replicas between the disks (logdirs) of a broker, which applies to intra-broker replica movements (e.g. with `rebalance_disk=true`). It is gated by the request parameter `log_dir_throttle` or config value `default.log.dir.throttle` (if request parameter is not set). During the execution, it is set as the broker config `replica.alter.log.dirs.io.max.bytes.per.second` on the brokers with intra-broker replica movements, and the original value of this broker config is restored afterwards.
+
+#### Rebalance disks broker by broker
+When `rebalance_disk=true`, Kafka Cruise Control balances the load between the disks within each broker (requires JBOD Kafka deployment). By default, the disks of all alive brokers are rebalanced and replica movements between disks are executed on all brokers in parallel. To limit the impact on the cluster (e.g. on Kafka versions that do not support throttling replica movements between disks), the disk rebalance can be performed one broker at a time in two ways:
+
+* Limit the disk rebalance to specific brokers via the `destination_broker_ids` parameter. For example, the following request only rebalances the disks of broker 3:
+
+      POST /kafkacruisecontrol/rebalance?rebalance_disk=true&destination_broker_ids=3&dryrun=false
+
+* Rebalance the disks of all (or the specified) brokers, but execute the replica movements between disks one broker at a time via `rebalance_disk_broker_by_broker=true`. Replica movements between the disks of a broker (bounded by `concurrent_intra_broker_partition_movements`) are completed before the replica movements of the next broker start:
+
+      POST /kafkacruisecontrol/rebalance?rebalance_disk=true&rebalance_disk_broker_by_broker=true&dryrun=false
+
+Three things to know when limiting or serializing a disk rebalance:
+
+* **The goal status covers only the requested brokers.** When `destination_broker_ids` limits a disk rebalance, `IntraBrokerDiskUsageDistributionGoal` is reported as `FIXED` once the requested brokers are balanced, even if disks on other brokers are still unbalanced. The status is a single value for the whole request, so a per-broker answer requires one request per broker.
+* **A replica movement whose disk or broker fails mid-flight is counted as finished.** The progress report and the moved-data figure include tasks that ended in `DEAD`, so an execution that lost a replica movement can still report 100%. Check `deadIntraBrokerPartitionMovement` in `GET /kafkacruisecontrol/state?substates=executor&verbose=true` to see whether any movement failed. Note also that Kafka keeps the pending move in the future replica's log directory, so a movement that Cruise Control reports as dead may still be completed by the broker itself after it comes back.
+* **With `rebalance_disk_broker_by_broker=true`, a broker whose movements cannot complete holds up the brokers after it.** Replica movements are handed out for one broker at a time, so a movement that never finishes prevents the remaining brokers from starting. `POST /kafkacruisecontrol/stop_proposal_execution` cancels the execution.
 
 ### Add a list of new brokers to Kafka Cluster
 The following POST request adds the given brokers to the Kafka cluster
@@ -385,6 +492,7 @@ Supported parameters are:
 | concurrent_leader_movements               | integer   | upper bound of ongoing leadership movements                                                                                           | null                  | yes       | 
 | skip_hard_goal_check                      | boolean   | whether allow hard goals be skipped in proposal generation                                                                            | false                 | yes       | 
 | excluded_topics                           | regex     | regular expression to specify topics excluded from replica and leadership movement                                                    | null                  | yes       | 
+| included_topics                           | regex     | regular expression to specify the only topics allowed to move (mutually exclusive with `excluded_topics`)                             | null                  | yes       | 
 | use_ready_default_goals                   | boolean   | whether only use ready goals to generate proposal                                                                                     | false                 | yes       | 
 | exclude_recently_demoted_brokers          | boolean   | whether to allow leader replicas to be moved to recently demoted brokers                                                              | false                 | yes       | 
 | exclude_recently_removed_brokers          | boolean   | whether allow replicas to be moved to recently removed broker                                                                         | false                 | yes       | 
@@ -422,6 +530,7 @@ Supported parameters are:
 | concurrent_leader_movements               | integer   | upper bound of ongoing leadership movements                                                                                          | null                  | yes       | 
 | skip_hard_goal_check                      | boolean   | whether allow hard goals be skipped in proposal generation                                                                           | false                 | yes       | 
 | excluded_topics                           | regex     | regular expression to specify topics excluded from replica and leadership movement                                                   | null                  | yes       | 
+| included_topics                           | regex     | regular expression to specify the only topics allowed to move (mutually exclusive with `excluded_topics`)                            | null                  | yes       | 
 | use_ready_default_goals                   | boolean   | whether only use ready goals to generate proposal                                                                                    | false                 | yes       | 
 | exclude_recently_demoted_brokers          | boolean   | whether to allow leader replicas to be moved to recently demoted brokers                                                             | false                 | yes       | 
 | exclude_recently_removed_brokers          | boolean   | whether allow replicas to be moved to recently removed broker                                                                        | false                 | yes       | 
@@ -439,7 +548,7 @@ Similar to adding brokers to a cluster, removing brokers from a cluster will **o
 
 Like adding brokers, users can choose whether to throttle the removed broker during the partition movement. If the removed brokers are throttled, the number of partitions concurrently moving out of a broker, number of concurrent partition leadership changes and bandwidth used for replica movement are gated in the same way as add_broker above.
 
-**Note if the topics specified in `excluded_topics` has replicas on the removed broker, the replicas will still get moved off the broker.**
+**Note if the topics specified in `excluded_topics` (or not matching `included_topics`) has replicas on the removed broker, the replicas will still get moved off the broker.**
 
 ### Fix offline replicas in Kafka cluster
 The following POST request moves all the offline replicas from dead disks/brokers.
@@ -460,6 +569,7 @@ Supported parameters are:
 | concurrent_leader_movements               | integer   | upper bound of ongoing leadership movements                                                                                           | null                  | yes       | 
 | skip_hard_goal_check                      | boolean   | Whether allow hard goals be skipped in proposal generation                                                                            | false                 | yes       | 
 | excluded_topics                           | regex     | regular expression to specify topics excluded from replica and leadership movement                                                    | null                  | yes       | 
+| included_topics                           | regex     | regular expression to specify the only topics allowed to move (mutually exclusive with `excluded_topics`)                             | null                  | yes       | 
 | use_ready_default_goals                   | boolean   | whether only use ready goals to generate proposal                                                                                     | false                 | yes       | 
 | exclude_recently_demoted_brokers          | boolean   | whether to allow leader replicas to be moved to recently demoted brokers                                                              | false                 | yes       | 
 | exclude_recently_removed_brokers          | boolean   | whether allow replicas to be moved to recently removed broker                                                                         | false                 | yes       | 
@@ -473,7 +583,7 @@ Supported parameters are:
 
 Likewise, users can throttle partition movement, the throttling can be set in the same way as [`rebalance` request](#trigger-a-workload-balance).
 
-**Note if the topics specified in `excluded_topics` has offline replicas, the replicas will still get moved to healthy brokers.**
+**Note if the topics specified in `excluded_topics` (or not matching `included_topics`) has offline replicas, the replicas will still get moved to healthy brokers.**
 
 ### Demote a list of brokers from the Kafka cluster
 The following POST request moves all the leader replicas away from a list of brokers.
@@ -521,24 +631,54 @@ For example, to remove two disks from broker `101`:
 
 Supported parameters are:
 
-| PARAMETER                 | TYPE      | DESCRIPTION                                                                                       | DEFAULT               | OPTIONAL  |
-|---------------------------|-----------|---------------------------------------------------------------------------------------------------|-----------------------|-----------|
-| brokerid_and_logdirs      | list      | list of broker id and logdir pairs for disks to remove from the cluster                           | N/A                   | **no**    |
-| dryrun                    | boolean   | whether dry-run the request or not                                                                | true                  | yes       |
-| stop_ongoing_execution    | boolean   | whether to stop the ongoing execution (if any) and start executing the given request              | false                 | yes       |
-| reason                    | string    | reason for the request                                                                            | "No reason provided"  | yes       |
-| json                      | boolean   | return in JSON format or not                                                                      | false                 | yes       |
+| PARAMETER                  | TYPE      | DESCRIPTION                                                                                  | DEFAULT               | OPTIONAL  |
+|----------------------------|-----------|----------------------------------------------------------------------------------------------|-----------------------|-----------|
+| brokerid_and_logdirs       | list      | list of broker id and logdir pairs for disks to remove from the cluster                      | N/A                   | **no**    |
+| dryrun                     | boolean   | whether dry-run the request or not                                                           | true                  | yes       |
+| stop_ongoing_execution     | boolean   | whether to stop the ongoing execution (if any) and start executing the given request        | false                 | yes       |
+| allow_capacity_estimation  | boolean   | whether to allow broker capacity to be estimated                                             | true                  | yes       |
+| json                       | boolean   | return in JSON format or not                                                                 | false                 | yes       |
+| verbose                    | boolean   | return the proposed replica movements and the load before the disk removal                  | false                 | yes       |
+| reason                     | string    | reason for the request                                                                       | "No reason provided"  | yes       |
+| get_response_schema        | boolean   | return JSON schema in response header or not                                                 | false                 | yes       |
+| doAs                       | string    | propagated user by the trusted proxy service                                                 | null                  | yes       |
 
 Note that `brokerid_and_logdirs` takes comma as delimiter between two broker id and logdir pairs — i.e. we assume a valid logdir name contains no comma. Each pair uses a hyphen (`-`) as the delimiter between broker id and logdir name (e.g. `101-/tmp/kafka-logs-1`).
 
-Unlike most other optimization endpoints, `remove_disks` does not accept a `goals` parameter. Proposal generation always uses `IntraBrokerDiskCapacityGoal` with disk-emptying enabled, regardless of the `intra.broker.goals` or `default.goals` configuration. This goal generates intra-broker replica movement proposals to move all replicas off the specified disks while keeping each remaining disk under the configured capacity threshold.
+A request without `brokerid_and_logdirs`, or with a pair that is not a broker id followed by a hyphen and a logdir, is rejected with HTTP 400.
+
+Unlike most other optimization endpoints, `remove_disks` does not accept a `goals` parameter. Proposal generation always uses `IntraBrokerDiskCapacityGoal` with disk-emptying enabled, regardless of the `intra.broker.goals` or `default.goals` configuration. This goal generates intra-broker replica movement proposals to move all replicas off the specified disks while keeping each remaining disk under the configured capacity threshold. It only moves the replicas on the specified disks -- including the replicas of topics excluded from partition movement (`topics.excluded.from.partition.movement`) -- to other disks of the same broker: it neither balances the remaining disks, nor touches other disks above the capacity threshold or other brokers. The other intra-broker goals, such as `IntraBrokerDiskUsageDistributionGoal`, are not used, since they balance the disks of every broker.
 
 Before generating proposals, Cruise Control validates that:
 * Each specified logdir exists on the corresponding broker.
-* At least one logdir remains on each affected broker.
-* The remaining disk capacity on each affected broker is sufficient to absorb the load from the disks being removed (based on the configured disk capacity threshold).
+* No specified logdir is a failed (dead) disk. Replicas cannot be moved off a failed disk to another disk of the broker, and
+  Kafka reports no replica for a failed log dir, so such a disk can be neither emptied nor checked to be empty. The error
+  lists the offline replicas of the broker: move them to other brokers with `fix_offline_replicas`, then take the disk out
+  of the broker's `log.dirs`.
+* At least one alive logdir remains on each affected broker.
+* The remaining capacity of the alive disks on each affected broker is sufficient to absorb the load of its alive disks (based on the configured disk capacity threshold, see `disk.capacity.threshold`).
+
+Offline replicas elsewhere -- on a dead broker, or on a failed disk that is not removed -- do not prevent a disk removal:
+`remove_disks` only moves online replicas between the alive disks of the given brokers.
 
 Replica movements are limited to disks within the same broker — there is no inter-broker replica movement. `stop_ongoing_execution` and `dryrun` cannot both be set to `true`.
+
+`remove_disks` is a one-shot drain: Cruise Control keeps no record of the disks it removed. While a drained log dir is still
+in the broker's `log.dirs`, Kafka keeps using it. It puts each new replica of the broker -- of a new partition, or moved
+from another broker -- on the log dir with the fewest partitions, i.e. the drained one, and a later `rebalance` with
+`rebalance_disk=true` moves replicas back onto it as well. So take the disk out of the broker's `log.dirs` (a broker
+restart) and out of the broker capacity config, from which Cruise Control builds the disks of the broker, right after the
+drain. On Kafka versions that support cordoning log directories (KIP-1066), cordon the drained log dir with the dynamic
+`cordoned.log.dirs` broker config, so that Kafka places no new replica on it until the restart.
+
+If `verbose` is set to `true`, the response also shows the proposed replica movements -- including the log directories
+that each replica moves between (`oldReplicaLogdirs` and `newReplicaLogdirs` in JSON, keyed by broker id) -- and the load
+before the disk removal. The load after the disk removal shows the removed disks as empty, and the disk capacity of the
+brokers without the removed disks.
+
+The summary shows the disk usage balance before and after the disk removal, as for `rebalance` with `rebalance_disk=true`. The
+disks to remove are only counted before the removal: e.g. removing one disk of each of three brokers with four disks each gives
+`unbalanced disks 12 of 12 -> 9 of 9`. The remaining disks are not rebalanced by `remove_disks`.
 
 ### Stop the current proposal execution task
 The following POST request will let Cruise Control stop an ongoing `rebalance`, `add_broker`,  `remove_broker`, `fix_offline_replica`, `topic_configuration`, `demote_broker` or `remove_disks` operation:
@@ -628,6 +768,8 @@ Note sometimes the topic regex can be too long to put at POST request head, in t
 ### Change Cruise Control configuration
 Some Cruise Control configs can be changed dynamically via `admin` endpoint, which includes
 * Dynamically change the partition and leadership concurrency and the interval between checking and updating (if needed) the progress of an ongoing execution.
+* Dynamically change the replication throttle applied to the inter-broker replica movements of an ongoing execution.
+* Dynamically change the log dir throttle applied to the intra-broker replica movements of an ongoing execution.
 * Enable/disable self-healing for the specified anomaly types.
 * Drop selected recently removed/demoted brokers.
 * Enable/disable the specified concurrency adjusters.
@@ -643,6 +785,8 @@ Supported parameters are:
 | max_partition_movements_in_cluster            | integer   | upper bound of max replica movements into/out of brokers across cluster   | N/A                   | yes       |                                                            
 | concurrent_intra_broker_partition_movements   | integer   | upper bound of ongoing replica movements between disks within a broker    | N/A                   | yes       |
 | concurrent_leader_movements                   | integer   | upper bound of ongoing leadership movements                               | N/A                   | yes       |
+| replication_throttle                          | long      | replication throttle (bytes/second) for the ongoing execution, or `null` to remove it | N/A       | yes       |
+| log_dir_throttle                              | long      | log dir throttle (bytes/second) for the ongoing execution, or `null` to remove it | N/A           | yes       |
 | drop_recently_removed_brokers                 | list      | list of id of recently removed brokers to be dropped                      | N/A                   | yes       |
 | drop_recently_demoted_brokers                 | list      | list of id of recently demoted brokers to be dropped                      | N/A                   | yes       |
 | doAs                                          | string    | propagated user by the trusted proxy service                              | null                  | yes       | 
@@ -653,15 +797,49 @@ Supported parameters are:
 | disable_concurrency_adjuster_for              | list      | disable concurrency adjuster for given concurrency types                  | N/A                   | yes       |
 | enable_concurrency_adjuster_for               | list      | enable concurrency adjuster for given concurrency types                   | N/A                   | yes       |
 | min_isr_based_concurrency_adjustment          | boolean   | enable (true) or disable (false) MinISR-based concurrency adjustment      | N/A                   | yes       |
+| replication_throttle_adjustment               | boolean   | enable (true) or disable (false) replication throttle adjustment; disabling it during an execution makes a `replication_throttle` set during it hold (see below) | N/A                   | yes       |
 | reason                                        | string    | reason for the request                                                    | "No reason provided"  | yes       | 
 
 To Enable/disable self-healing, send POST request like:
 
      POST /kafkacruisecontrol/admin?disable_self_healing_for=[anomaly_type]
 
+Supported anomaly types are `broker_failure`, `goal_violation`, `intra_broker_goal_violation`, `metric_anomaly`, `disk_failure`, `topic_anomaly`, and `maintenance_event`.
+
 To increase/decrease execution concurrency, send POST request like:
 
      POST /kafkacruisecontrol/admin?concurrent_partition_movements_per_broker=[integer]
+
+To change the replication throttle of an ongoing execution, send POST request like:
+
+     POST /kafkacruisecontrol/admin?replication_throttle=[bytes_per_second]
+
+The new throttle rate is applied right away to the brokers participating in the in-progress inter-broker replica movements, and picked up by the upcoming inter-broker replica movements of the ongoing execution. It has no effect if there is no ongoing inter-broker replica movement.
+
+Three things to know about the value:
+
+* `replication_throttle=null` **removes** the throttle: the in-progress inter-broker replica movements stop being throttled and the upcoming ones of this execution run unthrottled. An absent parameter means "no change requested", which is not the same thing.
+* `replication_throttle=0` is **not** "no throttle". Kafka reads it as a quota of zero bytes per second, so the throttled replica movements stop making progress until the throttle is changed again -- which makes it a way to pause an ongoing execution's replica movements, but a surprising one if `null` was meant. There is no timeout on an inter-broker replica movement, so a movement halted this way is waited on indefinitely.
+* The request **returns once the new rate has been verified on every participating broker and topic**, which can take tens of seconds: the throttle configs are written and read back one entity at a time, and a config write is not necessarily visible to the next read.
+
+The throttle in force for the ongoing execution is reported as `ongoingReplicationThrottle` by `GET /kafkacruisecontrol/state?substates=executor`. While the concurrency adjuster adjusts replication throttles (`concurrency.adjuster.replication.throttle.enabled`, or `replication_throttle_adjustment=true`), this is the base rate, which the adjuster may override per broker; the rates in force on each broker are reported as `ongoingReplicationThrottleByBroker` (`json=true`).
+
+With replication throttle adjustment enabled, the adjuster owns the rates:
+
+* `replication_throttle=X` puts X on every broker of the ongoing execution right away, replacing the rates the adjuster set; the adjuster may then move it again at its next run.
+* To make a throttle stick, turn the adjuster off: `POST /kafkacruisecontrol/admin?replication_throttle_adjustment=false`. If a `replication_throttle` was set during the ongoing execution, it is applied again on every broker of the execution and holds for the rest of it, whichever of the two requests came first (both parameters may also be in one request). Without one, the rates stay at the adjuster's last values.
+* `replication_throttle=null` is rejected (400) while the adjuster is on: turn `replication_throttle_adjustment` off first.
+* The switch stays off until `replication_throttle_adjustment=true` is sent: later executions run without the adjuster too. A restart reverts it to `concurrency.adjuster.replication.throttle.enabled`, as for every `admin` toggle; set that config to `false` to keep it off across restarts.
+
+To change the log dir throttle of an ongoing execution, send POST request like:
+
+     POST /kafkacruisecontrol/admin?log_dir_throttle=[bytes_per_second]
+
+The new throttle rate (which must be positive) is applied right away to the brokers participating in the in-progress intra-broker replica movements, and picked up by the upcoming intra-broker replica movements of the ongoing execution -- even if the execution started without a log dir throttle. The original value of `replica.alter.log.dirs.io.max.bytes.per.second` on these brokers is still restored once the execution finishes. It has no effect if there is no ongoing intra-broker replica movement.
+
+`log_dir_throttle=null` **removes** the throttle: the original per-broker value of `replica.alter.log.dirs.io.max.bytes.per.second` is restored on every broker this execution throttled, and the upcoming intra-broker replica movements run unthrottled. The throttle of the same execution can be set again afterwards. Unlike the replication throttle, a rate below 1 is rejected, so there is no zero-quota case here.
+
+The throttle in force on each broker is reported as `ongoingLogDirThrottleByBroker` by `GET /kafkacruisecontrol/state?substates=executor`.
 
 To drop recently removed/demoted brokers, send POST request like:
 

@@ -5,12 +5,25 @@
 package com.linkedin.kafka.cruisecontrol.servlet.parameters;
 
 import com.linkedin.cruisecontrol.http.CruiseControlRequestContext;
+import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUnitTestUtils;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskUsageDistributionGoal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskCapacityGoal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskIORateDistributionGoal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskUsageDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
+import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
+import com.linkedin.kafka.cruisecontrol.servlet.UserRequestException;
+import java.io.UnsupportedEncodingException;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
 import com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint;
+import java.util.regex.Pattern;
 import org.easymock.EasyMock;
 import org.junit.Assert;
 import org.junit.Test;
@@ -23,6 +36,8 @@ public class ParameterUtilsTest {
   private static final String END_TIME_STRING = "23456";
   private static final String REPLICATION_THROTTLE_STRING = "1000";
   private static final String DEFAULT_REPLICATION_THROTTLE_STRING = "2000";
+  private static final String LOG_DIR_THROTTLE_STRING = "3000";
+  private static final String DEFAULT_LOG_DIR_THROTTLE_STRING = "4000";
   private static final String EXECUTION_PROGRESS_CHECK_INTERVAL_STRING = "1500";
 
   @Test
@@ -51,6 +66,58 @@ public class ParameterUtilsTest {
     Assert.assertEquals(Long.valueOf(START_TIME_STRING), startMs);
     Assert.assertEquals(Long.valueOf(END_TIME_STRING), endMs);
     EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testGetGoalsInRebalanceDiskModeUsesConfiguredIntraBrokerGoals() throws UnsupportedEncodingException {
+    CruiseControlRequestContext mockRequest = mockRequestWithParameters(
+        Collections.singletonMap(ParameterUtils.REBALANCE_DISK_MODE_PARAM, Boolean.TRUE.toString()));
+
+    // Default intra-broker goals.
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    List<String> goals = ParameterUtils.getGoals(mockRequest, new KafkaCruiseControlConfig(props));
+    Assert.assertEquals(Arrays.asList(IntraBrokerDiskCapacityGoal.class.getSimpleName(),
+                                      IntraBrokerDiskUsageDistributionGoal.class.getSimpleName()), goals);
+
+    // Custom intra-broker goals are used in the configured order of priority.
+    props.setProperty(AnalyzerConfig.INTRA_BROKER_GOALS_CONFIG,
+                      String.join(",", IntraBrokerDiskCapacityGoal.class.getName(),
+                                  IntraBrokerDiskIORateDistributionGoal.class.getName(),
+                                  IntraBrokerDiskUsageDistributionGoal.class.getName()));
+    goals = ParameterUtils.getGoals(mockRequest, new KafkaCruiseControlConfig(props));
+    Assert.assertEquals(Arrays.asList(IntraBrokerDiskCapacityGoal.class.getSimpleName(),
+                                      IntraBrokerDiskIORateDistributionGoal.class.getSimpleName(),
+                                      IntraBrokerDiskUsageDistributionGoal.class.getSimpleName()), goals);
+  }
+
+  @Test
+  public void testGetGoalsInRebalanceDiskModeAcceptsOnlyConfiguredIntraBrokerGoals() throws UnsupportedEncodingException {
+    Map<String, String> parameters = new HashMap<>();
+    parameters.put(ParameterUtils.REBALANCE_DISK_MODE_PARAM, Boolean.TRUE.toString());
+    parameters.put(ParameterUtils.GOALS_PARAM, IntraBrokerDiskIORateDistributionGoal.class.getSimpleName());
+    CruiseControlRequestContext mockRequest = mockRequestWithParameters(parameters);
+
+    // The I/O goal is not in the default intra.broker.goals, so it is rejected.
+    KafkaCruiseControlConfig config = new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties());
+    Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.getGoals(mockRequest, config));
+
+    // Once it is in intra.broker.goals, it can be requested alone.
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnalyzerConfig.INTRA_BROKER_GOALS_CONFIG,
+                      String.join(",", IntraBrokerDiskCapacityGoal.class.getName(), IntraBrokerDiskIORateDistributionGoal.class.getName(),
+                                  IntraBrokerDiskUsageDistributionGoal.class.getName()));
+    Assert.assertEquals(List.of(IntraBrokerDiskIORateDistributionGoal.class.getSimpleName()),
+                        ParameterUtils.getGoals(mockRequest, new KafkaCruiseControlConfig(props)));
+  }
+
+  private static CruiseControlRequestContext mockRequestWithParameters(Map<String, String> parameters) {
+    Map<String, String[]> parameterMap = new HashMap<>();
+    parameters.forEach((name, value) -> parameterMap.put(name, new String[]{value}));
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(parameterMap).anyTimes();
+    parameters.forEach((name, value) -> EasyMock.expect(mockRequest.getParameter(name)).andReturn(value).anyTimes());
+    EasyMock.replay(mockRequest);
+    return mockRequest;
   }
 
   @Test
@@ -83,6 +150,35 @@ public class ParameterUtilsTest {
   }
 
   @Test
+  public void testReplicationThrottleAdjustment() {
+    String firstResponse = Boolean.TRUE.toString();
+    String secondResponse = Boolean.FALSE.toString();
+
+    // Mock for (1) default response (2) response for valid input with true/false.
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(Collections.emptyMap())
+            .andReturn(Collections.singletonMap(ParameterUtils.REPLICATION_THROTTLE_ADJUSTMENT_PARAM, new String[]{firstResponse}))
+            .andReturn(Collections.singletonMap(ParameterUtils.REPLICATION_THROTTLE_ADJUSTMENT_PARAM, new String[]{secondResponse}));
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.REPLICATION_THROTTLE_ADJUSTMENT_PARAM))
+            .andReturn(firstResponse).andReturn(secondResponse);
+
+    // Verify default response.
+    EasyMock.replay(mockRequest);
+    Boolean replicationThrottleAdjustment = ParameterUtils.replicationThrottleAdjustment(mockRequest);
+    Assert.assertNull(replicationThrottleAdjustment);
+
+    // Verify response for valid input.
+    replicationThrottleAdjustment = ParameterUtils.replicationThrottleAdjustment(mockRequest);
+    Assert.assertNotNull(replicationThrottleAdjustment);
+    Assert.assertTrue(replicationThrottleAdjustment);
+    replicationThrottleAdjustment = ParameterUtils.replicationThrottleAdjustment(mockRequest);
+    Assert.assertNotNull(replicationThrottleAdjustment);
+    Assert.assertFalse(replicationThrottleAdjustment);
+
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
   public void testParseTimeRangeNotSet() {
     CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
     // Mock the request so that it does not contain start/end time
@@ -100,6 +196,60 @@ public class ParameterUtilsTest {
     Assert.assertEquals(DEFAULT_START_TIME_MS, startMs);
     Assert.assertEquals(DEFAULT_END_TIME_MS, endMs);
     EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testParseLogDirThrottleWithNoDefault() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    KafkaCruiseControlConfig controlConfig = EasyMock.mock(KafkaCruiseControlConfig.class);
+
+    Map<String, String[]> paramMap = Collections.singletonMap(ParameterUtils.LOG_DIR_THROTTLE_PARAM,
+                                                              new String[]{ParameterUtils.LOG_DIR_THROTTLE_PARAM});
+
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).once();
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.LOG_DIR_THROTTLE_PARAM)).andReturn(LOG_DIR_THROTTLE_STRING).once();
+    // No default
+    EasyMock.expect(controlConfig.getLong(ExecutorConfig.DEFAULT_LOG_DIR_THROTTLE_CONFIG)).andReturn(null);
+
+    EasyMock.replay(mockRequest, controlConfig);
+
+    Long logDirThrottle = ParameterUtils.logDirThrottle(mockRequest, controlConfig);
+    Assert.assertEquals(Long.valueOf(LOG_DIR_THROTTLE_STRING), logDirThrottle);
+    EasyMock.verify(mockRequest, controlConfig);
+  }
+
+  @Test
+  public void testParseLogDirThrottleWithDefault() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    KafkaCruiseControlConfig controlConfig = EasyMock.mock(KafkaCruiseControlConfig.class);
+    // No parameter string value in the parameter map
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(Collections.emptyMap()).once();
+    EasyMock.expect(controlConfig.getLong(ExecutorConfig.DEFAULT_LOG_DIR_THROTTLE_CONFIG))
+            .andReturn(Long.valueOf(DEFAULT_LOG_DIR_THROTTLE_STRING));
+
+    EasyMock.replay(mockRequest, controlConfig);
+
+    Long logDirThrottle = ParameterUtils.logDirThrottle(mockRequest, controlConfig);
+    Assert.assertEquals(Long.valueOf(DEFAULT_LOG_DIR_THROTTLE_STRING), logDirThrottle);
+    EasyMock.verify(mockRequest, controlConfig);
+  }
+
+  @Test
+  public void testParseLogDirThrottleRejectsNonPositiveValue() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    KafkaCruiseControlConfig controlConfig = EasyMock.mock(KafkaCruiseControlConfig.class);
+
+    Map<String, String[]> paramMap = Collections.singletonMap(ParameterUtils.LOG_DIR_THROTTLE_PARAM,
+                                                              new String[]{ParameterUtils.LOG_DIR_THROTTLE_PARAM});
+
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).once();
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.LOG_DIR_THROTTLE_PARAM)).andReturn("0").once();
+    EasyMock.expect(controlConfig.getLong(ExecutorConfig.DEFAULT_LOG_DIR_THROTTLE_CONFIG)).andReturn(null);
+
+    EasyMock.replay(mockRequest, controlConfig);
+
+    Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.logDirThrottle(mockRequest, controlConfig));
+    EasyMock.verify(mockRequest, controlConfig);
   }
 
   @Test
@@ -137,6 +287,137 @@ public class ParameterUtilsTest {
     Long replicationThrottle = ParameterUtils.replicationThrottle(mockRequest, controlConfig);
     Assert.assertEquals(Long.valueOf(DEFAULT_REPLICATION_THROTTLE_STRING), replicationThrottle);
     EasyMock.verify(mockRequest, controlConfig);
+  }
+
+  @Test
+  public void testParseRequestedReplicationThrottle() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+
+    Map<String, String[]> paramMap = Collections.singletonMap(
+        ParameterUtils.REPLICATION_THROTTLE_PARAM,
+        new String[]{ParameterUtils.REPLICATION_THROTTLE_PARAM});
+
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).once();
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.REPLICATION_THROTTLE_PARAM)).andReturn(REPLICATION_THROTTLE_STRING).once();
+
+    EasyMock.replay(mockRequest);
+
+    Long replicationThrottle = ParameterUtils.requestedReplicationThrottle(mockRequest);
+    Assert.assertEquals(Long.valueOf(REPLICATION_THROTTLE_STRING), replicationThrottle);
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testParseRequestedReplicationThrottleWithoutValueDoesNotFallBackToDefault() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    // No parameter string value in the parameter map -- the requested replication throttle should be null rather than
+    // falling back to the default replication throttle config.
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(Collections.emptyMap()).once();
+
+    EasyMock.replay(mockRequest);
+
+    Assert.assertNull(ParameterUtils.requestedReplicationThrottle(mockRequest));
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testParseRequestedLogDirThrottle() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+
+    Map<String, String[]> paramMap = Collections.singletonMap(ParameterUtils.LOG_DIR_THROTTLE_PARAM,
+                                                              new String[]{ParameterUtils.LOG_DIR_THROTTLE_PARAM});
+
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).once();
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.LOG_DIR_THROTTLE_PARAM)).andReturn(LOG_DIR_THROTTLE_STRING).once();
+
+    EasyMock.replay(mockRequest);
+
+    Long logDirThrottle = ParameterUtils.requestedLogDirThrottle(mockRequest);
+    Assert.assertEquals(Long.valueOf(LOG_DIR_THROTTLE_STRING), logDirThrottle);
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testParseRequestedLogDirThrottleWithoutValueDoesNotFallBackToDefault() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    // No parameter string value in the parameter map -- the requested log dir throttle should be null rather than
+    // falling back to the default log dir throttle config.
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(Collections.emptyMap()).once();
+
+    EasyMock.replay(mockRequest);
+
+    Assert.assertNull(ParameterUtils.requestedLogDirThrottle(mockRequest));
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testParseRequestedThrottleUnsetValueAsksForRemoval() {
+    for (String parameter : new String[]{ParameterUtils.REPLICATION_THROTTLE_PARAM, ParameterUtils.LOG_DIR_THROTTLE_PARAM}) {
+      for (String value : new String[]{ParameterUtils.UNSET_PARAMETER_VALUE, "NULL", " null "}) {
+        CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+        Map<String, String[]> paramMap = Collections.singletonMap(parameter, new String[]{parameter});
+        EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).times(2);
+        EasyMock.expect(mockRequest.getParameter(parameter)).andReturn(value).times(2);
+        EasyMock.replay(mockRequest);
+
+        // The unset value asks for a removal, so it yields no rate -- and must not be parsed as a number.
+        if (parameter.equals(ParameterUtils.REPLICATION_THROTTLE_PARAM)) {
+          Assert.assertNull(ParameterUtils.requestedReplicationThrottle(mockRequest));
+          Assert.assertTrue(ParameterUtils.removeRequestedReplicationThrottle(mockRequest));
+        } else {
+          Assert.assertNull(ParameterUtils.requestedLogDirThrottle(mockRequest));
+          Assert.assertTrue(ParameterUtils.removeRequestedLogDirThrottle(mockRequest));
+        }
+        EasyMock.verify(mockRequest);
+      }
+    }
+  }
+
+  @Test
+  public void testParseRequestedThrottleDoesNotAskForRemovalWithARate() {
+    for (String parameter : new String[]{ParameterUtils.REPLICATION_THROTTLE_PARAM, ParameterUtils.LOG_DIR_THROTTLE_PARAM}) {
+      CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+      Map<String, String[]> paramMap = Collections.singletonMap(parameter, new String[]{parameter});
+      EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).once();
+      EasyMock.expect(mockRequest.getParameter(parameter)).andReturn("1024").once();
+      EasyMock.replay(mockRequest);
+
+      if (parameter.equals(ParameterUtils.REPLICATION_THROTTLE_PARAM)) {
+        Assert.assertFalse(ParameterUtils.removeRequestedReplicationThrottle(mockRequest));
+      } else {
+        Assert.assertFalse(ParameterUtils.removeRequestedLogDirThrottle(mockRequest));
+      }
+      EasyMock.verify(mockRequest);
+    }
+  }
+
+  @Test
+  public void testParseRequestedThrottleRemovalIsNotRequestedWhenAbsent() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(Collections.emptyMap()).times(2);
+    EasyMock.replay(mockRequest);
+
+    Assert.assertFalse(ParameterUtils.removeRequestedReplicationThrottle(mockRequest));
+    Assert.assertFalse(ParameterUtils.removeRequestedLogDirThrottle(mockRequest));
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testParseRequestedLogDirThrottleRejectsNonPositiveValue() {
+    for (String value : new String[]{"0", "-1"}) {
+      CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+
+      Map<String, String[]> paramMap = Collections.singletonMap(ParameterUtils.LOG_DIR_THROTTLE_PARAM,
+                                                                new String[]{ParameterUtils.LOG_DIR_THROTTLE_PARAM});
+
+      EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).once();
+      EasyMock.expect(mockRequest.getParameter(ParameterUtils.LOG_DIR_THROTTLE_PARAM)).andReturn(value).once();
+
+      EasyMock.replay(mockRequest);
+
+      Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.requestedLogDirThrottle(mockRequest));
+      EasyMock.verify(mockRequest);
+    }
   }
 
   @Test
@@ -243,6 +524,161 @@ public class ParameterUtilsTest {
     EasyMock.replay(mockRequest);
 
     Assert.assertEquals(CruiseControlEndPoint.STATE, ParameterUtils.endPoint(mockRequest));
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testBrokerIdAndLogdirs() throws UnsupportedEncodingException {
+    // The first hyphen of a pair separates the broker id from the logdir, which may contain hyphens. Empty pairs are ignored.
+    Assert.assertEquals(Map.of(101, Set.of("/tmp/kafka-logs-1", "/tmp/kafka-logs-2"), 102, Set.of("/data/d-1")),
+                        ParameterUtils.brokerIdAndLogdirs(requestWithBrokerIdAndLogdirs("101-/tmp/kafka-logs-1,,101-/tmp/kafka-logs-2,"
+                                                                                        + "102-/data/d-1")));
+    Assert.assertEquals(Collections.emptyMap(), ParameterUtils.brokerIdAndLogdirs(requestWithBrokerIdAndLogdirs("")));
+    Assert.assertEquals(Collections.emptyMap(), ParameterUtils.brokerIdAndLogdirs(requestWithBrokerIdAndLogdirs(null)));
+  }
+
+  @Test
+  public void testInvalidBrokerIdAndLogdirs() {
+    for (String invalidPair : List.of("101", "-/tmp/kafka-logs-1", "-1-/tmp/kafka-logs-1", "abc-/tmp/kafka-logs-1", "101-")) {
+      UserRequestException e = Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.brokerIdAndLogdirs(
+          requestWithBrokerIdAndLogdirs("101-/tmp/kafka-logs-2," + invalidPair)));
+      Assert.assertTrue(e.getMessage(), e.getMessage().contains(String.format("'%s'", invalidPair)));
+    }
+  }
+
+  @Test
+  public void testGoalsInRebalanceDiskMode() throws UnsupportedEncodingException {
+    KafkaCruiseControlConfig config = new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties());
+    String capacityGoal = IntraBrokerDiskCapacityGoal.class.getSimpleName();
+    String usageGoal = IntraBrokerDiskUsageDistributionGoal.class.getSimpleName();
+    Map<String, String> rebalanceDisk = Map.of(ParameterUtils.REBALANCE_DISK_MODE_PARAM, "true");
+
+    // Without requested goals, the intra-broker goals of the config, in their order.
+    Assert.assertEquals(List.of(capacityGoal, usageGoal), ParameterUtils.getGoals(request(rebalanceDisk), config));
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnalyzerConfig.INTRA_BROKER_GOALS_CONFIG, IntraBrokerDiskUsageDistributionGoal.class.getName());
+    Assert.assertEquals(List.of(usageGoal), ParameterUtils.getGoals(request(rebalanceDisk), new KafkaCruiseControlConfig(props)));
+
+    // Requested intra-broker goals are accepted, whatever the case of their names.
+    Map<String, String> requestedGoals = Map.of(ParameterUtils.REBALANCE_DISK_MODE_PARAM, "true",
+                                                ParameterUtils.GOALS_PARAM, usageGoal.toLowerCase());
+    Assert.assertEquals(List.of(usageGoal.toLowerCase()), ParameterUtils.getGoals(request(requestedGoals), config));
+
+    // Requested goals that are not intra-broker goals are rejected.
+    String interBrokerGoal = DiskUsageDistributionGoal.class.getSimpleName();
+    Map<String, String> unsupportedGoals = Map.of(ParameterUtils.REBALANCE_DISK_MODE_PARAM, "true",
+                                                  ParameterUtils.GOALS_PARAM, capacityGoal + "," + interBrokerGoal);
+    UserRequestException e = Assert.assertThrows(UserRequestException.class,
+                                                 () -> ParameterUtils.getGoals(request(unsupportedGoals), config));
+    Assert.assertTrue(e.getMessage(), e.getMessage().endsWith(String.format("got [%s].", interBrokerGoal)));
+
+    // Outside of rebalance disk mode, the requested goals are returned as they are.
+    Assert.assertEquals(List.of(), ParameterUtils.getGoals(request(Map.of()), config));
+    Assert.assertEquals(List.of(interBrokerGoal),
+                        ParameterUtils.getGoals(request(Map.of(ParameterUtils.GOALS_PARAM, interBrokerGoal)), config));
+  }
+
+  /**
+   * @param brokerIdAndLogdirs The value of {@link ParameterUtils#BROKER_ID_AND_LOGDIRS_PARAM}, or {@code null} to leave the
+   *                           parameter out.
+   * @return A request with the given broker id and logdir pairs.
+   */
+  private static CruiseControlRequestContext requestWithBrokerIdAndLogdirs(String brokerIdAndLogdirs) {
+    return request(brokerIdAndLogdirs == null ? Map.of() : Map.of(ParameterUtils.BROKER_ID_AND_LOGDIRS_PARAM, brokerIdAndLogdirs));
+  }
+
+  /**
+   * @param parameters The value of each parameter of the request.
+   * @return A request with the given parameters.
+   */
+  private static CruiseControlRequestContext request(Map<String, String> parameters) {
+    Map<String, String[]> parameterMap = new HashMap<>();
+    parameters.forEach((name, value) -> parameterMap.put(name, new String[]{value}));
+    CruiseControlRequestContext request = EasyMock.niceMock(CruiseControlRequestContext.class);
+    EasyMock.expect(request.getParameterMap()).andReturn(parameterMap).anyTimes();
+    EasyMock.expect(request.getParameter(EasyMock.anyString()))
+            .andAnswer(() -> parameters.get((String) EasyMock.getCurrentArgument(0))).anyTimes();
+    EasyMock.replay(request);
+    return request;
+  }
+
+  @Test
+  public void testRebalanceDiskBrokerByBroker() {
+    // Default: not set.
+    Assert.assertFalse(ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(Collections.emptyMap())));
+
+    // Set along with rebalance_disk=true.
+    Map<String, String> params = new HashMap<>();
+    params.put(ParameterUtils.REBALANCE_DISK_MODE_PARAM, "true");
+    params.put(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "true");
+    Assert.assertTrue(ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(params)));
+
+    // Explicitly disabled along with rebalance_disk=true.
+    params.put(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "false");
+    Assert.assertFalse(ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(params)));
+
+    // Set without rebalance_disk=true.
+    Map<String, String> invalidParams = Collections.singletonMap(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "true");
+    Assert.assertThrows(UserRequestException.class,
+                        () -> ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(invalidParams)));
+    params.put(ParameterUtils.REBALANCE_DISK_MODE_PARAM, "false");
+    params.put(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "true");
+    Assert.assertThrows(UserRequestException.class,
+                        () -> ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(params)));
+  }
+
+  private static CruiseControlRequestContext mockRequestWithParams(Map<String, String> params) {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    Map<String, String[]> paramMap = new HashMap<>();
+    params.forEach((name, value) -> paramMap.put(name, new String[]{value}));
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).anyTimes();
+    params.forEach((name, value) -> EasyMock.expect(mockRequest.getParameter(name)).andReturn(value).anyTimes());
+    EasyMock.replay(mockRequest);
+    return mockRequest;
+  }
+
+  @Test
+  public void testIncludedTopics() {
+    String includedTopics = "topic1|topic2";
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getParameterMap())
+            .andReturn(Collections.emptyMap())
+            .andReturn(Collections.singletonMap(ParameterUtils.INCLUDED_TOPICS_PARAM, new String[]{includedTopics})).times(2);
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.INCLUDED_TOPICS_PARAM)).andReturn(includedTopics);
+    EasyMock.replay(mockRequest);
+
+    // Verify default response.
+    Assert.assertNull(ParameterUtils.includedTopics(mockRequest));
+
+    // Verify response for valid input.
+    Pattern includedTopicsPattern = ParameterUtils.includedTopics(mockRequest);
+    Assert.assertNotNull(includedTopicsPattern);
+    Assert.assertEquals(includedTopics, includedTopicsPattern.pattern());
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testIncludedTopicsIsMutuallyExclusiveWithExcludedTopics() {
+    Map<String, String[]> paramMap = new HashMap<>();
+    paramMap.put(ParameterUtils.INCLUDED_TOPICS_PARAM, new String[]{"topic1"});
+    paramMap.put(ParameterUtils.EXCLUDED_TOPICS_PARAM, new String[]{"topic2"});
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).times(2);
+    EasyMock.replay(mockRequest);
+
+    Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.includedTopics(mockRequest));
+    EasyMock.verify(mockRequest);
+  }
+
+  @Test
+  public void testIncludedTopicsCannotBeEmpty() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    EasyMock.expect(mockRequest.getParameterMap())
+            .andReturn(Collections.singletonMap(ParameterUtils.INCLUDED_TOPICS_PARAM, new String[]{""})).times(2);
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.INCLUDED_TOPICS_PARAM)).andReturn("");
+    EasyMock.replay(mockRequest);
+
+    Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.includedTopics(mockRequest));
     EasyMock.verify(mockRequest);
   }
 }

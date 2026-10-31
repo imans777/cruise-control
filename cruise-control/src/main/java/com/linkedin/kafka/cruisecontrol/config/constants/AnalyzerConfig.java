@@ -36,7 +36,9 @@ import com.linkedin.kafka.cruisecontrol.config.BrokerSetFileResolver;
 import com.linkedin.kafka.cruisecontrol.config.BrokerSetResolver;
 import com.linkedin.kafka.cruisecontrol.config.NoOpBrokerSetAssignmentPolicy;
 import com.linkedin.kafka.cruisecontrol.config.ReplicaToBrokerSetMappingPolicy;
+import com.linkedin.kafka.cruisecontrol.config.ReplicaToOriginalBrokerSetMappingPolicy;
 import com.linkedin.kafka.cruisecontrol.config.TopicNameHashBrokerSetMappingPolicy;
+import com.linkedin.kafka.cruisecontrol.config.TopicPatternBrokerSetMappingPolicy;
 import java.util.StringJoiner;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.common.config.ConfigDef;
@@ -56,36 +58,65 @@ public final class AnalyzerConfig {
    */
   public static final String CPU_BALANCE_THRESHOLD_CONFIG = "cpu.balance.threshold";
   public static final double DEFAULT_CPU_BALANCE_THRESHOLD = 1.10;
-  public static final String CPU_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for CPU utilization. "
-      + "For example, 1.10 means the highest CPU usage of a broker should not be above 1.10x of average CPU utilization"
-      + " of all the brokers.";
+  public static final String CPU_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for CPU "
+      + "utilization. Utilization of a broker is measured as a percentage of its own CPU capacity. For example, "
+      + "1.10 means the CPU utilization percentage of a broker should be within 0.90x and 1.10x of the average CPU "
+      + "utilization percentage of the cluster (i.e. total CPU usage divided by total CPU capacity) -- hence, "
+      + "brokers with more capacity are expected to take proportionally more load. Note that a large value does "
+      + "not allow a fixed ratio between the loads of brokers; instead, it disables the balancing for CPU "
+      + "utilization.";
 
   /**
    * <code>disk.balance.threshold</code>
    */
   public static final String DISK_BALANCE_THRESHOLD_CONFIG = "disk.balance.threshold";
   public static final double DEFAULT_DISK_BALANCE_THRESHOLD = 1.10;
-  public static final String DISK_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for disk utilization. "
-      + "For example, 1.10 means the highest disk usage of a broker should not be above 1.10x of average disk utilization"
-      + " of all the brokers.";
+  public static final String DISK_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for disk "
+      + "utilization. Utilization of a broker is measured as a percentage of its own disk capacity. For example, "
+      + "1.10 means the disk utilization percentage of a broker should be within 0.90x and 1.10x of the average "
+      + "disk utilization percentage of the cluster (i.e. total disk usage divided by total disk capacity) -- "
+      + "hence, brokers with more capacity are expected to take proportionally more load. Note that a large value "
+      + "does not allow a fixed ratio between the loads of brokers; instead, it disables the balancing for disk "
+      + "utilization. Unless intra.broker.disk.balance.threshold is set, this value also bounds the utilization percentage of "
+      + "each disk relative to the one of its broker (IntraBrokerDiskUsageDistributionGoal), and through it the estimated "
+      + "disk I/O rate of each disk (IntraBrokerDiskIORateDistributionGoal) unless intra.broker.disk.io.balance.threshold is set.";
+
+  /**
+   * <code>intra.broker.disk.balance.threshold</code>
+   */
+  public static final String INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG = "intra.broker.disk.balance.threshold";
+  public static final Double DEFAULT_INTRA_BROKER_DISK_BALANCE_THRESHOLD = null;
+  public static final String INTRA_BROKER_DISK_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for disk utilization "
+      + "across the disks of the same broker, used by intra-broker disk goals (e.g. IntraBrokerDiskUsageDistributionGoal). "
+      + "For example, 1.10 means the utilization percentage of each disk should be within 0.90x and 1.10x of the utilization "
+      + "percentage of its broker (the goal applies a balance margin of 0.9, i.e. 0.91x-1.09x). If not set, the value of "
+      + DISK_BALANCE_THRESHOLD_CONFIG + " is used.";
 
   /**
    * <code>network.inbound.balance.threshold</code>
    */
   public static final String NETWORK_INBOUND_BALANCE_THRESHOLD_CONFIG = "network.inbound.balance.threshold";
   public static final double DEFAULT_NETWORK_INBOUND_BALANCE_THRESHOLD = 1.10;
-  public static final String NETWORK_INBOUND_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for network "
-      + "inbound usage. For example, 1.10 means the highest network inbound usage of a broker should not be above "
-      + "1.10x of average network inbound usage of all the brokers.";
+  public static final String NETWORK_INBOUND_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for "
+      + "network inbound utilization. Utilization of a broker is measured as a percentage of its own network "
+      + "inbound capacity. For example, 1.10 means the network inbound utilization percentage of a broker should "
+      + "be within 0.90x and 1.10x of the average network inbound utilization percentage of the cluster (i.e. "
+      + "total network inbound usage divided by total network inbound capacity) -- hence, brokers with more "
+      + "capacity are expected to take proportionally more load. Note that a large value does not allow a fixed "
+      + "ratio between the loads of brokers; instead, it disables the balancing for network inbound utilization.";
 
   /**
    * <code>network.outbound.balance.threshold</code>
    */
   public static final String NETWORK_OUTBOUND_BALANCE_THRESHOLD_CONFIG = "network.outbound.balance.threshold";
   public static final double DEFAULT_NETWORK_OUTBOUND_BALANCE_THRESHOLD = 1.10;
-  public static final String NETWORK_OUTBOUND_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for network "
-      + "outbound usage. For example, 1.10 means the highest network outbound usage of a broker should not be above "
-      + "1.10x of average network outbound usage of all the brokers.";
+  public static final String NETWORK_OUTBOUND_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for "
+      + "network outbound utilization. Utilization of a broker is measured as a percentage of its own network "
+      + "outbound capacity. For example, 1.10 means the network outbound utilization percentage of a broker should "
+      + "be within 0.90x and 1.10x of the average network outbound utilization percentage of the cluster (i.e. "
+      + "total network outbound usage divided by total network outbound capacity) -- hence, brokers with more "
+      + "capacity are expected to take proportionally more load. Note that a large value does not allow a fixed "
+      + "ratio between the loads of brokers; instead, it disables the balancing for network outbound utilization.";
 
   /**
    * <code>replica.count.balance.threshold</code>
@@ -95,6 +126,31 @@ public final class AnalyzerConfig {
   public static final String REPLICA_COUNT_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for replica "
       + "distribution. For example, 1.10 means the highest replica count of a broker should not be above 1.10x of "
       + "average replica count of all brokers.";
+
+  /**
+   * <code>intra.broker.disk.io.read.weight</code>
+   */
+  public static final String INTRA_BROKER_DISK_IO_READ_WEIGHT_CONFIG = "intra.broker.disk.io.read.weight";
+  public static final double DEFAULT_INTRA_BROKER_DISK_IO_READ_WEIGHT = 1.0;
+  public static final String INTRA_BROKER_DISK_IO_READ_WEIGHT_DOC = "The weight of the outbound network rate (i.e. reads) "
+      + "in the disk I/O rate estimation of a replica, which is used by IntraBrokerDiskIORateDistributionGoal. The disk I/O "
+      + "rate of a replica is estimated as (inbound network rate + weight * outbound network rate), where the inbound "
+      + "network rate approximates disk writes (for both leader and follower replicas) and the outbound network rate "
+      + "approximates disk reads (for leader replicas only). For example, 1.0 means reads and writes are counted equally, "
+      + "0.3 discounts reads that are mostly served from the page cache (e.g. consumers reading from the tail of the log), "
+      + "and 0.0 means only writes are considered.";
+
+  /**
+   * <code>intra.broker.disk.io.balance.threshold</code>
+   */
+  public static final String INTRA_BROKER_DISK_IO_BALANCE_THRESHOLD_CONFIG = "intra.broker.disk.io.balance.threshold";
+  public static final Double DEFAULT_INTRA_BROKER_DISK_IO_BALANCE_THRESHOLD = null;
+  public static final String INTRA_BROKER_DISK_IO_BALANCE_THRESHOLD_DOC = "The maximum allowed extent of unbalance for the "
+      + "estimated disk I/O rate across the disks of the same broker, used by IntraBrokerDiskIORateDistributionGoal. For "
+      + "example, 1.20 means the highest estimated disk I/O rate of a disk should not be above 1.20x of the average estimated "
+      + "disk I/O rate of all the disks of its broker. If not set, the value of " + INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG
+      + " is used (which in turn defaults to " + DISK_BALANCE_THRESHOLD_CONFIG + "). Since a single hot replica can account for a "
+      + "large share of the I/O rate of a disk, consider a looser value than " + INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG + ".";
 
   /**
    * <code>leader.replica.count.balance.threshold</code>
@@ -289,7 +345,8 @@ public final class AnalyzerConfig {
                                                                                .add(IntraBrokerDiskUsageDistributionGoal.class.getName()).toString();
   public static final String INTRA_BROKER_GOALS_DOC = "A list of case insensitive intra-broker goals in the order of priority. "
       + "The high priority goals will be executed first. The intra-broker goals are only relevant if intra-broker operation is "
-      + "supported (i.e. in  Cruise Control versions above 2.*), otherwise this list should be empty.";
+      + "supported (i.e. in  Cruise Control versions above 2.*), otherwise this list should be empty. These goals are used "
+      + "when a rebalance or proposals request sets rebalance_disk=true.";
 
   /**
    * <code>hard.goals</code>
@@ -440,7 +497,9 @@ public final class AnalyzerConfig {
    */
   public static final String BROKER_SET_CONFIG_FILE_CONFIG = "broker.set.config.file";
   public static final String DEFAULT_BROKER_SET_CONFIG_FILE = "config/brokerSets.json";
-  public static final String BROKER_SET_CONFIG_FILE_DOC = "The file path that holds broker sets ids to broker ids mapping information.";
+  public static final String BROKER_SET_CONFIG_FILE_DOC = "The file path that holds broker sets ids to broker ids mapping information. "
+      + "A broker set may also have an optional topicPattern field, which TopicPatternBrokerSetMappingPolicy uses to bind the topics "
+      + "that fully match the pattern to that broker set.";
 
   /**
    * <code>broker.set.assignment.policy.class</code>
@@ -457,8 +516,10 @@ public final class AnalyzerConfig {
   public static final String REPLICA_TO_BROKER_SET_MAPPING_POLICY_CLASS_CONFIG = "replica.to.broker.set.mapping.policy.class";
   public static final String DEFAULT_REPLICA_TO_BROKER_SET_MAPPING_POLICY_CLASS = TopicNameHashBrokerSetMappingPolicy.class.getName();
   public static final String REPLICA_TO_BROKER_SET_MAPPING_POLICY_CLASS_DOC =
-      String.format("The class implements %s interface and is used to generate replica to broker set mapping.",
-                    ReplicaToBrokerSetMappingPolicy.class.getName());
+      String.format("The class implements %s interface and is used to generate replica to broker set mapping. Built-in policies are "
+                    + "%s (default), %s and %s. The latter leaves replicas of topics that match no topicPattern unbound to any broker set.",
+                    ReplicaToBrokerSetMappingPolicy.class.getName(), TopicNameHashBrokerSetMappingPolicy.class.getName(),
+                    ReplicaToOriginalBrokerSetMappingPolicy.class.getName(), TopicPatternBrokerSetMappingPolicy.class.getName());
 
   private AnalyzerConfig() {
   }
@@ -482,6 +543,16 @@ public final class AnalyzerConfig {
                             atLeast(1),
                             ConfigDef.Importance.HIGH,
                             DISK_BALANCE_THRESHOLD_DOC)
+                    .define(INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG,
+                            ConfigDef.Type.DOUBLE,
+                            DEFAULT_INTRA_BROKER_DISK_BALANCE_THRESHOLD,
+                            ConfigDef.LambdaValidator.with((name, value) -> {
+                              if (value != null) {
+                                atLeast(1).ensureValid(name, value);
+                              }
+                            }, () -> "null or " + atLeast(1)),
+                            ConfigDef.Importance.MEDIUM,
+                            INTRA_BROKER_DISK_BALANCE_THRESHOLD_DOC)
                     .define(NETWORK_INBOUND_BALANCE_THRESHOLD_CONFIG,
                             ConfigDef.Type.DOUBLE,
                             DEFAULT_NETWORK_INBOUND_BALANCE_THRESHOLD,
@@ -506,6 +577,22 @@ public final class AnalyzerConfig {
                             atLeast(1),
                             ConfigDef.Importance.HIGH,
                             LEADER_REPLICA_COUNT_BALANCE_THRESHOLD_DOC)
+                    .define(INTRA_BROKER_DISK_IO_READ_WEIGHT_CONFIG,
+                            ConfigDef.Type.DOUBLE,
+                            DEFAULT_INTRA_BROKER_DISK_IO_READ_WEIGHT,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            INTRA_BROKER_DISK_IO_READ_WEIGHT_DOC)
+                    .define(INTRA_BROKER_DISK_IO_BALANCE_THRESHOLD_CONFIG,
+                            ConfigDef.Type.DOUBLE,
+                            DEFAULT_INTRA_BROKER_DISK_IO_BALANCE_THRESHOLD,
+                            ConfigDef.LambdaValidator.with((name, value) -> {
+                              if (value != null) {
+                                atLeast(1).ensureValid(name, value);
+                              }
+                            }, () -> "null or " + atLeast(1)),
+                            ConfigDef.Importance.LOW,
+                            INTRA_BROKER_DISK_IO_BALANCE_THRESHOLD_DOC)
                     .define(TOPIC_REPLICA_COUNT_BALANCE_THRESHOLD_CONFIG,
                             ConfigDef.Type.DOUBLE,
                             DEFAULT_TOPIC_REPLICA_COUNT_BALANCE_THRESHOLD,

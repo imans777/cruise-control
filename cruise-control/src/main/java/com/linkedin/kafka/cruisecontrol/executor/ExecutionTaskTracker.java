@@ -7,6 +7,7 @@ package com.linkedin.kafka.cruisecontrol.executor;
 import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -17,6 +18,7 @@ import java.util.Set;
 import org.apache.kafka.common.utils.Time;
 
 import static com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils.EXECUTOR_SENSOR;
+import static com.linkedin.kafka.cruisecontrol.executor.ExecutionTask.BYTES_IN_MB;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutionTask.TaskType;
 
 /**
@@ -26,19 +28,31 @@ import static com.linkedin.kafka.cruisecontrol.executor.ExecutionTask.TaskType;
  */
 public class ExecutionTaskTracker {
   private final Map<TaskType, Map<ExecutionTaskState, Set<ExecutionTask>>> _tasksByType;
-  private long _remainingInterBrokerDataToMoveInMB;
-  private long _remainingIntraBrokerDataToMoveInMB;
-  private long _inExecutionInterBrokerDataMovementInMB;
-  private long _inExecutionIntraBrokerDataMovementInMB;
-  private long _finishedInterBrokerDataMovementInMB;
-  private long _finishedIntraBrokerDataMovementInMB;
+  // The data movement and execution start time are volatile, because gauge sensors read them from metric reporter threads.
+  private volatile long _totalInterBrokerDataToMoveInMB;
+  private volatile long _totalIntraBrokerDataToMoveInMB;
+  private volatile long _remainingInterBrokerDataToMoveInMB;
+  private volatile long _remainingIntraBrokerDataToMoveInMB;
+  private volatile long _inExecutionInterBrokerDataMovementInMB;
+  private volatile long _inExecutionIntraBrokerDataMovementInMB;
+  private volatile long _finishedInterBrokerDataMovementInMB;
+  private volatile long _finishedIntraBrokerDataMovementInMB;
+  private volatile long _completedInterBrokerDataMovementInMB;
+  private volatile long _completedIntraBrokerDataMovementInMB;
+  private volatile long _executionStartMs;
   private boolean _isKafkaAssignerMode;
   private final Time _time;
   private volatile boolean _stopRequested;
+  // Incremented whenever a task is added or changes its state -- used for detecting changes to persist.
+  private long _taskStateVersion;
   private final Meter _interBrokerPartitionMovementRateMeter;
   private final Meter _intraBrokerPartitionMovementRateMeter;
   private final Meter _leadershipMovementRateMeter;
   private final Meter _partitionDataMovementRateMeter;
+  // Bytes of the in-progress replica movement tasks that have been accounted for in _partitionDataMovementRateMeter.
+  private final Map<ExecutionTask, Long> _meteredDataMovementInBytesByTask;
+  // Bytes that have been moved but not yet marked in _partitionDataMovementRateMeter, which is marked in MBs.
+  private long _unmeteredDataMovementInBytes;
 
   public static final String INTER_BROKER_REPLICA_ACTION = "replica-action";
   public static final String INTRA_BROKER_REPLICA_ACTION = "intra-broker-replica-action";
@@ -55,6 +69,18 @@ public class ExecutionTaskTracker {
   public static final String METER_INTRA_BROKER_PARTITION_MOVEMENT_RATE = "intra-broker-partition-movement-rate";
   public static final String METER_LEADERSHIP_MOVEMENT_RATE = "leadership-movement-rate";
   public static final String METER_PARTITION_DATA_MOVEMENT_RATE = "partition-data-movement-rate-MB";
+  public static final String GAUGE_ONGOING_EXECUTION_DURATION_MS = "ongoing-execution-duration-ms";
+  public static final String GAUGE_INTER_BROKER_DATA_TOTAL_MB = "ongoing-execution-inter-broker-data-movement-total-MB";
+  public static final String GAUGE_INTER_BROKER_DATA_FINISHED_MB = "ongoing-execution-inter-broker-data-movement-finished-MB";
+  public static final String GAUGE_INTER_BROKER_DATA_COMPLETED_MB = "ongoing-execution-inter-broker-data-movement-completed-MB";
+  public static final String GAUGE_INTER_BROKER_DATA_IN_EXECUTION_MB = "ongoing-execution-inter-broker-data-movement-in-execution-MB";
+  public static final String GAUGE_INTER_BROKER_DATA_REMAINING_MB = "ongoing-execution-inter-broker-data-movement-remaining-MB";
+  public static final String GAUGE_INTRA_BROKER_DATA_TOTAL_MB = "ongoing-execution-intra-broker-data-movement-total-MB";
+  public static final String GAUGE_INTRA_BROKER_DATA_FINISHED_MB = "ongoing-execution-intra-broker-data-movement-finished-MB";
+  public static final String GAUGE_INTRA_BROKER_DATA_COMPLETED_MB = "ongoing-execution-intra-broker-data-movement-completed-MB";
+  public static final String GAUGE_INTRA_BROKER_DATA_IN_EXECUTION_MB = "ongoing-execution-intra-broker-data-movement-in-execution-MB";
+  public static final String GAUGE_INTRA_BROKER_DATA_REMAINING_MB = "ongoing-execution-intra-broker-data-movement-remaining-MB";
+  private static final long NO_ONGOING_EXECUTION = -1L;
 
   ExecutionTaskTracker(MetricRegistry dropwizardMetricRegistry, Time time) {
     List<ExecutionTaskState> states = ExecutionTaskState.cachedValues();
@@ -67,19 +93,27 @@ public class ExecutionTaskTracker {
       }
       _tasksByType.put(type, taskMap);
     }
+    _totalInterBrokerDataToMoveInMB = 0L;
+    _totalIntraBrokerDataToMoveInMB = 0L;
     _remainingInterBrokerDataToMoveInMB = 0L;
     _remainingIntraBrokerDataToMoveInMB = 0L;
     _inExecutionInterBrokerDataMovementInMB = 0L;
     _inExecutionIntraBrokerDataMovementInMB = 0L;
     _finishedInterBrokerDataMovementInMB = 0L;
     _finishedIntraBrokerDataMovementInMB = 0L;
+    _completedInterBrokerDataMovementInMB = 0L;
+    _completedIntraBrokerDataMovementInMB = 0L;
+    _executionStartMs = NO_ONGOING_EXECUTION;
     _isKafkaAssignerMode = false;
     _time = time;
     _stopRequested = false;
+    _taskStateVersion = 0L;
     _interBrokerPartitionMovementRateMeter = new Meter();
     _intraBrokerPartitionMovementRateMeter = new Meter();
     _leadershipMovementRateMeter = new Meter();
     _partitionDataMovementRateMeter = new Meter();
+    _meteredDataMovementInBytesByTask = new HashMap<>();
+    _unmeteredDataMovementInBytes = 0L;
 
     // Register gauge sensors.
     registerGaugeSensors(dropwizardMetricRegistry);
@@ -111,6 +145,40 @@ public class ExecutionTaskTracker {
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_ONGOING_EXECUTION_IN_NON_KAFKA_ASSIGNER_MODE),
                                       (Gauge<Integer>) () -> !_isKafkaAssignerMode
                                                              && !inExecutionTasks(TaskType.cachedValues()).isEmpty() ? 1 : 0);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_ONGOING_EXECUTION_DURATION_MS),
+                                      (Gauge<Long>) this::ongoingExecutionDurationMs);
+    // Data to move in the ongoing execution. Similar to the number of pending tasks, the remaining data to move is reported
+    // as 0 once a stop is requested, because pending tasks will not be executed. The finished data movement includes aborted
+    // and dead tasks, whereas the completed data movement includes only the completed tasks.
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTER_BROKER_DATA_TOTAL_MB),
+                                      (Gauge<Long>) () -> _totalInterBrokerDataToMoveInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTER_BROKER_DATA_FINISHED_MB),
+                                      (Gauge<Long>) () -> _finishedInterBrokerDataMovementInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTER_BROKER_DATA_COMPLETED_MB),
+                                      (Gauge<Long>) () -> _completedInterBrokerDataMovementInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTER_BROKER_DATA_IN_EXECUTION_MB),
+                                      (Gauge<Long>) () -> _inExecutionInterBrokerDataMovementInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTER_BROKER_DATA_REMAINING_MB),
+                                      (Gauge<Long>) () -> _stopRequested ? 0L : _remainingInterBrokerDataToMoveInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTRA_BROKER_DATA_TOTAL_MB),
+                                      (Gauge<Long>) () -> _totalIntraBrokerDataToMoveInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTRA_BROKER_DATA_FINISHED_MB),
+                                      (Gauge<Long>) () -> _finishedIntraBrokerDataMovementInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTRA_BROKER_DATA_COMPLETED_MB),
+                                      (Gauge<Long>) () -> _completedIntraBrokerDataMovementInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTRA_BROKER_DATA_IN_EXECUTION_MB),
+                                      (Gauge<Long>) () -> _inExecutionIntraBrokerDataMovementInMB);
+    dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, GAUGE_INTRA_BROKER_DATA_REMAINING_MB),
+                                      (Gauge<Long>) () -> _stopRequested ? 0L : _remainingIntraBrokerDataToMoveInMB);
+  }
+
+  /**
+   * @return Duration of the ongoing execution in ms if there is one, 0 otherwise. The duration is measured from the time
+   * the tasks of the execution were added to the tracker.
+   */
+  private long ongoingExecutionDurationMs() {
+    long executionStartMs = _executionStartMs;
+    return executionStartMs == NO_ONGOING_EXECUTION ? 0L : _time.milliseconds() - executionStartMs;
   }
 
   private void registerMeterSensors(MetricRegistry dropwizardMetricRegistry) {
@@ -128,6 +196,7 @@ public class ExecutionTaskTracker {
    * @param newState New execution state of the task.
    */
   public void markTaskState(ExecutionTask task, ExecutionTaskState newState) {
+    _taskStateVersion++;
     _tasksByType.get(task.type()).get(task.state()).remove(task);
     switch (newState) {
       case PENDING:
@@ -190,13 +259,56 @@ public class ExecutionTaskTracker {
     } else if (task.state() == ExecutionTaskState.ABORTED
                || task.state() == ExecutionTaskState.DEAD
                || task.state() == ExecutionTaskState.COMPLETED) {
-      _partitionDataMovementRateMeter.mark(dataToMove);
+      boolean isCompleted = task.state() == ExecutionTaskState.COMPLETED;
+      Long meteredDataMovementInBytes = _meteredDataMovementInBytesByTask.remove(task);
+      if (isCompleted) {
+        // Mark the data movement of the task that has not been marked while it was in progress. A dead or aborted task (e.g. an
+        // in-progress movement rolled back when the execution is stopped) has not moved the rest of its data.
+        markDataMovement(dataToMove * BYTES_IN_MB - (meteredDataMovementInBytes == null ? 0L : meteredDataMovementInBytes));
+      }
       if (task.type() == TaskType.INTRA_BROKER_REPLICA_ACTION) {
         _inExecutionIntraBrokerDataMovementInMB -= dataToMove;
         _finishedIntraBrokerDataMovementInMB += dataToMove;
+        if (isCompleted) {
+          _completedIntraBrokerDataMovementInMB += dataToMove;
+        }
       } else if (task.type() == TaskType.INTER_BROKER_REPLICA_ACTION) {
         _inExecutionInterBrokerDataMovementInMB -= dataToMove;
         _finishedInterBrokerDataMovementInMB += dataToMove;
+        if (isCompleted) {
+          _completedInterBrokerDataMovementInMB += dataToMove;
+        }
+      }
+    }
+  }
+
+  /**
+   * Mark the data movement observed since the last call for the in-progress replica movement tasks in the partition data
+   * movement rate meter. This lets the meter report the data movement rate while partition movements are in progress,
+   * rather than only when they finish.
+   */
+  public void markInProgressDataMovement() {
+    for (TaskType type : List.of(TaskType.INTER_BROKER_REPLICA_ACTION, TaskType.INTRA_BROKER_REPLICA_ACTION)) {
+      for (ExecutionTask task : _tasksByType.get(type).get(ExecutionTaskState.IN_PROGRESS)) {
+        if (task.hasDataMovementProgress()) {
+          long meteredDataMovementInBytes = _meteredDataMovementInBytesByTask.getOrDefault(task, 0L);
+          // The moved data may shrink, e.g. due to retention on the destination replica -- this is not counted as progress.
+          if (task.movedDataInBytes() > meteredDataMovementInBytes) {
+            markDataMovement(task.movedDataInBytes() - meteredDataMovementInBytes);
+            _meteredDataMovementInBytesByTask.put(task, task.movedDataInBytes());
+          }
+        }
+      }
+    }
+  }
+
+  private void markDataMovement(long dataMovementInBytes) {
+    if (dataMovementInBytes > 0L) {
+      _unmeteredDataMovementInBytes += dataMovementInBytes;
+      long dataMovementInMB = _unmeteredDataMovementInBytes / BYTES_IN_MB;
+      if (dataMovementInMB > 0L) {
+        _partitionDataMovementRateMeter.mark(dataMovementInMB);
+        _unmeteredDataMovementInBytes -= dataMovementInMB * BYTES_IN_MB;
       }
     }
   }
@@ -204,16 +316,30 @@ public class ExecutionTaskTracker {
   /**
    * Add new tasks to ExecutionTaskTracker to trace their execution.
    * Tasks are added homogeneously -- all tasks have the same task type.
+   * The first tasks added after {@link #clear()} mark the start of the ongoing execution, and clear a stop that was requested
+   * while there was no ongoing execution.
    *
    * @param tasks    New tasks to add.
    * @param taskType Task type of new tasks.
    */
   public void addTasksToTrace(Collection<ExecutionTask> tasks, TaskType taskType) {
+    if (_executionStartMs == NO_ONGOING_EXECUTION) {
+      _executionStartMs = _time.milliseconds();
+      // The executor resets its stop signal when an execution starts, so a stop requested while there was no ongoing
+      // execution does not apply to this one. Otherwise, the pending tasks and the remaining data to move of this execution
+      // would be reported as 0.
+      _stopRequested = false;
+    }
+    _taskStateVersion++;
     _tasksByType.get(taskType).get(ExecutionTaskState.PENDING).addAll(tasks);
     if (taskType == TaskType.INTER_BROKER_REPLICA_ACTION) {
-      _remainingInterBrokerDataToMoveInMB += tasks.stream().mapToLong(t -> t.proposal().interBrokerDataToMoveInMB()).sum();
+      long dataToMoveInMB = tasks.stream().mapToLong(t -> t.proposal().interBrokerDataToMoveInMB()).sum();
+      _remainingInterBrokerDataToMoveInMB += dataToMoveInMB;
+      _totalInterBrokerDataToMoveInMB += dataToMoveInMB;
     } else if (taskType == TaskType.INTRA_BROKER_REPLICA_ACTION) {
-      _remainingIntraBrokerDataToMoveInMB += tasks.stream().mapToLong(t -> t.proposal().intraBrokerDataToMoveInMB()).sum();
+      long dataToMoveInMB = tasks.stream().mapToLong(t -> t.proposal().intraBrokerDataToMoveInMB()).sum();
+      _remainingIntraBrokerDataToMoveInMB += dataToMoveInMB;
+      _totalIntraBrokerDataToMoveInMB += dataToMoveInMB;
     }
   }
 
@@ -259,18 +385,42 @@ public class ExecutionTaskTracker {
    * Clear the replica action and leader action tasks.
    */
   public void clear() {
+    _taskStateVersion++;
     _tasksByType.values().forEach(m -> m.values().forEach(Set::clear));
+    _totalInterBrokerDataToMoveInMB = 0L;
+    _totalIntraBrokerDataToMoveInMB = 0L;
     _remainingInterBrokerDataToMoveInMB = 0L;
     _remainingIntraBrokerDataToMoveInMB = 0L;
     _inExecutionInterBrokerDataMovementInMB = 0L;
     _inExecutionIntraBrokerDataMovementInMB = 0L;
     _finishedInterBrokerDataMovementInMB = 0L;
     _finishedIntraBrokerDataMovementInMB = 0L;
+    _completedInterBrokerDataMovementInMB = 0L;
+    _completedIntraBrokerDataMovementInMB = 0L;
+    _executionStartMs = NO_ONGOING_EXECUTION;
+    _meteredDataMovementInBytesByTask.clear();
+    _unmeteredDataMovementInBytes = 0L;
     _stopRequested = false;
   }
 
   public void setStopRequested() {
     _stopRequested = true;
+  }
+
+  /**
+   * @return A number that changes whenever a task is added or changes its state.
+   */
+  public long taskStateVersion() {
+    return _taskStateVersion;
+  }
+
+  /**
+   * @return All tracked tasks regardless of their type and state.
+   */
+  public List<ExecutionTask> allTasks() {
+    List<ExecutionTask> allTasks = new ArrayList<>();
+    _tasksByType.values().forEach(tasksByState -> tasksByState.values().forEach(allTasks::addAll));
+    return allTasks;
   }
 
   // Internal query APIs.
@@ -293,6 +443,20 @@ public class ExecutionTaskTracker {
 
   public long finishedInterBrokerDataMovementInMB() {
     return _finishedInterBrokerDataMovementInMB;
+  }
+
+  /**
+   * @return Completed inter broker data movement in MB, which excludes the data of dead and aborted tasks.
+   */
+  public long completedInterBrokerDataMovementInMB() {
+    return _completedInterBrokerDataMovementInMB;
+  }
+
+  /**
+   * @return Completed intra broker data movement in MB, which excludes the data of dead and aborted tasks.
+   */
+  public long completedIntraBrokerDataMovementInMB() {
+    return _completedIntraBrokerDataMovementInMB;
   }
 
   /**
@@ -353,6 +517,31 @@ public class ExecutionTaskTracker {
   }
 
   /**
+   * @param type Task type.
+   * @return Number of MBs that have already been moved by the in-progress tasks with the given task type, as observed
+   * from their last known data movement progress.
+   */
+  public long inProgressMovedDataInMB(TaskType type) {
+    return _tasksByType.get(type).get(ExecutionTaskState.IN_PROGRESS).stream()
+                       .filter(ExecutionTask::hasDataMovementProgress)
+                       .mapToLong(ExecutionTask::movedDataInBytes)
+                       .sum() / BYTES_IN_MB;
+  }
+
+  /**
+   * @param type Task type.
+   * @return The sum of the last observed data movement rates (in MB/s) of the in-progress tasks with the given task type,
+   * or {@code -1} if the data movement rate of none of these tasks is known.
+   */
+  private double inProgressDataMovementRateInMBPerSec(TaskType type) {
+    return _tasksByType.get(type).get(ExecutionTaskState.IN_PROGRESS).stream()
+                       .filter(ExecutionTask::hasDataMovementRate)
+                       .mapToDouble(ExecutionTask::dataMovementRateInMBPerSec)
+                       .reduce(Double::sum)
+                       .orElse(-1.0);
+  }
+
+  /**
    * Get execution tasks summary.
    *
    * @param taskTypesToGetFullList Task types to return complete list of tasks.
@@ -365,6 +554,10 @@ public class ExecutionTaskTracker {
                                      _inExecutionIntraBrokerDataMovementInMB,
                                      _remainingInterBrokerDataToMoveInMB,
                                      _remainingIntraBrokerDataToMoveInMB,
+                                     inProgressMovedDataInMB(TaskType.INTER_BROKER_REPLICA_ACTION),
+                                     inProgressMovedDataInMB(TaskType.INTRA_BROKER_REPLICA_ACTION),
+                                     inProgressDataMovementRateInMBPerSec(TaskType.INTER_BROKER_REPLICA_ACTION),
+                                     inProgressDataMovementRateInMBPerSec(TaskType.INTRA_BROKER_REPLICA_ACTION),
                                      taskStat(),
                                      filteredTasksByState(taskTypesToGetFullList)
     );
@@ -377,6 +570,10 @@ public class ExecutionTaskTracker {
     private final long _inExecutionIntraBrokerDataMovementInMB;
     private final long _remainingInterBrokerDataToMoveInMB;
     private final long _remainingIntraBrokerDataToMoveInMB;
+    private final long _inProgressInterBrokerMovedDataInMB;
+    private final long _inProgressIntraBrokerMovedDataInMB;
+    private final double _inProgressInterBrokerDataMovementRateInMBPerSec;
+    private final double _inProgressIntraBrokerDataMovementRateInMBPerSec;
     private final Map<TaskType, Map<ExecutionTaskState, Integer>> _taskStat;
     private final Map<TaskType, Map<ExecutionTaskState, Set<ExecutionTask>>> _filteredTasksByState;
 
@@ -386,6 +583,10 @@ public class ExecutionTaskTracker {
                           long inExecutionIntraBrokerDataMovementInMB,
                           long remainingInterBrokerDataToMoveInMB,
                           long remainingIntraBrokerDataToMoveInMB,
+                          long inProgressInterBrokerMovedDataInMB,
+                          long inProgressIntraBrokerMovedDataInMB,
+                          double inProgressInterBrokerDataMovementRateInMBPerSec,
+                          double inProgressIntraBrokerDataMovementRateInMBPerSec,
                           Map<TaskType, Map<ExecutionTaskState, Integer>> taskStat,
                           Map<TaskType, Map<ExecutionTaskState, Set<ExecutionTask>>> filteredTasksByState) {
       _finishedInterBrokerDataMovementInMB = finishedInterBrokerDataMovementInMB;
@@ -394,6 +595,10 @@ public class ExecutionTaskTracker {
       _inExecutionIntraBrokerDataMovementInMB = inExecutionIntraBrokerDataMovementInMB;
       _remainingInterBrokerDataToMoveInMB = remainingInterBrokerDataToMoveInMB;
       _remainingIntraBrokerDataToMoveInMB = remainingIntraBrokerDataToMoveInMB;
+      _inProgressInterBrokerMovedDataInMB = inProgressInterBrokerMovedDataInMB;
+      _inProgressIntraBrokerMovedDataInMB = inProgressIntraBrokerMovedDataInMB;
+      _inProgressInterBrokerDataMovementRateInMBPerSec = inProgressInterBrokerDataMovementRateInMBPerSec;
+      _inProgressIntraBrokerDataMovementRateInMBPerSec = inProgressIntraBrokerDataMovementRateInMBPerSec;
       _taskStat = taskStat;
       _filteredTasksByState = filteredTasksByState;
     }
@@ -420,6 +625,36 @@ public class ExecutionTaskTracker {
 
     public long remainingIntraBrokerDataToMoveInMB() {
       return _remainingIntraBrokerDataToMoveInMB;
+    }
+
+    /**
+     * @return Number of MBs that have already been moved by the in-progress inter-broker replica movement tasks.
+     */
+    public long inProgressInterBrokerMovedDataInMB() {
+      return _inProgressInterBrokerMovedDataInMB;
+    }
+
+    /**
+     * @return Number of MBs that have already been moved by the in-progress intra-broker replica movement tasks.
+     */
+    public long inProgressIntraBrokerMovedDataInMB() {
+      return _inProgressIntraBrokerMovedDataInMB;
+    }
+
+    /**
+     * @return The sum of the last observed data movement rates (in MB/s) of the in-progress inter-broker replica movement
+     * tasks, or {@code -1} if unknown.
+     */
+    public double inProgressInterBrokerDataMovementRateInMBPerSec() {
+      return _inProgressInterBrokerDataMovementRateInMBPerSec;
+    }
+
+    /**
+     * @return The sum of the last observed data movement rates (in MB/s) of the in-progress intra-broker replica movement
+     * tasks, or {@code -1} if unknown.
+     */
+    public double inProgressIntraBrokerDataMovementRateInMBPerSec() {
+      return _inProgressIntraBrokerDataMovementRateInMBPerSec;
     }
 
     public Map<TaskType, Map<ExecutionTaskState, Integer>> taskStat() {

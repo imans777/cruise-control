@@ -5,18 +5,23 @@
 package com.linkedin.kafka.cruisecontrol.config.constants;
 
 import com.linkedin.kafka.cruisecontrol.executor.ExecutorNoopNotifier;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.FileExecutionStateStore;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.BaseReplicaMovementStrategy;
+import com.linkedin.kafka.cruisecontrol.executor.strategy.OneReplicaPerPartitionMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PostponeUrpReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeLargeReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeMinIsrWithOfflineReplicasStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeOneAboveMinIsrWithOfflineReplicasStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeSmallReplicaMovementStrategy;
+import com.linkedin.kafka.cruisecontrol.executor.strategy.ThrottleAwareReplicaMovementStrategy;
 import java.util.StringJoiner;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigException;
 
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.REASON_PARAM;
 import static org.apache.kafka.common.config.ConfigDef.Range.atLeast;
+import static org.apache.kafka.common.config.ConfigDef.Range.between;
 
 
 /**
@@ -94,6 +99,30 @@ public final class ExecutorConfig {
       + "moved, in bytes per second.";
 
   /**
+   * <code>replica.movement.throttle.write.rate.margin</code>
+   */
+  public static final String REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG = "replica.movement.throttle.write.rate.margin";
+  public static final double DEFAULT_REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN = 0.2;
+  public static final String REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_DOC = "The fraction by which the write rates are "
+      + "increased when checking whether the replication throttle of the source and destination brokers can carry the write rate "
+      + "of a partition in addition to the write rates of the inter-broker replica movements in progress on them, i.e. a movement "
+      + "starts if (1 + margin) * (write rates in progress + write rate of the partition) <= throttle. Used by "
+      + ThrottleAwareReplicaMovementStrategy.class.getSimpleName() + " if the execution has a replication throttle "
+      + "and replication throttle adjustment is disabled. While it is enabled, each broker is budgeted at its network headroom instead "
+      + "and each movement is charged the throttle that the adjuster keeps for it (see "
+      + "concurrency.adjuster.replication.throttle.write.rate.margin), so this margin is not used.";
+
+  /**
+   * <code>default.log.dir.throttle</code>
+   */
+  public static final String DEFAULT_LOG_DIR_THROTTLE_CONFIG = "default.log.dir.throttle";
+  public static final Long DEFAULT_DEFAULT_LOG_DIR_THROTTLE = null;
+  public static final String DEFAULT_LOG_DIR_THROTTLE_DOC = "The throttle applied to replicas being moved between the logdirs "
+      + "(i.e. disks) of the same broker, in bytes per second. During an execution, it is set as the broker config "
+      + "replica.alter.log.dirs.io.max.bytes.per.second on the brokers with intra-broker replica movements, and the original "
+      + "value of the config is restored once the execution finishes. If null, intra-broker replica movements are not throttled.";
+
+  /**
    * <code>replica.movement.strategies</code>
    */
   public static final String REPLICA_MOVEMENT_STRATEGIES_CONFIG = "replica.movement.strategies";
@@ -103,6 +132,8 @@ public final class ExecutorConfig {
       .add(PrioritizeSmallReplicaMovementStrategy.class.getName())
       .add(PrioritizeMinIsrWithOfflineReplicasStrategy.class.getName())
       .add(PrioritizeOneAboveMinIsrWithOfflineReplicasStrategy.class.getName())
+      .add(ThrottleAwareReplicaMovementStrategy.class.getName())
+      .add(OneReplicaPerPartitionMovementStrategy.class.getName())
       .add(BaseReplicaMovementStrategy.class.getName()).toString();
   public static final String REPLICA_MOVEMENT_STRATEGIES_DOC = "A list of supported strategies used to determine execution"
       + " order for generated partition movement tasks.";
@@ -161,7 +192,9 @@ public final class ExecutorConfig {
   public static final String INTER_BROKER_REPLICA_MOVEMENT_RATE_ALERTING_THRESHOLD_DOC = "Threshold of data movement rate (in MB/s) "
       + "for inter-broker replica movement task. If the task's data movement rate is lower than this and the task's execution time exceeds "
       + "the threshold set via " + TASK_EXECUTION_ALERTING_THRESHOLD_MS_CONFIG + ", an alert will be sent via notifier set by config "
-      + EXECUTOR_NOTIFIER_CLASS_CONFIG;
+      + EXECUTOR_NOTIFIER_CLASS_CONFIG + ". If partition.movement.progress.tracking.enabled is set, the data movement rate of an "
+      + "in-progress task is the rate observed between its last two partition movement progress checks; otherwise, it is estimated "
+      + "from the size of the partition.";
 
   /**
    * <code>intra.broker.replica.movement.rate.alerting.threshold</code>
@@ -172,7 +205,9 @@ public final class ExecutorConfig {
   public static final String INTRA_BROKER_REPLICA_MOVEMENT_RATE_ALERTING_THRESHOLD_DOC = "Threshold of data movement rate (in MB/s) "
       + "for intra-broker replica movement task. If task's data movement rate is lower than this and the task's execution time exceeds "
       + "the threshold set via " + TASK_EXECUTION_ALERTING_THRESHOLD_MS_CONFIG + ", an alert will be sent via notifier set by config "
-      + EXECUTOR_NOTIFIER_CLASS_CONFIG;
+      + EXECUTOR_NOTIFIER_CLASS_CONFIG + ". If partition.movement.progress.tracking.enabled is set, the data movement rate of an "
+      + "in-progress task is the rate observed between its last two partition movement progress checks; otherwise, it is estimated "
+      + "from the size of the partition.";
 
   // Put here to avoid forward reference.
   public static final String TASK_EXECUTION_ALERTING_THRESHOLD_MS_DOC = "Threshold of execution time to alert a replica/leader movement"
@@ -195,6 +230,30 @@ public final class ExecutorConfig {
   public static final String LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG = "logdir.response.timeout.ms";
   public static final long DEFAULT_LOGDIR_RESPONSE_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(10);
   public static final String LOGDIR_RESPONSE_TIMEOUT_MS_DOC = "Timeout in ms for broker logdir to respond";
+
+  /**
+   * <code>partition.movement.progress.tracking.enabled</code>
+   */
+  public static final String PARTITION_MOVEMENT_PROGRESS_TRACKING_ENABLED_CONFIG = "partition.movement.progress.tracking.enabled";
+  public static final boolean DEFAULT_PARTITION_MOVEMENT_PROGRESS_TRACKING_ENABLED = true;
+  public static final String PARTITION_MOVEMENT_PROGRESS_TRACKING_ENABLED_DOC = "Enable tracking the amount of data (in MB) that has "
+      + "already been moved by in-progress inter-broker and intra-broker partition movements. If enabled, the executor periodically "
+      + "(see partition.movement.progress.check.interval.ms) sends a describeLogDirs request to the brokers involved in "
+      + "the in-progress partition movements, compares the size of the replicas being created with the size of their source "
+      + "replicas, and reports the result -- along with the observed data movement rate and the estimated remaining time -- in the "
+      + "executor state and the partition data movement metrics. The observed data movement rate is also used to detect slow (e.g. "
+      + "stuck) partition movements (see " + TASK_EXECUTION_ALERTING_THRESHOLD_MS_CONFIG + "). If a check fails (e.g. a broker fails "
+      + "to respond), the last known progress is kept until the next check.";
+
+  /**
+   * <code>partition.movement.progress.check.interval.ms</code>
+   */
+  public static final String PARTITION_MOVEMENT_PROGRESS_CHECK_INTERVAL_MS_CONFIG = "partition.movement.progress.check.interval.ms";
+  public static final long DEFAULT_PARTITION_MOVEMENT_PROGRESS_CHECK_INTERVAL_MS = TimeUnit.MINUTES.toMillis(1);
+  public static final String PARTITION_MOVEMENT_PROGRESS_CHECK_INTERVAL_MS_DOC = "The minimum interval in milliseconds between two "
+      + "checks of the amount of data moved by in-progress partition movements. Each check sends one describeLogDirs request to each "
+      + "broker involved in the in-progress partition movements. The check happens at the first execution progress check after this "
+      + "interval elapses; hence, 0 means checking at every execution progress check.";
 
   /**
    * <code>demotion.history.retention.time.ms</code>
@@ -473,6 +532,115 @@ public final class ExecutorConfig {
       + "itself is enabled.";
 
   /**
+   * <code>concurrency.adjuster.replication.throttle.enabled</code>
+   */
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_CONFIG = "concurrency.adjuster.replication.throttle.enabled";
+  public static final boolean DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED = false;
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_DOC = "Enable the concurrency adjuster to dynamically "
+      + "adjust the replication throttle (leader and follower throttled rates) of each broker during inter-broker replica movements. "
+      + "While replicas are being moved to (from) a broker, its follower (leader) throttle is raised step by step towards its network "
+      + "headroom (see concurrency.adjuster.replication.throttle.target.network.utilization) at each metric-based check. It is "
+      + "reduced at once when the headroom shrinks, checked at each adjuster run, and divided if the broker hosts (At/Under)MinISR "
+      + "partitions with an out-of-sync replica (see concurrency.adjuster.replication.throttle.min.isr.check.enabled) or violates a "
+      + "concurrency adjuster limit at two consecutive metric-based checks. It is never below the throttle needed by the write rate "
+      + "of the partitions being moved (see concurrency.adjuster.replication.throttle.write.rate.margin), even above the network "
+      + "headroom -- a throttle below it stalls the movements -- and that need is doubled for a movement whose new replicas make no "
+      + "progress at it; only concurrency.adjuster.max.replication.throttle bounds it. A change smaller than 5% of the current "
+      + "throttle is ignored, so traffic fluctuations do not cause config updates. A broker without metrics in the current metrics "
+      + "window uses its last valid metrics from within one broker metrics window; without either, only the needed throttle is "
+      + "enforced. An execution started without a replication throttle (neither replication_throttle nor "
+      + "default.replication.throttle) starts each broker at its network headroom, bounded by the minimum and maximum replication "
+      + "throttles of the concurrency adjuster. It can be enabled or disabled at runtime with the replication_throttle_adjustment "
+      + "parameter of the admin endpoint; disabling it during an execution leaves the replication throttles at their last values "
+      + "until the execution ends.";
+
+  /**
+   * <code>concurrency.adjuster.min.replication.throttle</code>
+   */
+  public static final String CONCURRENCY_ADJUSTER_MIN_REPLICATION_THROTTLE_CONFIG = "concurrency.adjuster.min.replication.throttle";
+  public static final long DEFAULT_CONCURRENCY_ADJUSTER_MIN_REPLICATION_THROTTLE = 1024L * 1024L;
+  public static final String CONCURRENCY_ADJUSTER_MIN_REPLICATION_THROTTLE_DOC = "The minimum replication throttle in bytes/second "
+      + "that the concurrency adjuster (if enabled for replication throttle) decreases the throttle of a broker to. The throttle "
+      + "needed by the in-progress movements of the broker is a higher floor (see "
+      + "concurrency.adjuster.replication.throttle.write.rate.margin).";
+
+  /**
+   * <code>concurrency.adjuster.max.replication.throttle</code>
+   */
+  public static final String CONCURRENCY_ADJUSTER_MAX_REPLICATION_THROTTLE_CONFIG = "concurrency.adjuster.max.replication.throttle";
+  public static final long DEFAULT_CONCURRENCY_ADJUSTER_MAX_REPLICATION_THROTTLE = 1024L * 1024L * 1024L;
+  public static final String CONCURRENCY_ADJUSTER_MAX_REPLICATION_THROTTLE_DOC = "The maximum replication throttle in bytes/second "
+      + "that the concurrency adjuster (if enabled for replication throttle) can set on a broker, including the throttle needed by "
+      + "the in-progress movements. The default (1 GB/second) effectively does not cap the throttle; set it to the highest "
+      + "replication throttle that is acceptable for the cluster, even at peak traffic, since broker metrics react to traffic changes "
+      + "with a delay.";
+
+  /**
+   * <code>concurrency.adjuster.additive.increase.replication.throttle</code>
+   */
+  public static final String CONCURRENCY_ADJUSTER_ADDITIVE_INCREASE_REPLICATION_THROTTLE_CONFIG
+      = "concurrency.adjuster.additive.increase.replication.throttle";
+  public static final long DEFAULT_CONCURRENCY_ADJUSTER_ADDITIVE_INCREASE_REPLICATION_THROTTLE = 10L * 1024L * 1024L;
+  public static final String CONCURRENCY_ADJUSTER_ADDITIVE_INCREASE_REPLICATION_THROTTLE_DOC = "The amount in bytes/second by which "
+      + "the concurrency adjuster (if enabled for replication throttle) can increase the replication throttle of a broker at a "
+      + "metric-based check, or 5% of the broker's network capacity in that direction if larger -- so brokers with larger network "
+      + "capacity converge to their network headroom in a similar time. Decreases towards the network headroom are applied at once.";
+
+  /**
+   * <code>concurrency.adjuster.multiplicative.decrease.replication.throttle</code>
+   */
+  public static final String CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE_CONFIG
+      = "concurrency.adjuster.multiplicative.decrease.replication.throttle";
+  public static final int DEFAULT_CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE = 2;
+  public static final String CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE_DOC = "The fixed number by which the "
+      + "replication throttle of a broker will be divided by the concurrency adjuster (if enabled for replication throttle) when the "
+      + "broker hosts (At/Under)MinISR partitions with an out-of-sync replica (see "
+      + "concurrency.adjuster.replication.throttle.min.isr.check.enabled), or violates any concurrency adjuster limit at two "
+      + "consecutive metric-based checks. It is never divided below the throttle needed by the in-progress movements of the broker.";
+
+  /**
+   * <code>concurrency.adjuster.replication.throttle.target.network.utilization</code>
+   */
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_CONFIG
+      = "concurrency.adjuster.replication.throttle.target.network.utilization";
+  public static final double DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION = 0.8;
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_DOC = "The target network "
+      + "utilization (in (0, 1]) of each broker that the concurrency adjuster (if enabled for replication throttle) aims for. The "
+      + "follower (leader) throttled rate of a broker is moved towards this fraction of the broker's inbound (outbound) network "
+      + "capacity minus its inbound (outbound) traffic that the throttle does not limit, i.e. its leader traffic and the replication "
+      + "traffic of in-sync followers -- but never below the throttle needed by its in-progress movements.";
+
+  /**
+   * <code>concurrency.adjuster.replication.throttle.min.isr.check.enabled</code>
+   */
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG
+      = "concurrency.adjuster.replication.throttle.min.isr.check.enabled";
+  public static final boolean DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED = true;
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_DOC = "Enable the concurrency adjuster "
+      + "(if enabled for replication throttle) to divide the replication throttle of the brokers hosting a replica of an "
+      + "(At/Under)MinISR partition with an out-of-sync replica and without offline replicas by "
+      + "concurrency.adjuster.multiplicative.decrease.replication.throttle at each check, i.e. every concurrency.adjuster.interval.ms "
+      + "/ concurrency.adjuster.num.min.isr.check. Partitions that are (At/Under)MinISR by their configuration -- all replicas in "
+      + "sync, e.g. a replication factor of 1 or equal to min.insync.replicas -- are ignored, as are the replicas being added by the "
+      + "execution. It only affects the brokers hosting such partitions, never stops the execution, and is independent of "
+      + "concurrency.adjuster.min.isr.check.enabled.";
+
+  /**
+   * <code>concurrency.adjuster.replication.throttle.write.rate.margin</code>
+   */
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG
+      = "concurrency.adjuster.replication.throttle.write.rate.margin";
+  public static final double DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN = 1.0;
+  public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_DOC = "The margin above the write rate of the "
+      + "partitions being moved that the concurrency adjuster (if enabled for replication throttle) keeps in the replication throttle "
+      + "of a broker, so that the new replicas can catch up. The follower (leader) throttled rate of a broker is never below (1 + "
+      + "margin) times the total write rate of the partitions being moved to (from) the broker, even above its network headroom, "
+      + "bounded only by concurrency.adjuster.max.replication.throttle: a throttle below the write rate stalls the movements, and a "
+      + "stalled movement keeps using its throttle without making progress. A new replica of a partition at its retention limit can "
+      + "need several times the write rate, since retention truncates a replica that falls behind the log start of the leader; so a "
+      + "movement whose new replicas make no progress for two adjuster runs at its needed throttle has it doubled.";
+
+  /**
    * <code>concurrency.adjuster.min.isr.cache.size</code>
    */
   public static final String CONCURRENCY_ADJUSTER_MIN_ISR_CACHE_SIZE_CONFIG = "concurrency.adjuster.min.isr.cache.size";
@@ -497,6 +665,69 @@ public final class ExecutorConfig {
   public static final String AUTO_STOP_EXTERNAL_AGENT_DOC = "When starting a new proposal execution while external agent is reassigning partitions,"
       + " automatically stop the external agent and start the execution."
       + " Set to false to keep the external agent reassignment and skip starting the execution.";
+
+  /**
+   * <code>executor.state.store.class</code>
+   */
+  public static final String EXECUTOR_STATE_STORE_CLASS_CONFIG = "executor.state.store.class";
+  public static final String DEFAULT_EXECUTOR_STATE_STORE_CLASS = FileExecutionStateStore.class.getName();
+  public static final String EXECUTOR_STATE_STORE_CLASS_DOC = "The class implementing com.linkedin.kafka.cruisecontrol.executor."
+      + "persistence.ExecutionStateStore to persist the state of the ongoing execution -- i.e. its parameters, proposals, and the"
+      + " latest state of each execution task. The state is updated whenever the execution makes progress, so that after a"
+      + " Cruise Control restart, the interrupted execution can be recovered: its leftover replication throttles are removed,"
+      + " and (if resume.interrupted.execution.on.startup is enabled) its remaining tasks are resumed. Use"
+      + " com.linkedin.kafka.cruisecontrol.executor.persistence.NoopExecutionStateStore to disable persisting the execution state.";
+
+  /**
+   * <code>executor.state.file.path</code>
+   */
+  public static final String EXECUTOR_STATE_FILE_PATH_CONFIG = "executor.state.file.path";
+  public static final String DEFAULT_EXECUTOR_STATE_FILE_PATH = "fileStore/executionState.json";
+  public static final String EXECUTOR_STATE_FILE_PATH_DOC = "The file path to persist the state of the ongoing execution if the"
+      + " executor.state.store.class is com.linkedin.kafka.cruisecontrol.executor.persistence.FileExecutionStateStore. To recover"
+      + " the execution after a restart, this path must be on storage that survives Cruise Control restarts.";
+
+  /**
+   * <code>resume.interrupted.execution.on.startup</code>
+   */
+  public static final String RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG = "resume.interrupted.execution.on.startup";
+  public static final boolean DEFAULT_RESUME_INTERRUPTED_EXECUTION_ON_STARTUP = false;
+  public static final String RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_DOC = "Upon startup, if the persisted execution state indicates"
+      + " that an execution was interrupted (e.g. due to a crash or a restart of Cruise Control), resume its remaining tasks with the"
+      + " original parameters. Tasks that were in progress when Cruise Control stopped and are still being executed by Kafka are"
+      + " monitored until completion rather than being submitted again; tasks that were completed in the meantime are skipped."
+      + " If disabled (or the execution cannot be resumed), Cruise Control waits for the interrupted in-progress tasks to finish and"
+      + " removes the replication throttles left behind by the interrupted execution.";
+
+  /**
+   * <code>resume.interrupted.execution.max.age.ms</code>
+   */
+  public static final String RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG = "resume.interrupted.execution.max.age.ms";
+  public static final long DEFAULT_RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS = TimeUnit.HOURS.toMillis(1);
+  public static final String RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_DOC = "The maximum time in ms since an interrupted execution"
+      + " last made progress for it to be resumed upon startup. An older execution was planned for a cluster that has likely"
+      + " changed since, so it is only cleaned up -- i.e. its leftover replication throttles are removed.";
+
+  /**
+   * <code>resume.interrupted.execution.max.count</code>
+   */
+  public static final String RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG = "resume.interrupted.execution.max.count";
+  public static final int DEFAULT_RESUME_INTERRUPTED_EXECUTION_MAX_COUNT = 3;
+  public static final String RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_DOC = "The maximum number of times an interrupted execution"
+      + " is resumed. An execution that was resumed this many times is only cleaned up upon the next startup, so that an"
+      + " execution which keeps Cruise Control from running (e.g. by exhausting its memory) is not resumed forever.";
+
+  /**
+   * <code>interrupted.execution.cleanup.timeout.ms</code>
+   */
+  public static final String INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG = "interrupted.execution.cleanup.timeout.ms";
+  public static final long DEFAULT_INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS = TimeUnit.HOURS.toMillis(1);
+  public static final String INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_DOC = "The maximum time in ms to wait for the partition"
+      + " reassignments of an interrupted execution that is not resumed to finish, before cancelling them and removing the"
+      + " replication throttles that the interrupted execution left behind. Until then, the executor reports the"
+      + " RECOVERING_INTERRUPTED_EXECUTION state, and a new execution can only be started by stopping the cleanup -- which"
+      + " cancels those reassignments right away.";
+
   private ExecutorConfig() {
   }
 
@@ -548,6 +779,22 @@ public final class ExecutorConfig {
                             DEFAULT_DEFAULT_REPLICATION_THROTTLE,
                             ConfigDef.Importance.MEDIUM,
                             DEFAULT_REPLICATION_THROTTLE_DOC)
+                    .define(REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG,
+                            ConfigDef.Type.DOUBLE,
+                            DEFAULT_REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_DOC)
+                    .define(DEFAULT_LOG_DIR_THROTTLE_CONFIG,
+                            ConfigDef.Type.LONG,
+                            DEFAULT_DEFAULT_LOG_DIR_THROTTLE,
+                            ConfigDef.LambdaValidator.with((name, value) -> {
+                              if (value != null && (Long) value < 1) {
+                                throw new ConfigException(name, value, "Value must be null or at least 1.");
+                              }
+                            }, () -> "null or [1,...]"),
+                            ConfigDef.Importance.MEDIUM,
+                            DEFAULT_LOG_DIR_THROTTLE_DOC)
                     .define(REPLICA_MOVEMENT_STRATEGIES_CONFIG,
                             ConfigDef.Type.LIST,
                             DEFAULT_REPLICA_MOVEMENT_STRATEGIES,
@@ -605,6 +852,17 @@ public final class ExecutorConfig {
                             DEFAULT_LOGDIR_RESPONSE_TIMEOUT_MS,
                             ConfigDef.Importance.LOW,
                             LOGDIR_RESPONSE_TIMEOUT_MS_DOC)
+                    .define(PARTITION_MOVEMENT_PROGRESS_TRACKING_ENABLED_CONFIG,
+                            ConfigDef.Type.BOOLEAN,
+                            DEFAULT_PARTITION_MOVEMENT_PROGRESS_TRACKING_ENABLED,
+                            ConfigDef.Importance.LOW,
+                            PARTITION_MOVEMENT_PROGRESS_TRACKING_ENABLED_DOC)
+                    .define(PARTITION_MOVEMENT_PROGRESS_CHECK_INTERVAL_MS_CONFIG,
+                            ConfigDef.Type.LONG,
+                            DEFAULT_PARTITION_MOVEMENT_PROGRESS_CHECK_INTERVAL_MS,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            PARTITION_MOVEMENT_PROGRESS_CHECK_INTERVAL_MS_DOC)
                     .define(DEMOTION_HISTORY_RETENTION_TIME_MS_CONFIG,
                             ConfigDef.Type.LONG,
                             DEFAULT_DEMOTION_HISTORY_RETENTION_TIME_MS,
@@ -781,6 +1039,52 @@ public final class ExecutorConfig {
                             DEFAULT_CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED,
                             ConfigDef.Importance.HIGH,
                             CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_DOC)
+                    .define(CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_CONFIG,
+                            ConfigDef.Type.BOOLEAN,
+                            DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED,
+                            ConfigDef.Importance.HIGH,
+                            CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_DOC)
+                    .define(CONCURRENCY_ADJUSTER_MIN_REPLICATION_THROTTLE_CONFIG,
+                            ConfigDef.Type.LONG,
+                            DEFAULT_CONCURRENCY_ADJUSTER_MIN_REPLICATION_THROTTLE,
+                            atLeast(1),
+                            ConfigDef.Importance.MEDIUM,
+                            CONCURRENCY_ADJUSTER_MIN_REPLICATION_THROTTLE_DOC)
+                    .define(CONCURRENCY_ADJUSTER_MAX_REPLICATION_THROTTLE_CONFIG,
+                            ConfigDef.Type.LONG,
+                            DEFAULT_CONCURRENCY_ADJUSTER_MAX_REPLICATION_THROTTLE,
+                            atLeast(1),
+                            ConfigDef.Importance.MEDIUM,
+                            CONCURRENCY_ADJUSTER_MAX_REPLICATION_THROTTLE_DOC)
+                    .define(CONCURRENCY_ADJUSTER_ADDITIVE_INCREASE_REPLICATION_THROTTLE_CONFIG,
+                            ConfigDef.Type.LONG,
+                            DEFAULT_CONCURRENCY_ADJUSTER_ADDITIVE_INCREASE_REPLICATION_THROTTLE,
+                            atLeast(1),
+                            ConfigDef.Importance.LOW,
+                            CONCURRENCY_ADJUSTER_ADDITIVE_INCREASE_REPLICATION_THROTTLE_DOC)
+                    .define(CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE_CONFIG,
+                            ConfigDef.Type.INT,
+                            DEFAULT_CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE,
+                            atLeast(2),
+                            ConfigDef.Importance.LOW,
+                            CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE_DOC)
+                    .define(CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_CONFIG,
+                            ConfigDef.Type.DOUBLE,
+                            DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION,
+                            between(Double.MIN_VALUE, 1.0),
+                            ConfigDef.Importance.MEDIUM,
+                            CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_DOC)
+                    .define(CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG,
+                            ConfigDef.Type.BOOLEAN,
+                            DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED,
+                            ConfigDef.Importance.MEDIUM,
+                            CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_DOC)
+                    .define(CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG,
+                            ConfigDef.Type.DOUBLE,
+                            DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_DOC)
                     .define(CONCURRENCY_ADJUSTER_MIN_ISR_CACHE_SIZE_CONFIG,
                             ConfigDef.Type.INT,
                             DEFAULT_CONCURRENCY_ADJUSTER_MIN_ISR_CACHE_SIZE,
@@ -797,6 +1101,39 @@ public final class ExecutorConfig {
                             ConfigDef.Type.BOOLEAN,
                             DEFAULT_AUTO_STOP_EXTERNAL_AGENT,
                             ConfigDef.Importance.MEDIUM,
-                            AUTO_STOP_EXTERNAL_AGENT_DOC);
+                            AUTO_STOP_EXTERNAL_AGENT_DOC)
+                    .define(EXECUTOR_STATE_STORE_CLASS_CONFIG,
+                            ConfigDef.Type.CLASS,
+                            DEFAULT_EXECUTOR_STATE_STORE_CLASS,
+                            ConfigDef.Importance.LOW,
+                            EXECUTOR_STATE_STORE_CLASS_DOC)
+                    .define(EXECUTOR_STATE_FILE_PATH_CONFIG,
+                            ConfigDef.Type.STRING,
+                            DEFAULT_EXECUTOR_STATE_FILE_PATH,
+                            ConfigDef.Importance.LOW,
+                            EXECUTOR_STATE_FILE_PATH_DOC)
+                    .define(RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG,
+                            ConfigDef.Type.BOOLEAN,
+                            DEFAULT_RESUME_INTERRUPTED_EXECUTION_ON_STARTUP,
+                            ConfigDef.Importance.MEDIUM,
+                            RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_DOC)
+                    .define(RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG,
+                            ConfigDef.Type.LONG,
+                            DEFAULT_RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_DOC)
+                    .define(RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG,
+                            ConfigDef.Type.INT,
+                            DEFAULT_RESUME_INTERRUPTED_EXECUTION_MAX_COUNT,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_DOC)
+                    .define(INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG,
+                            ConfigDef.Type.LONG,
+                            DEFAULT_INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS,
+                            atLeast(0),
+                            ConfigDef.Importance.LOW,
+                            INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_DOC);
   }
 }

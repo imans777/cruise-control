@@ -27,11 +27,13 @@ import com.linkedin.kafka.cruisecontrol.exception.BrokerCapacityResolutionExcept
 import com.linkedin.kafka.cruisecontrol.exception.KafkaCruiseControlException;
 import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
 import com.linkedin.kafka.cruisecontrol.executor.ConcurrencyType;
+import com.linkedin.kafka.cruisecontrol.executor.DynamicThrottleResult;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutionProposal;
 import com.linkedin.kafka.cruisecontrol.executor.Executor;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutorState;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
+import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
 import com.linkedin.kafka.cruisecontrol.model.ModelParameters;
 import com.linkedin.kafka.cruisecontrol.model.ModelUtils;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
@@ -221,6 +223,12 @@ public class KafkaCruiseControl {
   public void startUp() {
     LOG.info("Starting Cruise Control...");
     _loadMonitor.startUp();
+    // Recover the execution interrupted by a restart (if any) before starting the anomaly detection that may start a new execution.
+    try {
+      _executor.recoverInterruptedExecution(_loadMonitor);
+    } catch (RuntimeException e) {
+      LOG.error("Failed to recover the interrupted execution.", e);
+    }
     _anomalyDetectorManager.startDetection();
     _goalOptimizerExecutor.execute(_goalOptimizer);
     LOG.info("Cruise Control started.");
@@ -275,9 +283,10 @@ public class KafkaCruiseControl {
     }
     if (hasOngoingExecution()) {
       if (!stopOngoingExecution) {
-        throw new IllegalStateException(String.format("Cannot start a new execution while there is an ongoing execution. "
+        String recovery = _executor.ongoingRecoveryDescription();
+        throw new IllegalStateException(String.format("Cannot start a new execution while there is an ongoing execution%s. "
                                                       + "Please use %s=true to stop ongoing execution and start a new one.",
-                                                      STOP_ONGOING_EXECUTION_PARAM));
+                                                      recovery == null ? "" : " (" + recovery + ")", STOP_ONGOING_EXECUTION_PARAM));
       }
     } else {
       Set<TopicPartition> partitionsBeingReassigned;
@@ -450,6 +459,18 @@ public class KafkaCruiseControl {
   }
 
   /**
+   * Enable or disable replication throttle adjustment by the concurrency adjuster. Disabling it waits for the throttle update of a
+   * broker that is already in progress (if any) to complete; during an execution, the replication throttles then stay at their last
+   * values until the execution ends.
+   *
+   * @param isReplicationThrottleAdjustmentEnabled {@code true} to enable replication throttle adjustment, {@code false} otherwise.
+   * @return {@code true} if replication throttle adjustment was enabled before, {@code false} otherwise.
+   */
+  public boolean setReplicationThrottleAdjusterEnabled(boolean isReplicationThrottleAdjustmentEnabled) {
+    return _executor.setReplicationThrottleAdjusterEnabled(isReplicationThrottleAdjustmentEnabled);
+  }
+
+  /**
    * Drop the given brokers from the recently removed/demoted brokers.
    *
    * @param brokersToDrop Brokers to drop from the recently removed or demoted brokers.
@@ -513,6 +534,46 @@ public class KafkaCruiseControl {
    */
   public void setRequestedMaxInterBrokerPartitionMovements(Integer requestedMaxInterBrokerPartitionMovements) {
     _executor.setRequestedMaxInterBrokerPartitionMovements(requestedMaxInterBrokerPartitionMovements);
+  }
+
+  /**
+   * Dynamically update the replication throttle of the ongoing execution (if any).
+   *
+   * @param replicationThrottle The new replication throttle rate in bytes per second.
+   * @return {@code true} if the replication throttle of the ongoing execution has been updated, {@code false} if
+   * there is no ongoing execution with remaining inter-broker replica movements to throttle.
+   */
+  public boolean updateOngoingExecutionReplicationThrottle(long replicationThrottle) {
+    return _executor.updateOngoingExecutionReplicationThrottle(replicationThrottle);
+  }
+
+  /**
+   * Remove the replication throttle of the ongoing execution (if any).
+   *
+   * @return The outcome of the removal -- removed, not throttled, or no ongoing inter-broker replica movement.
+   */
+  public DynamicThrottleResult removeOngoingExecutionReplicationThrottle() {
+    return _executor.removeOngoingExecutionReplicationThrottle();
+  }
+
+  /**
+   * Remove the log dir throttle of the ongoing execution (if any).
+   *
+   * @return The outcome of the removal -- removed, not throttled, or no ongoing intra-broker replica movement.
+   */
+  public DynamicThrottleResult removeOngoingExecutionLogDirThrottle() {
+    return _executor.removeOngoingExecutionLogDirThrottle();
+  }
+
+  /**
+   * Dynamically update the log dir throttle of the ongoing execution (if any).
+   *
+   * @param logDirThrottle The new log dir throttle rate in bytes per second.
+   * @return {@code true} if the log dir throttle of the ongoing execution has been updated, {@code false} if
+   * there is no ongoing execution with remaining intra-broker replica movements to throttle.
+   */
+  public boolean updateOngoingExecutionLogDirThrottle(long logDirThrottle) {
+    return _executor.updateOngoingExecutionLogDirThrottle(logDirThrottle);
   }
 
   /**
@@ -606,6 +667,35 @@ public class KafkaCruiseControl {
   }
 
   /**
+   * See {@link GoalOptimizer#optimizations(ClusterModel, List, OperationProgress, Map, OptimizationOptions, BrokerStats,
+   * ClusterModelStats)}.
+   *
+   * @param clusterModel The state of the cluster.
+   * @param goalsByPriority the goals ordered by priority.
+   * @param operationProgress to report the job progress.
+   * @param initReplicaDistribution The initial replica distribution of the cluster, if the passed in clusterModel is not the
+   *                                original cluster model, otherwise it is null.
+   * @param optimizationOptions Optimization options.
+   * @param initBrokerStats The broker stats of the initial cluster state, if the passed in clusterModel has been modified in a
+   *                        way that is not supposed to be reflected in the load before optimization (e.g. disks are marked
+   *                        for removal), otherwise it is null.
+   * @param initClusterModelStats The cluster model stats of the initial cluster state, under the same condition as initBrokerStats,
+   *                              otherwise it is null.
+   * @return Results of optimization containing the proposals and stats.
+   */
+  public synchronized OptimizerResult optimizations(ClusterModel clusterModel,
+                                                    List<Goal> goalsByPriority,
+                                                    OperationProgress operationProgress,
+                                                    Map<TopicPartition, List<ReplicaPlacementInfo>> initReplicaDistribution,
+                                                    OptimizationOptions optimizationOptions,
+                                                    BrokerStats initBrokerStats,
+                                                    ClusterModelStats initClusterModelStats)
+      throws KafkaCruiseControlException {
+    return _goalOptimizer.optimizations(clusterModel, goalsByPriority, operationProgress, initReplicaDistribution, optimizationOptions,
+                                        initBrokerStats, initClusterModelStats);
+  }
+
+  /**
    * See {@link GoalOptimizer#excludedTopics(ClusterModel, Pattern)}.
    * @param clusterModel The state of the cluster.
    * @param requestedExcludedTopics Pattern used to exclude topics, or {@code null} to use the default excluded topics.
@@ -631,7 +721,8 @@ public class KafkaCruiseControl {
   }
 
   /**
-   * Execute the given balancing proposals for non-(demote/remove) operations.
+   * Execute the given balancing proposals for non-(demote/remove) operations, throttling intra-broker replica movements
+   * (if any) with default.log.dir.throttle.
    * @param proposals the given balancing proposals
    * @param unthrottledBrokers Brokers for which the rate of replica movements from/to will not be throttled.
    * @param isKafkaAssignerMode {@code true} if kafka assigner mode, {@code false} otherwise.
@@ -655,6 +746,8 @@ public class KafkaCruiseControl {
    * @param uuid UUID of the execution.
    * @param skipInterBrokerReplicaConcurrencyAdjustment {@code true} to skip auto adjusting concurrency of inter-broker
    * replica movements even if the concurrency adjuster is enabled, {@code false} otherwise.
+   * @param intraBrokerMovementsBrokerByBroker {@code true} to execute intra-broker replica movements one broker at a time,
+   * {@code false} to execute them on all brokers in parallel.
    */
   public void executeProposals(Set<ExecutionProposal> proposals,
                                Set<Integer> unthrottledBrokers,
@@ -669,12 +762,67 @@ public class KafkaCruiseControl {
                                Long replicationThrottle,
                                boolean isTriggeredByUserRequest,
                                String uuid,
-                               boolean skipInterBrokerReplicaConcurrencyAdjustment) throws OngoingExecutionException {
+                               boolean skipInterBrokerReplicaConcurrencyAdjustment,
+                               boolean intraBrokerMovementsBrokerByBroker) throws OngoingExecutionException {
+    executeProposals(proposals, unthrottledBrokers, isKafkaAssignerMode, concurrentInterBrokerPartitionMovements,
+                     maxInterBrokerPartitionMovements, concurrentIntraBrokerPartitionMovements, clusterConcurrentLeaderMovements,
+                     brokerConcurrentLeaderMovements, executionProgressCheckIntervalMs, replicaMovementStrategy, replicationThrottle,
+                     _config.getLong(ExecutorConfig.DEFAULT_LOG_DIR_THROTTLE_CONFIG), isTriggeredByUserRequest, uuid,
+                     skipInterBrokerReplicaConcurrencyAdjustment, intraBrokerMovementsBrokerByBroker);
+  }
+
+  /**
+   * Execute the given balancing proposals for non-(demote/remove) operations.
+   * @param proposals the given balancing proposals
+   * @param unthrottledBrokers Brokers for which the rate of replica movements from/to will not be throttled.
+   * @param isKafkaAssignerMode {@code true} if kafka assigner mode, {@code false} otherwise.
+   * @param concurrentInterBrokerPartitionMovements The maximum number of concurrent inter-broker partition movements per broker
+   *                                                (if null, use num.concurrent.partition.movements.per.broker).
+   * @param maxInterBrokerPartitionMovements The upper bound of concurrent inter-broker partition movements in cluster
+   *                                                (if null, use num.concurrent.partition.movements.per.broker).
+   * @param concurrentIntraBrokerPartitionMovements The maximum number of concurrent intra-broker partition movements
+   *                                                (if null, use num.concurrent.intra.broker.partition.movements).
+   * @param clusterConcurrentLeaderMovements The maximum number of concurrent leader movements in a cluster
+   *                                  (if null, use num.concurrent.leader.movements).
+   * @param brokerConcurrentLeaderMovements The maximum number of concurrent leader movements involved in a broker
+   *                                  (if null, use num.concurrent.leader.movements.per.broker).
+   * @param executionProgressCheckIntervalMs The interval between checking and updating the progress of an initiated
+   *                                         execution (if null, use execution.progress.check.interval.ms).
+   * @param replicaMovementStrategy The strategy used to determine the execution order of generated replica movement tasks
+   *                                (if null, use default.replica.movement.strategies).
+   * @param replicationThrottle The replication throttle (bytes/second) to apply to both leaders and followers
+   *                            when executing proposals (if null, no throttling is applied).
+   * @param logDirThrottle The throttle (bytes/second) to apply to intra-broker replica movements -- i.e. moving replicas
+   *                       between the logdirs of a broker (if null, no throttling is applied).
+   * @param isTriggeredByUserRequest Whether the execution is triggered by a user request.
+   * @param uuid UUID of the execution.
+   * @param skipInterBrokerReplicaConcurrencyAdjustment {@code true} to skip auto adjusting concurrency of inter-broker
+   * replica movements even if the concurrency adjuster is enabled, {@code false} otherwise.
+   * @param intraBrokerMovementsBrokerByBroker {@code true} to execute intra-broker replica movements one broker at a time,
+   * {@code false} to execute them on all brokers in parallel.
+   */
+  public void executeProposals(Set<ExecutionProposal> proposals,
+                               Set<Integer> unthrottledBrokers,
+                               boolean isKafkaAssignerMode,
+                               Integer concurrentInterBrokerPartitionMovements,
+                               Integer maxInterBrokerPartitionMovements,
+                               Integer concurrentIntraBrokerPartitionMovements,
+                               Integer clusterConcurrentLeaderMovements,
+                               Integer brokerConcurrentLeaderMovements,
+                               Long executionProgressCheckIntervalMs,
+                               ReplicaMovementStrategy replicaMovementStrategy,
+                               Long replicationThrottle,
+                               Long logDirThrottle,
+                               boolean isTriggeredByUserRequest,
+                               String uuid,
+                               boolean skipInterBrokerReplicaConcurrencyAdjustment,
+                               boolean intraBrokerMovementsBrokerByBroker) throws OngoingExecutionException {
     if (hasProposalsToExecute(proposals, uuid)) {
       _executor.executeProposals(proposals, unthrottledBrokers, null, _loadMonitor, concurrentInterBrokerPartitionMovements,
                                  maxInterBrokerPartitionMovements, concurrentIntraBrokerPartitionMovements, clusterConcurrentLeaderMovements,
                                  brokerConcurrentLeaderMovements, executionProgressCheckIntervalMs, replicaMovementStrategy, replicationThrottle,
-                                 isTriggeredByUserRequest, uuid, isKafkaAssignerMode, skipInterBrokerReplicaConcurrencyAdjustment);
+                                 logDirThrottle, isTriggeredByUserRequest, uuid, isKafkaAssignerMode, skipInterBrokerReplicaConcurrencyAdjustment,
+                                 intraBrokerMovementsBrokerByBroker);
     } else {
       failGeneratingProposalsForExecution(uuid);
     }
@@ -721,7 +869,8 @@ public class KafkaCruiseControl {
                                  _loadMonitor, concurrentInterBrokerPartitionMovements, maxInterBrokerPartitionMovements, 0,
                                  clusterLeaderMovementConcurrency, brokerLeaderMovementConcurrency,
                                  executionProgressCheckIntervalMs, replicaMovementStrategy, replicationThrottle,
-                                 isTriggeredByUserRequest, uuid, isKafkaAssignerMode, false);
+                                 // Removal operations do not move replicas between the logdirs of a broker.
+                                 null, isTriggeredByUserRequest, uuid, isKafkaAssignerMode, false);
     } else {
       failGeneratingProposalsForExecution(uuid);
     }

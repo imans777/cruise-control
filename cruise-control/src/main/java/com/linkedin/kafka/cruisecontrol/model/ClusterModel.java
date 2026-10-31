@@ -135,7 +135,23 @@ public class ClusterModel implements Serializable {
    * @return Analysis stats with this cluster and given balancing constraint.
    */
   public ClusterModelStats getClusterStats(BalancingConstraint balancingConstraint, OptimizationOptions optimizationOptions) {
-    return (new ClusterModelStats()).populate(this, balancingConstraint, optimizationOptions);
+    return getClusterStats(balancingConstraint, optimizationOptions, Collections.emptySet());
+  }
+
+  /**
+   * Populate the analysis stats with this cluster, given balancing constraint, and optimization options, with the disk balance
+   * stats ({@link ClusterModelStats#diskBalanceStats()}) over the given brokers only.
+   *
+   * @param balancingConstraint Balancing constraint.
+   * @param optimizationOptions Options to take into account while populating stats.
+   * @param diskStatsBrokerIds The ids of the brokers to compute the disk balance stats over, or an empty set for all alive brokers
+   *                           (see {@link com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils#diskStatsBrokerIds}).
+   * @return Analysis stats with this cluster and given balancing constraint.
+   */
+  public ClusterModelStats getClusterStats(BalancingConstraint balancingConstraint,
+                                           OptimizationOptions optimizationOptions,
+                                           Set<Integer> diskStatsBrokerIds) {
+    return (new ClusterModelStats()).populate(this, balancingConstraint, optimizationOptions, diskStatsBrokerIds);
   }
 
   /**
@@ -336,19 +352,55 @@ public class ClusterModel implements Serializable {
   }
 
   /**
-   * Set the given disk to dead state.
-   * This method is for testing only.
+   * Set the given disk to dead state, and drop its capacity from the capacity of its broker, host, rack and cluster.
+   * The replicas on the disk become offline. Marking a dead disk dead again drops no capacity.
+   * This is used during cluster model initialization for a logdir that Kafka reports as failed.
    *
    * @param brokerId Id of the broker on which the disk resides.
    * @param logdir   Log directory of the disk.
    */
-  void markDiskDead(int brokerId, String logdir) {
+  public void markDiskDead(int brokerId, String logdir) {
     Broker broker = broker(brokerId);
     if (broker == null) {
       throw new IllegalArgumentException("Broker " + brokerId + " does not exist.");
     }
     broker.rack().markDiskDead(brokerId, logdir);
     _selfHealingEligibleReplicas.addAll(broker.currentOfflineReplicas());
+    refreshCapacity();
+  }
+
+  /**
+   * Mark the given disk for removal: drop its capacity from the capacity of its broker, host, rack and cluster, and set
+   * its capacity to 0, so that goals move all replicas off the disk.
+   *
+   * @param brokerId Id of the broker on which the disk resides.
+   * @param logdir   Log directory of the disk.
+   */
+  public void markDiskForRemoval(int brokerId, String logdir) {
+    Broker broker = broker(brokerId);
+    if (broker == null) {
+      throw new IllegalArgumentException("Broker " + brokerId + " does not exist.");
+    }
+    broker.rack().markDiskForRemoval(brokerId, logdir);
+    refreshCapacity();
+  }
+
+  /**
+   * Remove the given disk from the broker and deduct its capacity from the cluster model.
+   * This is used during cluster model initialization to ignore disks that are configured in the broker capacity config
+   * but are not among the logdirs reported by Kafka for the broker (e.g. a disk excluded from Kafka logdirs after a
+   * failure).
+   * The disk must not host any replicas.
+   *
+   * @param brokerId Id of the broker on which the disk resides.
+   * @param logdir   Log directory of the disk.
+   */
+  public void removeDisk(int brokerId, String logdir) {
+    Broker broker = broker(brokerId);
+    if (broker == null) {
+      throw new IllegalArgumentException("Broker " + brokerId + " does not exist.");
+    }
+    broker.rack().removeDisk(brokerId, logdir);
     refreshCapacity();
   }
 
@@ -895,7 +947,9 @@ public class ClusterModel implements Serializable {
       throw new IllegalStateException(String.format("Unable to delete replica for topic partition %s since it only has %d replicas.",
                                                     topicPartition, currentReplicaCount));
     }
-    removeReplica(brokerId, topicPartition);
+    Replica removedReplica = removeReplica(brokerId, topicPartition);
+    // A deleted replica no longer needs to be moved away from a dead broker or broken disk.
+    _selfHealingEligibleReplicas.remove(removedReplica);
     // Update partition info.
     Partition partition = _partitionsByTopicPartition.get(topicPartition);
     partition.deleteReplica(brokerId);
@@ -952,7 +1006,9 @@ public class ClusterModel implements Serializable {
 
   /**
    * For partitions of specified topics, create or delete replicas in given cluster model to change the partition's replication
-   * factor to target replication factor. New replicas for partition are added in a rack-aware, round-robin way.
+   * factor to target replication factor. New replicas for partition are added in a rack-aware, round-robin way. When
+   * replicas are deleted, the leader replica is retained and offline replicas (i.e. on dead brokers or broken disks), then
+   * out-of-sync replicas are deleted first (see {@link ModelUtils#replicasToRetainOnReplicationFactorDecrease}).
    *
    * @param topicsByReplicationFactor The topics to modify replication factor with target replication factor.
    * @param brokersByRack A map from rack to broker.
@@ -987,8 +1043,8 @@ public class ClusterModel implements Serializable {
             continue;
           }
 
-          List<Integer> newAssignedReplica = new ArrayList<>();
           if (partitionInfo.replicas().length < replicationFactor) {
+            List<Integer> newAssignedReplica = new ArrayList<>();
             Set<String> currentOccupiedRack = new HashSet<>();
             // Make sure the current replicas are in new replica list.
             for (Node node : partitionInfo.replicas()) {
@@ -1014,16 +1070,14 @@ public class ClusterModel implements Serializable {
               rackCursor = (rackCursor + 1) % racks.size();
             }
           } else {
-            // Make sure the leader replica is in new replica list.
-            newAssignedReplica.add(partitionInfo.leader().id());
+            // Retain the leader replica and prefer removing offline, then out-of-sync replicas.
+            List<Integer> replicasToRetain =
+                ModelUtils.replicasToRetainOnReplicationFactorDecrease(partitionInfo, offlineReplicaBrokerIds(partition, partitionInfo),
+                                                                       replicationFactor);
             for (Node node : partitionInfo.replicas()) {
-              if (node.id() != newAssignedReplica.get(0)) {
-                if (newAssignedReplica.size() < replicationFactor) {
-                  newAssignedReplica.add(node.id());
-                } else {
-                  deleteReplica(new TopicPartition(topic, partitionInfo.partition()), node.id());
-                  needToRefreshClusterMaxReplicationFactor = true;
-                }
+              if (!replicasToRetain.contains(node.id())) {
+                deleteReplica(tp, node.id());
+                needToRefreshClusterMaxReplicationFactor = true;
               }
             }
           }
@@ -1033,6 +1087,29 @@ public class ClusterModel implements Serializable {
     if (needToRefreshClusterMaxReplicationFactor) {
       refreshClusterMaxReplicationFactor();
     }
+  }
+
+  /**
+   * Get ids of brokers hosting offline replicas of the given partition, based on both the given partition info and
+   * the cluster model (i.e. replicas on dead brokers or broken disks).
+   *
+   * @param partition The partition in the cluster model.
+   * @param partitionInfo The partition info from the Kafka cluster metadata.
+   * @return Ids of brokers hosting offline replicas of the given partition.
+   */
+  private static Set<Integer> offlineReplicaBrokerIds(Partition partition, PartitionInfo partitionInfo) {
+    Set<Integer> offlineBrokerIds = new HashSet<>();
+    if (partitionInfo.offlineReplicas() != null) {
+      for (Node node : partitionInfo.offlineReplicas()) {
+        offlineBrokerIds.add(node.id());
+      }
+    }
+    for (Replica replica : partition.replicas()) {
+      if (replica.isCurrentOffline()) {
+        offlineBrokerIds.add(replica.broker().id());
+      }
+    }
+    return offlineBrokerIds;
   }
 
   /**
@@ -1304,8 +1381,32 @@ public class ClusterModel implements Serializable {
     BrokerStats brokerStats = new BrokerStats(config);
     brokers().forEach(broker -> brokerStats.addSingleBrokerStats(broker,
                                                                  potentialLeadershipLoadFor(broker.id()).expectedUtilizationFor(Resource.NW_OUT),
+                                                                 potentialBytesOutRateByLogdir(broker.id()),
                                                                  _capacityEstimationInfoByBrokerId.get(broker.id()) != null));
     return brokerStats;
+  }
+
+  /**
+   * Get the NW_OUT rate that each disk of the given broker would serve if all the replicas on it were leaders, i.e. for each
+   * disk, the sum of the leader NW_OUT rate of the partitions it has a replica of. This is the per-disk breakdown of
+   * {@link #potentialLeadershipLoadFor(Integer)}.
+   *
+   * @param brokerId Id of the broker.
+   * @return The potential NW_OUT rate by logdir, or an empty map if the model has no disk information.
+   */
+  public Map<String, Double> potentialBytesOutRateByLogdir(int brokerId) {
+    Map<String, Double> potentialBytesOutRateByLogdir = new HashMap<>();
+    for (Disk disk : broker(brokerId).disks()) {
+      double potentialBytesOutRate = 0.0;
+      for (Replica replica : disk.replicas()) {
+        Replica leader = partition(replica.topicPartition()).leader();
+        if (leader != null) {
+          potentialBytesOutRate += leader.load().expectedUtilizationFor(Resource.NW_OUT);
+        }
+      }
+      potentialBytesOutRateByLogdir.put(disk.logDir(), potentialBytesOutRate);
+    }
+    return potentialBytesOutRateByLogdir;
   }
 
   /**

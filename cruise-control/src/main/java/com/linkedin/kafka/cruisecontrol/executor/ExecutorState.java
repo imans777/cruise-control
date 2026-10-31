@@ -9,10 +9,14 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import com.linkedin.kafka.cruisecontrol.servlet.response.JsonResponseField;
 import com.linkedin.kafka.cruisecontrol.servlet.response.JsonResponseClass;
 
+import static com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils.toPrettyDuration;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutionTask.TaskType.*;
 import static com.linkedin.kafka.cruisecontrol.executor.ExecutionTaskTracker.ExecutionTasksSummary;
 
@@ -26,10 +30,19 @@ public final class ExecutorState {
   private static final String TRIGGERED_TASK_REASON = "triggeredTaskReason";
   @JsonResponseField
   private static final String STATE = "state";
+  // The throttles in force for the ongoing execution, if any.
+  @JsonResponseField(required = false)
+  private static final String ONGOING_REPLICATION_THROTTLE = "ongoingReplicationThrottle";
+  @JsonResponseField(required = false)
+  private static final String ONGOING_REPLICATION_THROTTLE_BY_BROKER = "ongoingReplicationThrottleByBroker";
+  @JsonResponseField(required = false)
+  private static final String ONGOING_LOG_DIR_THROTTLE_BY_BROKER = "ongoingLogDirThrottleByBroker";
   @JsonResponseField(required = false)
   private static final String RECENTLY_DEMOTED_BROKERS = "recentlyDemotedBrokers";
   @JsonResponseField(required = false)
   private static final String RECENTLY_REMOVED_BROKERS = "recentlyRemovedBrokers";
+  @JsonResponseField(required = false)
+  private static final String RECOVERY = "recovery";
 
   @JsonResponseField(required = false)
   private static final String NUM_TOTAL_LEADERSHIP_MOVEMENTS = "numTotalLeadershipMovements";
@@ -82,6 +95,12 @@ public final class ExecutorState {
   @JsonResponseField(required = false)
   private static final String TOTAL_INTER_BROKER_DATA_TO_MOVE = "totalDataToMove";
   @JsonResponseField(required = false)
+  private static final String IN_PROGRESS_INTER_BROKER_MOVED_DATA = "inProgressMovedData";
+  @JsonResponseField(required = false)
+  private static final String IN_PROGRESS_INTER_BROKER_DATA_MOVEMENT_RATE = "inProgressDataMovementRate";
+  @JsonResponseField(required = false)
+  private static final String ESTIMATED_INTER_BROKER_REMAINING_TIME_MS = "estimatedRemainingTimeMs";
+  @JsonResponseField(required = false)
   private static final String MAXIMUM_CONCURRENT_INTER_BROKER_PARTITION_MOVEMENTS_PER_BROKER = "maximumConcurrentPartitionMovementsPerBroker";
   @JsonResponseField(required = false)
   private static final String MINIMUM_CONCURRENT_INTER_BROKER_PARTITION_MOVEMENTS_PER_BROKER = "minimumConcurrentPartitionMovementsPerBroker";
@@ -119,6 +138,12 @@ public final class ExecutorState {
   @JsonResponseField(required = false)
   private static final String TOTAL_INTRA_BROKER_DATA_TO_MOVE = "totalIntraBrokerDataToMove";
   @JsonResponseField(required = false)
+  private static final String IN_PROGRESS_INTRA_BROKER_MOVED_DATA = "inProgressIntraBrokerMovedData";
+  @JsonResponseField(required = false)
+  private static final String IN_PROGRESS_INTRA_BROKER_DATA_MOVEMENT_RATE = "inProgressIntraBrokerDataMovementRate";
+  @JsonResponseField(required = false)
+  private static final String ESTIMATED_INTRA_BROKER_REMAINING_TIME_MS = "estimatedIntraBrokerRemainingTimeMs";
+  @JsonResponseField(required = false)
   private static final String MAXIMUM_CONCURRENT_INTRA_BROKER_PARTITION_MOVEMENTS_PER_BROKER
       = "maximumConcurrentIntraBrokerPartitionMovementsPerBroker";
   @JsonResponseField(required = false)
@@ -139,7 +164,49 @@ public final class ExecutorState {
     LEADER_MOVEMENT_TASK_IN_PROGRESS,
     STOPPING_EXECUTION,
     INITIALIZING_PROPOSAL_EXECUTION,
-    GENERATING_PROPOSALS_FOR_EXECUTION
+    GENERATING_PROPOSALS_FOR_EXECUTION,
+    // Cleaning up an execution that was interrupted by a Cruise Control restart and is not resumed.
+    RECOVERING_INTERRUPTED_EXECUTION
+  }
+
+  /**
+   * The leader and follower replication throttles (bytes/sec) in force on a broker.
+   */
+  @JsonResponseClass
+  public static final class BrokerReplicationThrottle {
+    @JsonResponseField
+    private static final String LEADER = "leader";
+    @JsonResponseField
+    private static final String FOLLOWER = "follower";
+    private final long _leader;
+    private final long _follower;
+
+    /**
+     * @param leader The leader replication throttle (bytes/sec).
+     * @param follower The follower replication throttle (bytes/sec).
+     */
+    public BrokerReplicationThrottle(long leader, long follower) {
+      _leader = leader;
+      _follower = follower;
+    }
+
+    public long leader() {
+      return _leader;
+    }
+
+    public long follower() {
+      return _follower;
+    }
+
+    /**
+     * @return An object that can be further used to encode into JSON.
+     */
+    public Map<String, Object> getJsonStructure() {
+      Map<String, Object> jsonStructure = new LinkedHashMap<>();
+      jsonStructure.put(LEADER, _leader);
+      jsonStructure.put(FOLLOWER, _follower);
+      return jsonStructure;
+    }
   }
 
   public static final Set<State> IN_PROGRESS_STATES = Set.of(State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS,
@@ -156,6 +223,17 @@ public final class ExecutorState {
   private final boolean _isTriggeredByUserRequest;
   private final Set<Integer> _recentlyDemotedBrokers;
   private final Set<Integer> _recentlyRemovedBrokers;
+  // The replication throttle (bytes/sec) of the ongoing inter-broker replica movements, null if they are not throttled or none
+  // is in progress: the base rate, which the concurrency adjuster may override per broker (see the map below).
+  private final Long _ongoingReplicationThrottle;
+  // The replication throttles in force on each broker throttled by the ongoing inter-broker replica movements, by broker id --
+  // per broker, since the concurrency adjuster may set a different throttle on each broker -- null if none is throttled.
+  private final SortedMap<Integer, BrokerReplicationThrottle> _ongoingReplicationThrottleByBroker;
+  // The log dir throttle (bytes/sec) in force on each broker with ongoing intra-broker replica movements, empty or null if
+  // they are not throttled or none is in progress.
+  private final Map<Integer, String> _ongoingLogDirThrottleByBroker;
+  // The recovery of the latest execution interrupted by a Cruise Control restart (if any).
+  private final Map<String, Object> _recovery;
 
   private ExecutorState(State state,
                         ExecutionTasksSummary executionTasksSummary,
@@ -164,7 +242,9 @@ public final class ExecutorState {
                         String reason,
                         Set<Integer> recentlyDemotedBrokers,
                         Set<Integer> recentlyRemovedBrokers,
-                        boolean isTriggeredByUserRequest) {
+                        boolean isTriggeredByUserRequest,
+                        Long ongoingReplicationThrottle,
+                        Map<Integer, String> ongoingLogDirThrottleByBroker) {
     _state = state;
     _executionTasksSummary = executionTasksSummary;
     _executionConcurrencySummary = executionConcurrencySummary;
@@ -173,6 +253,69 @@ public final class ExecutorState {
     _recentlyDemotedBrokers = recentlyDemotedBrokers;
     _recentlyRemovedBrokers = recentlyRemovedBrokers;
     _isTriggeredByUserRequest = isTriggeredByUserRequest;
+    _ongoingReplicationThrottle = ongoingReplicationThrottle;
+    _ongoingReplicationThrottleByBroker = null;
+    _ongoingLogDirThrottleByBroker = ongoingLogDirThrottleByBroker;
+    _recovery = null;
+  }
+
+  private ExecutorState(ExecutorState executorState,
+                        SortedMap<Integer, BrokerReplicationThrottle> ongoingReplicationThrottleByBroker,
+                        Map<String, Object> recovery) {
+    _state = executorState._state;
+    _executionTasksSummary = executorState._executionTasksSummary;
+    _executionConcurrencySummary = executorState._executionConcurrencySummary;
+    _uuid = executorState._uuid;
+    _reason = executorState._reason;
+    _recentlyDemotedBrokers = executorState._recentlyDemotedBrokers;
+    _recentlyRemovedBrokers = executorState._recentlyRemovedBrokers;
+    _isTriggeredByUserRequest = executorState._isTriggeredByUserRequest;
+    _ongoingReplicationThrottle = executorState._ongoingReplicationThrottle;
+    _ongoingReplicationThrottleByBroker = ongoingReplicationThrottleByBroker;
+    _ongoingLogDirThrottleByBroker = executorState._ongoingLogDirThrottleByBroker;
+    _recovery = recovery;
+  }
+
+  /**
+   * @param ongoingReplicationThrottle The replication throttle in force, or null if there is none.
+   * @param ongoingLogDirThrottleByBroker The log dir throttle in force per broker, or null if there is none.
+   * @return A copy of this state reporting the given throttles. The executor attaches them when its state is read, so that a
+   * throttle changed by an {@code admin} request is reported immediately rather than at the next progress check.
+   */
+  public ExecutorState withThrottles(Long ongoingReplicationThrottle, Map<Integer, String> ongoingLogDirThrottleByBroker) {
+    if (ongoingReplicationThrottle == null && (ongoingLogDirThrottleByBroker == null || ongoingLogDirThrottleByBroker.isEmpty())) {
+      return this;
+    }
+    return new ExecutorState(_state, _executionTasksSummary, _executionConcurrencySummary, _uuid, _reason,
+                             _recentlyDemotedBrokers, _recentlyRemovedBrokers, _isTriggeredByUserRequest,
+                             ongoingReplicationThrottle, ongoingLogDirThrottleByBroker)
+        .withReplicationThrottleByBroker(_ongoingReplicationThrottleByBroker).withRecovery(_recovery);
+  }
+
+  /**
+   * @param ongoingReplicationThrottleByBroker The replication throttles in force on each broker throttled by the ongoing
+   * inter-broker replica movements, by broker id; empty or {@code null} if none is throttled.
+   * @return This executor state, along with the given replication throttles. The executor attaches them when its state is read,
+   * so that a throttle that the concurrency adjuster changes is reported immediately rather than at the next progress check.
+   */
+  public ExecutorState withReplicationThrottleByBroker(SortedMap<Integer, BrokerReplicationThrottle> ongoingReplicationThrottleByBroker) {
+    return ongoingReplicationThrottleByBroker == null || ongoingReplicationThrottleByBroker.isEmpty()
+           ? this : new ExecutorState(this, ongoingReplicationThrottleByBroker, _recovery);
+  }
+
+  /**
+   * @param recovery The recovery of the latest execution interrupted by a Cruise Control restart, or {@code null} if none.
+   * @return This executor state, along with the given recovery of an interrupted execution.
+   */
+  public ExecutorState withRecovery(Map<String, Object> recovery) {
+    return recovery == null ? this : new ExecutorState(this, _ongoingReplicationThrottleByBroker, recovery);
+  }
+
+  /**
+   * @return The recovery of the latest execution interrupted by a Cruise Control restart, or {@code null} if none.
+   */
+  public Map<String, Object> recovery() {
+    return _recovery;
   }
 
   /**
@@ -189,7 +332,9 @@ public final class ExecutorState {
                              "",
                              recentlyDemotedBrokers,
                              recentlyRemovedBrokers,
-                             false);
+                             false,
+                             null,
+                             null);
   }
 
   /**
@@ -212,7 +357,9 @@ public final class ExecutorState {
                              reason,
                              recentlyDemotedBrokers,
                              recentlyRemovedBrokers,
-                             isTriggeredByUserRequest);
+                             isTriggeredByUserRequest,
+                             null,
+                             null);
   }
 
   /**
@@ -235,7 +382,9 @@ public final class ExecutorState {
                              reason,
                              recentlyDemotedBrokers,
                              recentlyRemovedBrokers,
-                             isTriggeredByUserRequest);
+                             isTriggeredByUserRequest,
+                             null,
+                             null);
   }
 
   /**
@@ -258,7 +407,34 @@ public final class ExecutorState {
                              reason,
                              recentlyDemotedBrokers,
                              recentlyRemovedBrokers,
-                             isTriggeredByUserRequest);
+                             isTriggeredByUserRequest,
+                             null,
+                             null);
+  }
+
+  /**
+   * @param uuid UUID of the interrupted execution.
+   * @param reason Reason of the interrupted execution.
+   * @param recentlyDemotedBrokers Recently demoted broker IDs.
+   * @param recentlyRemovedBrokers Recently removed broker IDs.
+   * @param isTriggeredByUserRequest Whether the interrupted execution was triggered by a user request.
+   * @return Executor state when cleaning up an execution that was interrupted by a Cruise Control restart.
+   */
+  public static ExecutorState recoveringInterruptedExecution(String uuid,
+                                                             String reason,
+                                                             Set<Integer> recentlyDemotedBrokers,
+                                                             Set<Integer> recentlyRemovedBrokers,
+                                                             boolean isTriggeredByUserRequest) {
+    return new ExecutorState(State.RECOVERING_INTERRUPTED_EXECUTION,
+                             null,
+                             null,
+                             uuid,
+                             reason,
+                             recentlyDemotedBrokers,
+                             recentlyRemovedBrokers,
+                             isTriggeredByUserRequest,
+                             null,
+                             null);
   }
 
   /**
@@ -290,7 +466,9 @@ public final class ExecutorState {
                              reason,
                              recentlyDemotedBrokers,
                              recentlyRemovedBrokers,
-                             isTriggeredByUserRequest);
+                             isTriggeredByUserRequest,
+                             null,
+                             null);
   }
 
   /**
@@ -330,6 +508,59 @@ public final class ExecutorState {
     return _executionTasksSummary.inExecutionIntraBrokerDataMovementInMB()
            + _executionTasksSummary.finishedIntraBrokerDataMovementInMB()
            + _executionTasksSummary.remainingIntraBrokerDataToMoveInMB();
+  }
+
+  /**
+   * @return Estimated time (in ms) to move the remaining inter-broker data at the current data movement rate of the
+   * in-progress inter-broker partition movements, or {@code -1} if unknown.
+   */
+  public long estimatedInterBrokerRemainingTimeMs() {
+    return estimatedRemainingTimeMs(numTotalInterBrokerDataToMove(),
+                                    _executionTasksSummary.finishedInterBrokerDataMovementInMB(),
+                                    _executionTasksSummary.inProgressInterBrokerMovedDataInMB(),
+                                    _executionTasksSummary.inProgressInterBrokerDataMovementRateInMBPerSec());
+  }
+
+  /**
+   * @return Estimated time (in ms) to move the remaining intra-broker data at the current data movement rate of the
+   * in-progress intra-broker partition movements, or {@code -1} if unknown.
+   */
+  public long estimatedIntraBrokerRemainingTimeMs() {
+    return estimatedRemainingTimeMs(numTotalIntraBrokerDataToMove(),
+                                    _executionTasksSummary.finishedIntraBrokerDataMovementInMB(),
+                                    _executionTasksSummary.inProgressIntraBrokerMovedDataInMB(),
+                                    _executionTasksSummary.inProgressIntraBrokerDataMovementRateInMBPerSec());
+  }
+
+  private static long estimatedRemainingTimeMs(long totalDataToMoveInMB,
+                                               long finishedDataMovementInMB,
+                                               long inProgressMovedDataInMB,
+                                               double dataMovementRateInMBPerSec) {
+    long remainingDataToMoveInMB = Math.max(0L, totalDataToMoveInMB - finishedDataMovementInMB - inProgressMovedDataInMB);
+    if (remainingDataToMoveInMB == 0L) {
+      return 0L;
+    }
+    return dataMovementRateInMBPerSec > 0.0 ? Math.round(remainingDataToMoveInMB * 1000.0 / dataMovementRateInMBPerSec) : -1L;
+  }
+
+  private static void putDataMovementRateAndEstimatedRemainingTime(Map<String, Object> execState,
+                                                                   String rateKey,
+                                                                   double dataMovementRateInMBPerSec,
+                                                                   String remainingTimeKey,
+                                                                   long estimatedRemainingTimeMs) {
+    if (dataMovementRateInMBPerSec >= 0.0) {
+      execState.put(rateKey, dataMovementRateInMBPerSec);
+    }
+    if (estimatedRemainingTimeMs >= 0L) {
+      execState.put(remainingTimeKey, estimatedRemainingTimeMs);
+    }
+  }
+
+  private static String dataMovementRateAndEstimatedRemainingTimePlaintext(double dataMovementRateInMBPerSec,
+                                                                           long estimatedRemainingTimeMs) {
+    return String.format("data movement rate of in-progress movements: %s, estimated remaining time: %s",
+                         dataMovementRateInMBPerSec >= 0.0 ? String.format("%.2f MB/s", dataMovementRateInMBPerSec) : "unknown",
+                         estimatedRemainingTimeMs >= 0L ? toPrettyDuration(estimatedRemainingTimeMs) : "unknown");
   }
 
   public String uuid() {
@@ -379,6 +610,17 @@ public final class ExecutorState {
     if (_recentlyRemovedBrokers != null && !_recentlyRemovedBrokers.isEmpty()) {
       execState.put(RECENTLY_REMOVED_BROKERS, _recentlyRemovedBrokers);
     }
+    if (_ongoingReplicationThrottle != null) {
+      execState.put(ONGOING_REPLICATION_THROTTLE, _ongoingReplicationThrottle);
+    }
+    if (_ongoingReplicationThrottleByBroker != null) {
+      Map<Integer, Object> throttleByBroker = new TreeMap<>();
+      _ongoingReplicationThrottleByBroker.forEach((brokerId, throttle) -> throttleByBroker.put(brokerId, throttle.getJsonStructure()));
+      execState.put(ONGOING_REPLICATION_THROTTLE_BY_BROKER, throttleByBroker);
+    }
+    if (_ongoingLogDirThrottleByBroker != null && !_ongoingLogDirThrottleByBroker.isEmpty()) {
+      execState.put(ONGOING_LOG_DIR_THROTTLE_BY_BROKER, _ongoingLogDirThrottleByBroker);
+    }
     Map<ExecutionTaskState, Integer> interBrokerPartitionMovementStats;
     Map<ExecutionTaskState, Integer> intraBrokerPartitionMovementStats;
     switch (_state) {
@@ -387,6 +629,7 @@ public final class ExecutorState {
       case STARTING_EXECUTION:
       case INITIALIZING_PROPOSAL_EXECUTION:
       case GENERATING_PROPOSALS_FOR_EXECUTION:
+      case RECOVERING_INTERRUPTED_EXECUTION:
         populateUuidFieldInJsonStructure(execState, _uuid);
         execState.put(TRIGGERED_TASK_REASON, _reason);
         break;
@@ -424,6 +667,12 @@ public final class ExecutorState {
         execState.put(NUM_TOTAL_INTER_BROKER_PARTITION_MOVEMENTS, numTotalMovements(INTER_BROKER_REPLICA_ACTION));
         execState.put(FINISHED_INTER_BROKER_DATA_MOVEMENT, _executionTasksSummary.finishedInterBrokerDataMovementInMB());
         execState.put(TOTAL_INTER_BROKER_DATA_TO_MOVE, numTotalInterBrokerDataToMove());
+        execState.put(IN_PROGRESS_INTER_BROKER_MOVED_DATA, _executionTasksSummary.inProgressInterBrokerMovedDataInMB());
+        putDataMovementRateAndEstimatedRemainingTime(execState,
+                                                     IN_PROGRESS_INTER_BROKER_DATA_MOVEMENT_RATE,
+                                                     _executionTasksSummary.inProgressInterBrokerDataMovementRateInMBPerSec(),
+                                                     ESTIMATED_INTER_BROKER_REMAINING_TIME_MS,
+                                                     estimatedInterBrokerRemainingTimeMs());
         if (verbose) {
           execState.put(IN_PROGRESS_INTER_BROKER_PARTITION_MOVEMENT, getTaskDetails(INTER_BROKER_REPLICA_ACTION, ExecutionTaskState.IN_PROGRESS));
           execState.put(PENDING_INTER_BROKER_PARTITION_MOVEMENT, getTaskDetails(INTER_BROKER_REPLICA_ACTION, ExecutionTaskState.PENDING));
@@ -450,6 +699,12 @@ public final class ExecutorState {
         execState.put(NUM_TOTAL_INTRA_BROKER_PARTITION_MOVEMENTS, numTotalMovements(INTRA_BROKER_REPLICA_ACTION));
         execState.put(FINISHED_INTRA_BROKER_DATA_MOVEMENT, _executionTasksSummary.finishedIntraBrokerDataMovementInMB());
         execState.put(TOTAL_INTRA_BROKER_DATA_TO_MOVE, numTotalIntraBrokerDataToMove());
+        execState.put(IN_PROGRESS_INTRA_BROKER_MOVED_DATA, _executionTasksSummary.inProgressIntraBrokerMovedDataInMB());
+        putDataMovementRateAndEstimatedRemainingTime(execState,
+                                                     IN_PROGRESS_INTRA_BROKER_DATA_MOVEMENT_RATE,
+                                                     _executionTasksSummary.inProgressIntraBrokerDataMovementRateInMBPerSec(),
+                                                     ESTIMATED_INTRA_BROKER_REMAINING_TIME_MS,
+                                                     estimatedIntraBrokerRemainingTimeMs());
         if (verbose) {
           execState.put(IN_PROGRESS_INTRA_BROKER_PARTITION_MOVEMENT, getTaskDetails(INTRA_BROKER_REPLICA_ACTION, ExecutionTaskState.IN_PROGRESS));
           execState.put(PENDING_INTRA_BROKER_PARTITION_MOVEMENT, getTaskDetails(INTRA_BROKER_REPLICA_ACTION, ExecutionTaskState.PENDING));
@@ -493,6 +748,9 @@ public final class ExecutorState {
         execState.put(ERROR, "ILLEGAL_STATE_EXCEPTION");
         break;
     }
+    if (_recovery != null) {
+      execState.put(RECOVERY, _recovery);
+    }
     return execState;
   }
 
@@ -500,6 +758,12 @@ public final class ExecutorState {
    * @return Plaintext response for the executor state.
    */
   public String getPlaintext() {
+    String plaintext = plaintextWithoutRecovery();
+    // Every plaintext state ends with a closing brace.
+    return _recovery == null ? plaintext : String.format("%s, %s: %s}", plaintext.substring(0, plaintext.length() - 1), RECOVERY, _recovery);
+  }
+
+  private String plaintextWithoutRecovery() {
     String recentlyDemotedBrokers = (_recentlyDemotedBrokers != null && !_recentlyDemotedBrokers.isEmpty())
                                     ? String.format(", %s: %s", RECENTLY_DEMOTED_BROKERS, _recentlyDemotedBrokers) : "";
     String recentlyRemovedBrokers = (_recentlyRemovedBrokers != null && !_recentlyRemovedBrokers.isEmpty())
@@ -513,6 +777,7 @@ public final class ExecutorState {
       case STARTING_EXECUTION:
       case INITIALIZING_PROPOSAL_EXECUTION:
       case GENERATING_PROPOSALS_FOR_EXECUTION:
+      case RECOVERING_INTERRUPTED_EXECUTION:
         return String.format("{%s: %s, %s: %s, %s: %s%s%s}", STATE, _state,
                              _isTriggeredByUserRequest ? TRIGGERED_USER_TASK_ID : TRIGGERED_SELF_HEALING_TASK_ID,
                              _uuid, TRIGGERED_TASK_REASON, _reason, recentlyDemotedBrokers, recentlyRemovedBrokers);
@@ -539,8 +804,8 @@ public final class ExecutorState {
         }
 
         return String.format("{%s: %s, pending(%d)/in-progress(%d)/aborting(%d)/finished(%d)/total(%d) inter-broker partition movements,"
-                             + " completed(%d)/total(%d) bytes in MBs: %.2f%%, max/min/avg concurrent inter-broker partition movements per-broker:"
-                             + " %d/%d/%.2f, %s: %s, %s: %s%s%s}",
+                             + " completed(%d)/total(%d) bytes in MBs: %.2f%%, moved(%d) bytes in MBs by in-progress inter-broker partition"
+                             + " movements, %s, max/min/avg concurrent inter-broker partition movements per-broker: %d/%d/%.2f, %s: %s, %s: %s%s%s}",
                              STATE, _state,
                              interBrokerPartitionMovementStats.get(ExecutionTaskState.PENDING),
                              interBrokerPartitionMovementStats.get(ExecutionTaskState.IN_PROGRESS),
@@ -550,6 +815,9 @@ public final class ExecutorState {
                              finishedInterBrokerDataMovementInMB,
                              numTotalInterBrokerDataToMove,
                              finishedInterBrokerDataPercent,
+                             _executionTasksSummary.inProgressInterBrokerMovedDataInMB(),
+                             dataMovementRateAndEstimatedRemainingTimePlaintext(
+                                 _executionTasksSummary.inProgressInterBrokerDataMovementRateInMBPerSec(), estimatedInterBrokerRemainingTimeMs()),
                              _executionConcurrencySummary.getMaxExecutionConcurrency(ConcurrencyType.INTER_BROKER_REPLICA),
                              _executionConcurrencySummary.getMinExecutionConcurrency(ConcurrencyType.INTER_BROKER_REPLICA),
                              _executionConcurrencySummary.getAvgExecutionConcurrency(ConcurrencyType.INTER_BROKER_REPLICA),
@@ -565,8 +833,8 @@ public final class ExecutorState {
         }
 
         return String.format("{%s: %s, pending(%d)/in-progress(%d)/aborting(%d)/finished(%d)/total(%d) intra-broker partition movements,"
-                             + "completed(%d)/total(%d) bytes in MBs: %.2f%%, max/min/avg concurrent intra-broker partition movements per-broker:"
-                             + "%d/%d/%.2f, %s: %s, %s: %s%s%s}",
+                             + "completed(%d)/total(%d) bytes in MBs: %.2f%%, moved(%d) bytes in MBs by in-progress intra-broker partition "
+                             + "movements, %s, max/min/avg concurrent intra-broker partition movements per-broker:%d/%d/%.2f, %s: %s, %s: %s%s%s}",
                              STATE, _state,
                              intraBrokerPartitionMovementStats.get(ExecutionTaskState.PENDING),
                              intraBrokerPartitionMovementStats.get(ExecutionTaskState.IN_PROGRESS),
@@ -576,6 +844,9 @@ public final class ExecutorState {
                              finishedIntraBrokerDataMovementInMB,
                              numTotalIntraBrokerDataToMove,
                              finishedIntraBrokerDataPercent,
+                             _executionTasksSummary.inProgressIntraBrokerMovedDataInMB(),
+                             dataMovementRateAndEstimatedRemainingTimePlaintext(
+                                 _executionTasksSummary.inProgressIntraBrokerDataMovementRateInMBPerSec(), estimatedIntraBrokerRemainingTimeMs()),
                              _executionConcurrencySummary.getMaxExecutionConcurrency(ConcurrencyType.INTRA_BROKER_REPLICA),
                              _executionConcurrencySummary.getMinExecutionConcurrency(ConcurrencyType.INTRA_BROKER_REPLICA),
                              _executionConcurrencySummary.getAvgExecutionConcurrency(ConcurrencyType.INTRA_BROKER_REPLICA),

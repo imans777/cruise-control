@@ -7,13 +7,13 @@ package com.linkedin.kafka.cruisecontrol.servlet.parameters;
 import com.linkedin.cruisecontrol.detector.AnomalyType;
 import com.linkedin.cruisecontrol.servlet.EndPoint;
 import com.linkedin.cruisecontrol.servlet.parameters.CruiseControlParameters;
+import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.ProvisionRecommendation;
-import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskCapacityGoal;
-import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskUsageDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.analyzer.kafkaassigner.KafkaAssignerDiskUsageDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.analyzer.kafkaassigner.KafkaAssignerEvenRackAwareGoal;
 import com.linkedin.cruisecontrol.http.CruiseControlRequestContext;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
+import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.detector.notifier.KafkaAnomalyType;
 import com.linkedin.kafka.cruisecontrol.executor.ConcurrencyType;
@@ -91,6 +91,11 @@ public final class ParameterUtils {
   public static final String THROTTLE_ADDED_BROKER_PARAM = "throttle_added_broker";
   public static final String THROTTLE_REMOVED_BROKER_PARAM = "throttle_removed_broker";
   public static final String REPLICATION_THROTTLE_PARAM = "replication_throttle";
+  public static final String LOG_DIR_THROTTLE_PARAM = "log_dir_throttle";
+  // The value that asks for a throttle to be REMOVED from the ongoing execution, as opposed to an absent parameter, which
+  // asks for no change. `null` already means "unset, fall back to the configured default" inside the executor (see
+  // ExecutionConcurrencyManager); this is how a request says it.
+  public static final String UNSET_PARAMETER_VALUE = "null";
   public static final String IGNORE_PROPOSAL_CACHE_PARAM = "ignore_proposal_cache";
   public static final String USE_READY_DEFAULT_GOALS_PARAM = "use_ready_default_goals";
   public static final String EXECUTION_PROGRESS_CHECK_INTERVAL_MS_PARAM = "execution_progress_check_interval_ms";
@@ -104,6 +109,7 @@ public final class ParameterUtils {
   public static final String MIN_VALID_PARTITION_RATIO_PARAM = "min_valid_partition_ratio";
   public static final String SKIP_HARD_GOAL_CHECK_PARAM = "skip_hard_goal_check";
   public static final String EXCLUDED_TOPICS_PARAM = "excluded_topics";
+  public static final String INCLUDED_TOPICS_PARAM = "included_topics";
   public static final String USER_TASK_IDS_PARAM = "user_task_ids";
   public static final String CLIENT_IDS_PARAM = "client_ids";
   public static final String ENDPOINTS_PARAM = "endpoints";
@@ -115,12 +121,14 @@ public final class ParameterUtils {
   public static final String DISABLE_CONCURRENCY_ADJUSTER_FOR_PARAM = "disable_concurrency_adjuster_for";
   public static final String ENABLE_CONCURRENCY_ADJUSTER_FOR_PARAM = "enable_concurrency_adjuster_for";
   public static final String MIN_ISR_BASED_CONCURRENCY_ADJUSTMENT_PARAM = "min_isr_based_concurrency_adjustment";
+  public static final String REPLICATION_THROTTLE_ADJUSTMENT_PARAM = "replication_throttle_adjustment";
   public static final String EXCLUDE_RECENTLY_DEMOTED_BROKERS_PARAM = "exclude_recently_demoted_brokers";
   public static final String EXCLUDE_RECENTLY_REMOVED_BROKERS_PARAM = "exclude_recently_removed_brokers";
   public static final String REPLICA_MOVEMENT_STRATEGIES_PARAM = "replica_movement_strategies";
   public static final String APPROVE_PARAM = "approve";
   public static final String DISCARD_PARAM = "discard";
   public static final String REBALANCE_DISK_MODE_PARAM = "rebalance_disk";
+  public static final String REBALANCE_DISK_BROKER_BY_BROKER_PARAM = "rebalance_disk_broker_by_broker";
   public static final String POPULATE_DISK_INFO_PARAM = "populate_disk_info";
   public static final String CAPACITY_ONLY_PARAM = "capacity_only";
   public static final String BROKER_ID_AND_LOGDIRS_PARAM = "brokerid_and_logdirs";
@@ -380,6 +388,20 @@ public final class ParameterUtils {
     return getBooleanParam(requestContext, REBALANCE_DISK_MODE_PARAM, false);
   }
 
+  /**
+   * Default: {@code false}.
+   * @param requestContext The request context.
+   * @return The value of {@link #REBALANCE_DISK_BROKER_BY_BROKER_PARAM} parameter.
+   */
+  static boolean isRebalanceDiskBrokerByBroker(CruiseControlRequestContext requestContext) {
+    boolean isRebalanceDiskBrokerByBroker = getBooleanParam(requestContext, REBALANCE_DISK_BROKER_BY_BROKER_PARAM, false);
+    if (isRebalanceDiskBrokerByBroker && !isRebalanceDiskMode(requestContext)) {
+      throw new UserRequestException(String.format("%s requires %s to be set to true.", REBALANCE_DISK_BROKER_BY_BROKER_PARAM,
+                                                   REBALANCE_DISK_MODE_PARAM));
+    }
+    return isRebalanceDiskBrokerByBroker;
+  }
+
   static boolean populateDiskInfo(CruiseControlRequestContext requestContext) {
     return getBooleanParam(requestContext, POPULATE_DISK_INFO_PARAM, false);
   }
@@ -423,12 +445,106 @@ public final class ParameterUtils {
             : getBooleanParam(requestContext, THROTTLE_REMOVED_BROKER_PARAM, true);
   }
 
+  /**
+   * @param requestContext The request context.
+   * @param config The configurations for Cruise Control.
+   * @return The requested throttle (bytes/second) for intra-broker replica movements, or the value of
+   * {@link ExecutorConfig#DEFAULT_LOG_DIR_THROTTLE_CONFIG} if the request does not specify it.
+   */
+  static Long logDirThrottle(CruiseControlRequestContext requestContext, KafkaCruiseControlConfig config) {
+    Long value = getLongParam(requestContext, LOG_DIR_THROTTLE_PARAM, config.getLong(ExecutorConfig.DEFAULT_LOG_DIR_THROTTLE_CONFIG));
+    if (value != null && value < 1) {
+      throw new UserRequestException(String.format("Requested log dir throttle must be positive (Requested: %s).", value));
+    }
+    return value;
+  }
+
   static Long replicationThrottle(CruiseControlRequestContext requestContext, KafkaCruiseControlConfig config) {
     Long value = getLongParam(requestContext, REPLICATION_THROTTLE_PARAM, config.getLong(ExecutorConfig.DEFAULT_REPLICATION_THROTTLE_CONFIG));
     if (value != null && value < 0) {
       throw new UserRequestException(String.format("Requested rebalance throttle must be non-negative (Requested: %s).", value));
     }
     return value;
+  }
+
+  /**
+   * @param requestContext The request context.
+   * @param parameter The name of the throttle parameter.
+   * @return The raw value of the given throttle parameter, or {@code null} if it is absent.
+   */
+  private static String rawThrottleValue(CruiseControlRequestContext requestContext, String parameter) {
+    String parameterString = caseSensitiveParameterName(requestContext.getParameterMap(), parameter);
+    return parameterString == null ? null : requestContext.getParameter(parameterString).trim();
+  }
+
+  /**
+   * @param requestContext The request context.
+   * @param parameter The name of the throttle parameter.
+   * @return {@code true} if the request asks for this throttle to be removed -- i.e. the parameter is present with the value
+   * {@link #UNSET_PARAMETER_VALUE}.
+   */
+  private static boolean isUnsetRequested(CruiseControlRequestContext requestContext, String parameter) {
+    return UNSET_PARAMETER_VALUE.equalsIgnoreCase(rawThrottleValue(requestContext, parameter));
+  }
+
+  /**
+   * @param requestContext The request context.
+   * @return {@code true} if the request asks for the replication throttle of the ongoing execution to be removed.
+   */
+  static boolean removeRequestedReplicationThrottle(CruiseControlRequestContext requestContext) {
+    return isUnsetRequested(requestContext, REPLICATION_THROTTLE_PARAM);
+  }
+
+  /**
+   * @param requestContext The request context.
+   * @return {@code true} if the request asks for the log dir throttle of the ongoing execution to be removed.
+   */
+  static boolean removeRequestedLogDirThrottle(CruiseControlRequestContext requestContext) {
+    return isUnsetRequested(requestContext, LOG_DIR_THROTTLE_PARAM);
+  }
+
+  /**
+   * Get the requested replication throttle from the request, without falling back to
+   * {@link ExecutorConfig#DEFAULT_REPLICATION_THROTTLE_CONFIG} -- i.e. an absent parameter indicates no requested change.
+   *
+   * @param requestContext The request context.
+   * @return The value of {@link #REPLICATION_THROTTLE_PARAM} parameter, or {@code null} if the parameter is absent or asks
+   * for the throttle to be removed (see {@link #removeRequestedReplicationThrottle}).
+   */
+  static Long requestedReplicationThrottle(CruiseControlRequestContext requestContext) {
+    String value = rawThrottleValue(requestContext, REPLICATION_THROTTLE_PARAM);
+    if (value == null || UNSET_PARAMETER_VALUE.equalsIgnoreCase(value)) {
+      // Absent means no change requested; the unset value asks for a removal rather than for a rate -- see
+      // #removeRequestedReplicationThrottle.
+      return null;
+    }
+    long throttle = Long.parseLong(value);
+    if (throttle < 0) {
+      throw new UserRequestException(String.format("Requested replication throttle must be non-negative (Requested: %s).", throttle));
+    }
+    return throttle;
+  }
+
+  /**
+   * Get the requested log dir throttle from the request, without falling back to
+   * {@link ExecutorConfig#DEFAULT_LOG_DIR_THROTTLE_CONFIG} -- i.e. an absent parameter indicates no requested change.
+   *
+   * @param requestContext The request context.
+   * @return The value of {@link #LOG_DIR_THROTTLE_PARAM} parameter, or {@code null} if the parameter is absent or asks for
+   * the throttle to be removed (see {@link #removeRequestedLogDirThrottle}).
+   */
+  static Long requestedLogDirThrottle(CruiseControlRequestContext requestContext) {
+    String value = rawThrottleValue(requestContext, LOG_DIR_THROTTLE_PARAM);
+    if (value == null || UNSET_PARAMETER_VALUE.equalsIgnoreCase(value)) {
+      // Absent means no change requested; the unset value asks for a removal rather than for a rate -- see
+      // #removeRequestedLogDirThrottle.
+      return null;
+    }
+    long throttle = Long.parseLong(value);
+    if (throttle < 1) {
+      throw new UserRequestException(String.format("Requested log dir throttle must be positive (Requested: %s).", throttle));
+    }
+    return throttle;
   }
 
   static Long time(CruiseControlRequestContext requestContext) {
@@ -704,6 +820,20 @@ public final class ParameterUtils {
   }
 
   /**
+   * @param requestContext The http request.
+   * @return {@code true}: enable or {@code false}: disable replication throttle adjustment by the concurrency adjuster, {@code null}
+   * if the request parameter is unset.
+   */
+  @Nullable
+  static Boolean replicationThrottleAdjustment(CruiseControlRequestContext requestContext) {
+    String parameterString = caseSensitiveParameterName(requestContext.getParameterMap(), REPLICATION_THROTTLE_ADJUSTMENT_PARAM);
+    if (parameterString == null) {
+      return null;
+    }
+    return Boolean.parseBoolean(requestContext.getParameter(parameterString));
+  }
+
+  /**
    * Compare and ensure two sets are disjoint as part of a user request.
    * @param set1 The first set to compare.
    * @param set2 The second set to compare.
@@ -747,7 +877,20 @@ public final class ParameterUtils {
     return strategy.chainBaseReplicaMovementStrategyIfAbsent();
   }
 
-  static List<String> getGoals(CruiseControlRequestContext requestContext) {
+  /**
+   * Get the goals requested by the given request context.
+   * <ul>
+   *   <li>In Kafka assigner mode, the goals are the Kafka assigner goals -- explicitly requested goals are rejected.</li>
+   *   <li>In rebalance disk mode, the goals are the explicitly requested goals, which must be intra-broker goals (i.e. listed in
+   *   {@link AnalyzerConfig#INTRA_BROKER_GOALS_CONFIG}), or the intra-broker goals if no goal is requested.</li>
+   *   <li>Otherwise, the goals are the explicitly requested goals (if any).</li>
+   * </ul>
+   *
+   * @param requestContext HTTP request received by Cruise Control.
+   * @param config Kafka Cruise Control config.
+   * @return The requested goals, or an empty list to indicate that the default goals should be used.
+   */
+  static List<String> getGoals(CruiseControlRequestContext requestContext, KafkaCruiseControlConfig config) {
     boolean isKafkaAssignerMode = isKafkaAssignerMode(requestContext);
     boolean isRebalanceDiskMode = isRebalanceDiskMode(requestContext);
     // Sanity check isKafkaAssignerMode and isRebalanceDiskMode are not both true at the same time.
@@ -764,10 +907,17 @@ public final class ParameterUtils {
       return List.of(KafkaAssignerEvenRackAwareGoal.class.getSimpleName(), KafkaAssignerDiskUsageDistributionGoal.class.getSimpleName());
     }
     if (isRebalanceDiskMode) {
-      if (!goals.isEmpty()) {
-        throw new UserRequestException("Rebalance disk mode does not support explicitly specifying goals in request.");
+      List<String> intraBrokerGoals = KafkaCruiseControlUtils.intraBrokerGoals(config);
+      if (goals.isEmpty()) {
+        return Collections.unmodifiableList(intraBrokerGoals);
       }
-      return List.of(IntraBrokerDiskCapacityGoal.class.getSimpleName(), IntraBrokerDiskUsageDistributionGoal.class.getSimpleName());
+      Set<String> supportedGoals = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+      supportedGoals.addAll(intraBrokerGoals);
+      List<String> unsupportedGoals = goals.stream().filter(goal -> !supportedGoals.contains(goal)).collect(Collectors.toList());
+      if (!unsupportedGoals.isEmpty()) {
+        throw new UserRequestException(String.format("Rebalance disk mode only supports the intra-broker goals in %s %s, got %s.",
+                                                     AnalyzerConfig.INTRA_BROKER_GOALS_CONFIG, intraBrokerGoals, unsupportedGoals));
+      }
     }
     return goals;
   }
@@ -901,6 +1051,33 @@ public final class ParameterUtils {
   static Pattern excludedTopics(CruiseControlRequestContext requestContext) {
     String parameterString = caseSensitiveParameterName(requestContext.getParameterMap(), EXCLUDED_TOPICS_PARAM);
     return parameterString == null ? null : Pattern.compile(requestContext.getParameter(parameterString));
+  }
+
+  /**
+   * Get the pattern of topics that are the only ones allowed to move. Every topic that does not match this pattern is
+   * excluded from replica and leadership movement. This parameter is mutually exclusive with {@link #EXCLUDED_TOPICS_PARAM}.
+   *
+   * @param requestContext Http servlet request.
+   * @return The value of {@link #INCLUDED_TOPICS_PARAM} parameter, or {@code null} if it is not specified.
+   * @throws UserRequestException if {@link #EXCLUDED_TOPICS_PARAM} is also specified, or the pattern is empty.
+   */
+  static Pattern includedTopics(CruiseControlRequestContext requestContext) {
+    String parameterString = caseSensitiveParameterName(requestContext.getParameterMap(), INCLUDED_TOPICS_PARAM);
+    if (parameterString == null) {
+      return null;
+    }
+
+    if (caseSensitiveParameterName(requestContext.getParameterMap(), EXCLUDED_TOPICS_PARAM) != null) {
+      throw new UserRequestException(String.format("Parameter %s and parameter %s are mutually exclusive and should "
+                                                   + "not be specified in the same request.", INCLUDED_TOPICS_PARAM,
+                                                   EXCLUDED_TOPICS_PARAM));
+    }
+
+    String includedTopics = requestContext.getParameter(parameterString);
+    if (includedTopics == null || includedTopics.isEmpty()) {
+      throw new UserRequestException(String.format("Parameter %s cannot be empty.", INCLUDED_TOPICS_PARAM));
+    }
+    return Pattern.compile(includedTopics);
   }
 
   /**
@@ -1045,20 +1222,41 @@ public final class ParameterUtils {
   }
 
   /**
-   * Default: An empty map.
+   * Parse the comma-separated broker id and logdir pairs of {@link #BROKER_ID_AND_LOGDIRS_PARAM}, e.g.
+   * {@code 101-/tmp/kafka-logs-1,101-/tmp/kafka-logs-2}. The first hyphen of a pair separates the broker id from the logdir.
+   * Empty pairs are ignored.
+   *
+   * Default: An empty map -- endpoints that require the parameter (e.g. remove_disks) reject an empty map.
    * @param requestContext the request context.
-   * @return The value for {@link #BROKER_ID_AND_LOGDIRS_PARAM} parameter.
+   * @return The value for {@link #BROKER_ID_AND_LOGDIRS_PARAM} parameter: the logdirs by broker id.
+   * @throws UserRequestException If a pair does not consist of a non-negative broker id and a non-empty logdir.
    */
   static Map<Integer, Set<String>> brokerIdAndLogdirs(CruiseControlRequestContext requestContext) {
     final Map<Integer, Set<String>> brokerIdAndLogdirs = new HashMap<>();
     String parameterString = caseSensitiveParameterName(requestContext.getParameterMap(), BROKER_ID_AND_LOGDIRS_PARAM);
-    if (parameterString != null) {
-      Arrays.stream(urlDecode(requestContext.getParameter(parameterString)).split(",")).forEach(e -> {
-        int index = e.indexOf(DELIMITER_BETWEEN_BROKER_ID_AND_LOGDIR);
-        int brokerId = Integer.parseInt(e.substring(0, index));
-        brokerIdAndLogdirs.putIfAbsent(brokerId, new HashSet<>());
-        brokerIdAndLogdirs.get(brokerId).add(e.substring(index + 1));
-      });
+    String parameterValue = parameterString == null ? null : urlDecode(requestContext.getParameter(parameterString));
+    if (parameterValue != null) {
+      for (String brokerIdAndLogdir : parameterValue.split(",")) {
+        if (brokerIdAndLogdir.isEmpty()) {
+          continue;
+        }
+        int index = brokerIdAndLogdir.indexOf(DELIMITER_BETWEEN_BROKER_ID_AND_LOGDIR);
+        String logdir = index < 0 ? "" : brokerIdAndLogdir.substring(index + 1);
+        int brokerId = -1;
+        if (index > 0) {
+          try {
+            brokerId = Integer.parseInt(brokerIdAndLogdir.substring(0, index));
+          } catch (NumberFormatException nfe) {
+            // Reported below.
+          }
+        }
+        if (brokerId < 0 || logdir.isEmpty()) {
+          throw new UserRequestException(String.format("Invalid %s pair '%s': expected a broker id and a logdir separated by '%s' "
+                                                       + "(e.g. 101-/tmp/kafka-logs-1).", BROKER_ID_AND_LOGDIRS_PARAM,
+                                                       brokerIdAndLogdir, DELIMITER_BETWEEN_BROKER_ID_AND_LOGDIR));
+        }
+        brokerIdAndLogdirs.computeIfAbsent(brokerId, id -> new HashSet<>()).add(logdir);
+      }
     }
     return Collections.unmodifiableMap(brokerIdAndLogdirs);
   }

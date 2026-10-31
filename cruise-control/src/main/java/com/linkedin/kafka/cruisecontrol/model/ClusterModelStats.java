@@ -19,9 +19,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.apache.kafka.common.TopicPartition;
 
 import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.averageDiskUtilizationPercentage;
+import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.diskIORate;
 import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.diskUtilizationPercentage;
 import static com.linkedin.kafka.cruisecontrol.monitor.MonitorUtils.UNIT_INTERVAL_TO_PERCENTAGE;
 
@@ -32,6 +34,8 @@ public class ClusterModelStats {
   private static final String METADATA = "metadata";
   @JsonResponseField
   private static final String STATISTICS = "statistics";
+  @JsonResponseField(required = false)
+  private static final String DISK_STATISTICS = "diskStatistics";
   private final Map<Statistic, Map<Resource, Double>> _resourceUtilizationStats;
   private final Map<Statistic, Double> _potentialNwOutUtilizationStats;
   private final Map<Statistic, Number> _replicaStats;
@@ -51,7 +55,10 @@ public class ClusterModelStats {
   private int _numUnbalancedDisks;
   // Aggregated standard deviation of disk utilization for the cluster.
   private double _diskUtilizationStDev;
+  private double _diskIORateStDev;
   private Set<Integer> _brokersAllowedReplicaMove;
+  // Stats about the balance between the disks of each broker -- null if the cluster model has no disk information.
+  private DiskBalanceStats _diskBalanceStats;
 
   /**
    * Constructor for analysis stats.
@@ -70,7 +77,9 @@ public class ClusterModelStats {
     _numBalancedBrokersByResource = new HashMap<>();
     _numUnbalancedDisks = 0;
     _diskUtilizationStDev = 0;
+    _diskIORateStDev = 0;
     _brokersAllowedReplicaMove = Collections.emptySet();
+    _diskBalanceStats = null;
   }
 
   /**
@@ -79,9 +88,13 @@ public class ClusterModelStats {
    * @param clusterModel        The state of the cluster.
    * @param balancingConstraint Balancing constraint.
    * @param optimizationOptions Options to take into account while populating stats.
+   * @param diskStatsBrokerIds  The ids of the brokers to compute the disk balance stats over, or an empty set for all alive brokers.
    * @return Analysis stats with this cluster and given balancing constraint.
    */
-  ClusterModelStats populate(ClusterModel clusterModel, BalancingConstraint balancingConstraint, OptimizationOptions optimizationOptions) {
+  ClusterModelStats populate(ClusterModel clusterModel,
+                             BalancingConstraint balancingConstraint,
+                             OptimizationOptions optimizationOptions,
+                             Set<Integer> diskStatsBrokerIds) {
     final SortedSet<Broker> brokers = clusterModel.brokers();
     final Set<Broker> aliveBrokers = clusterModel.aliveBrokers();
     Set<String> topics = clusterModel.topics();
@@ -98,6 +111,11 @@ public class ClusterModelStats {
     _numSnapshotWindows = clusterModel.load().numWindows();
     _monitoredPartitionsRatio = clusterModel.monitoredPartitionsRatio();
     populateStatsForDisks(balancingConstraint, aliveBrokers);
+    _diskBalanceStats = DiskBalanceStats.compute(brokers.stream()
+                                                        .filter(b -> b.isAlive() && (diskStatsBrokerIds.isEmpty()
+                                                                                     || diskStatsBrokerIds.contains(b.id())))
+                                                        .collect(Collectors.toList()),
+                                                 balancingConstraint);
     return this;
   }
 
@@ -213,7 +231,7 @@ public class ClusterModelStats {
    * Get the number of unbalanced disk in this cluster model;
    * A disk is taken as unbalanced if its utilization percentage is out of the range centered at its broker utilization
    * percentage with boundary determined by
-   * {@link com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig#DISK_BALANCE_THRESHOLD_CONFIG}.
+   * {@link com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig#INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG}.
    *
    * @return The number of unbalanced disk in this cluster model.
    */
@@ -229,15 +247,40 @@ public class ClusterModelStats {
   }
 
   /**
+   * @return Stats about the balance between the disks of each broker, or {@code null} if the cluster model has no disk
+   * information. Unlike {@link #numUnbalancedDisks()} and {@link #diskUtilizationStandardDeviation()}, these stats leave out
+   * disks with no capacity, such as disks marked for removal, and count unbalanced disks with the balance margin of
+   * {@link com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskUsageDistributionGoal}.
+   */
+  public DiskBalanceStats diskBalanceStats() {
+    return _diskBalanceStats;
+  }
+
+  /**
+   * The deviation of each alive disk is computed against the average estimated disk I/O rate of the alive disks on the
+   * same broker. See {@link GoalUtils#replicaDiskIORate} for the estimation of disk I/O rate.
+   *
+   * @return The standard deviation of estimated disk I/O rate of this cluster model.
+   */
+  public double diskIORateStDev() {
+    return _diskIORateStDev;
+  }
+
+  /**
    * @return An object that can be further used to encode into JSON.
    */
   public Map<String, Object> getJsonStructure() {
-    return Map.of(METADATA, new ClusterModelStatsMetaData(numBrokers(), numReplicasInCluster(), numTopics()).getJsonStructure(),
-                  STATISTICS, new ClusterModelStatsValue(_resourceUtilizationStats,
-                                                         _potentialNwOutUtilizationStats,
-                                                         _replicaStats,
-                                                         _leaderReplicaStats,
-                                                         _topicReplicaStats).getJsonStructure());
+    Map<String, Object> jsonStructure = new HashMap<>();
+    jsonStructure.put(METADATA, new ClusterModelStatsMetaData(numBrokers(), numReplicasInCluster(), numTopics()).getJsonStructure());
+    jsonStructure.put(STATISTICS, new ClusterModelStatsValue(_resourceUtilizationStats,
+                                                             _potentialNwOutUtilizationStats,
+                                                             _replicaStats,
+                                                             _leaderReplicaStats,
+                                                             _topicReplicaStats).getJsonStructure());
+    if (_diskBalanceStats != null) {
+      jsonStructure.put(DISK_STATISTICS, _diskBalanceStats.getJsonStructure());
+    }
+    return jsonStructure;
   }
 
   /**
@@ -249,11 +292,12 @@ public class ClusterModelStats {
 
   @Override
   public String toString() {
-    return new ClusterModelStatsValue(_resourceUtilizationStats,
-                                      _potentialNwOutUtilizationStats,
-                                      _replicaStats,
-                                      _leaderReplicaStats,
-                                      _topicReplicaStats).toString();
+    String brokerStats = new ClusterModelStatsValue(_resourceUtilizationStats,
+                                                    _potentialNwOutUtilizationStats,
+                                                    _replicaStats,
+                                                    _leaderReplicaStats,
+                                                    _topicReplicaStats).toString();
+    return _diskBalanceStats == null ? brokerStats : String.format("%s%n%s", brokerStats, _diskBalanceStats);
   }
 
   /**
@@ -479,34 +523,44 @@ public class ClusterModelStats {
    * Generate statistics for disks in the given cluster.
    * For each alive disk on disk broker in the cluster, check whether its utilization percentage is within the range centered
    * at its broker utilization percentage with boundary determined by
-   * {@link com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig#DISK_BALANCE_THRESHOLD_CONFIG}.
+   * {@link com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig#INTRA_BROKER_DISK_BALANCE_THRESHOLD_CONFIG}.
    * If the disk utilization percentage is out of the boundary, the disk is counted as unbalanced.
    * Also sum up the variance of utilization for each alive disk and get an aggregated standard deviation.
+   * Similarly, sum up the variance of estimated disk I/O rate for each alive disk (relative to the average estimated disk
+   * I/O rate of alive disks on the same broker) and get an aggregated standard deviation.
    *
    * @param balancingConstraint Balancing constraint.
    * @param aliveBrokers Alive brokers in the cluster -- passed to this function to avoid recomputing them using cluster model.
    */
   private void populateStatsForDisks(BalancingConstraint balancingConstraint, Set<Broker> aliveBrokers) {
     double totalDiskUtilizationVariance = 0;
+    double totalDiskIORateVariance = 0;
+    double diskIOReadWeight = balancingConstraint.diskIOReadWeight();
     int numAliveDisks = 0;
     for (Broker broker : aliveBrokers) {
       double brokerDiskUtilization = averageDiskUtilizationPercentage(broker);
-      double upperLimit = brokerDiskUtilization * balancingConstraint.resourceBalancePercentage(Resource.DISK);
-      double lowerLimit = brokerDiskUtilization * Math.max(0, (2 - balancingConstraint.resourceBalancePercentage(Resource.DISK)));
+      double upperLimit = brokerDiskUtilization * balancingConstraint.intraBrokerDiskBalancePercentage();
+      double lowerLimit = brokerDiskUtilization * Math.max(0, (2 - balancingConstraint.intraBrokerDiskBalancePercentage()));
+      Map<Disk, Double> diskIORateByAliveDisk = new HashMap<>();
       for (Disk disk : broker.disks()) {
-        if (!disk.isAlive()) {
-          continue;
+        if (disk.isAlive()) {
+          diskIORateByAliveDisk.put(disk, diskIORate(disk, diskIOReadWeight));
         }
-        double diskUtilizationPercentage = diskUtilizationPercentage(disk);
+      }
+      double averageDiskIORate = diskIORateByAliveDisk.values().stream().mapToDouble(Double::doubleValue).average().orElse(0);
+      for (Map.Entry<Disk, Double> entry : diskIORateByAliveDisk.entrySet()) {
+        double diskUtilizationPercentage = diskUtilizationPercentage(entry.getKey());
         if (diskUtilizationPercentage > upperLimit || diskUtilizationPercentage < lowerLimit) {
           _numUnbalancedDisks++;
         }
         totalDiskUtilizationVariance += Math.pow(diskUtilizationPercentage - brokerDiskUtilization, 2);
+        totalDiskIORateVariance += Math.pow(entry.getValue() - averageDiskIORate, 2);
         numAliveDisks++;
       }
     }
     if (numAliveDisks > 0) {
       _diskUtilizationStDev = Math.sqrt(totalDiskUtilizationVariance / numAliveDisks);
+      _diskIORateStDev = Math.sqrt(totalDiskIORateVariance / numAliveDisks);
     }
   }
 }
