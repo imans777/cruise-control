@@ -663,6 +663,24 @@ public class ConcurrencyAdjusterTest {
   }
 
   @Test
+  public void testNeededReplicationThrottleByPartition() {
+    TopicPartition tp0 = new TopicPartition(TOPIC1, 0);
+    TopicPartition tp1 = new TopicPartition(TOPIC1, 1);
+    TopicPartition tp2 = new TopicPartition(TOPIC1, 2);
+    double margin = 1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN;
+    // tp0 (10 MB/sec) is not escalated, tp1 (5 MB/sec) is escalated to 50 MB/sec, and tp2 (unknown write rate) to 3 MB/sec.
+    Map<TopicPartition, Double> neededThrottleByPartition = ExecutionUtils.neededReplicationThrottleByPartition(
+        Map.of(tp0, 10 * MB_IN_KB, tp1, 5 * MB_IN_KB), Map.of(tp1, 50 * MB_IN_BYTES, tp2, 3 * MB_IN_BYTES));
+    assertEquals(Set.of(tp0, tp1, tp2), neededThrottleByPartition.keySet());
+    assertEquals(10 * margin * MB_IN_BYTES, neededThrottleByPartition.get(tp0), 1.0);
+    assertEquals(50 * MB_IN_BYTES, neededThrottleByPartition.get(tp1), 1.0);
+    assertEquals(3 * MB_IN_BYTES, neededThrottleByPartition.get(tp2), 1.0);
+    // An escalated need below the need derived from the write rate has no effect.
+    assertEquals(10 * margin * MB_IN_BYTES,
+                 ExecutionUtils.neededReplicationThrottleByPartition(Map.of(tp0, 10 * MB_IN_KB), Map.of(tp0, MB_IN_BYTES)).get(tp0), 1.0);
+  }
+
+  @Test
   public void testAtNeededThrottle() {
     long mb = MB_IN_BYTES;
     assertTrue(ExecutionUtils.atNeededThrottle(10 * mb, 10 * mb));
