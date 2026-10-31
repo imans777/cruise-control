@@ -1207,7 +1207,10 @@ public class Executor {
    * @return The current executor state.
    */
   public ExecutorState state() {
-    return _executorState;
+    // Attach the replication throttles in force from the live helper (without its lock), so that a throttle that the concurrency
+    // adjuster changes is visible immediately instead of at the next progress check.
+    ReplicationThrottleHelper throttleHelper = _replicationThrottleHelper;
+    return throttleHelper == null ? _executorState : _executorState.withReplicationThrottleByBroker(throttleHelper.throttleRateByBroker());
   }
 
   /**

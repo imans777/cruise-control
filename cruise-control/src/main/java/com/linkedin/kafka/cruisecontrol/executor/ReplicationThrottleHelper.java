@@ -23,6 +23,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
@@ -54,7 +56,8 @@ class ReplicationThrottleHelper {
   // Leader and follower throttle rates of brokers that have been adjusted during the execution (e.g. by the concurrency adjuster).
   private final ConcurrentMap<Integer, Long> _leaderThrottleRateByBroker;
   private final ConcurrentMap<Integer, Long> _followerThrottleRateByBroker;
-  // Brokers whose throttle rate has been set by this helper and not yet removed.
+  // Brokers whose throttle rate has been set by this helper and not yet removed. Written under the lock of this helper, concurrent
+  // for the unsynchronized read of the executor state (see #throttleRateByBroker()).
   private final Set<Integer> _throttledBrokers;
 
   ReplicationThrottleHelper(Admin adminClient, Long throttleRate) {
@@ -73,7 +76,7 @@ class ReplicationThrottleHelper {
     this._deadBrokers = new HashSet<>();
     this._leaderThrottleRateByBroker = new ConcurrentHashMap<>();
     this._followerThrottleRateByBroker = new ConcurrentHashMap<>();
-    this._throttledBrokers = new HashSet<>();
+    this._throttledBrokers = ConcurrentHashMap.newKeySet();
   }
 
   ReplicationThrottleHelper(Admin adminClient, Long throttleRate, int retries, Set<Integer> deadBrokers) {
@@ -83,7 +86,7 @@ class ReplicationThrottleHelper {
     this._deadBrokers = deadBrokers;
     this._leaderThrottleRateByBroker = new ConcurrentHashMap<>();
     this._followerThrottleRateByBroker = new ConcurrentHashMap<>();
-    this._throttledBrokers = new HashSet<>();
+    this._throttledBrokers = ConcurrentHashMap.newKeySet();
   }
 
   synchronized void setThrottles(List<ExecutionProposal> replicaMovementProposals)
@@ -173,6 +176,25 @@ class ReplicationThrottleHelper {
    */
   synchronized Set<Integer> throttledBrokers() {
     return new TreeSet<>(_throttledBrokers);
+  }
+
+  /**
+   * Not synchronized: the executor state reads it while setting, clearing or updating the throttles may hold the lock of this helper
+   * for as long as it takes to alter and verify the broker configs.
+   *
+   * @return The leader and follower throttle rates (bytes/sec) of the brokers whose throttle rate has been set by this helper and not
+   * yet removed, by broker id; empty if no broker is throttled.
+   */
+  SortedMap<Integer, ExecutorState.BrokerReplicationThrottle> throttleRateByBroker() {
+    SortedMap<Integer, ExecutorState.BrokerReplicationThrottle> throttleRateByBroker = new TreeMap<>();
+    for (int brokerId : _throttledBrokers) {
+      Long leaderThrottleRate = leaderThrottleRate(brokerId);
+      Long followerThrottleRate = followerThrottleRate(brokerId);
+      if (leaderThrottleRate != null && followerThrottleRate != null) {
+        throttleRateByBroker.put(brokerId, new ExecutorState.BrokerReplicationThrottle(leaderThrottleRate, followerThrottleRate));
+      }
+    }
+    return throttleRateByBroker;
   }
 
   /**

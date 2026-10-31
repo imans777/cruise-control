@@ -129,10 +129,19 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     throttleHelper.clearThrottles(Collections.singletonList(task), Collections.emptyList());
     assertFalse(throttleHelper.throttlingEnabled());
     assertTrue(throttleHelper.throttledBrokers().isEmpty());
+    assertTrue(throttleHelper.throttleRateByBroker().isEmpty());
     assertNull(throttleHelper.leaderThrottleRate(0));
     assertNull(throttleHelper.followerThrottleRate(0));
     assertThrows(IllegalStateException.class, () -> throttleHelper.updateThrottleRates(0, 100L, 100L));
     EasyMock.verify(mockAdminClient);
+  }
+
+  @Test
+  public void testThrottleRateByBrokerDoesNotWaitForTheLockOfTheHelper() throws Exception {
+    // The executor state reads the rates while setting, clearing or updating the throttles holds the lock of the helper for as
+    // long as it takes to alter and verify the configs.
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(EasyMock.mock(Admin.class), 100L);
+    assertTrue(readWhileLocked(throttleHelper, throttleHelper::throttleRateByBroker).isEmpty());
   }
 
   @Test
@@ -341,11 +350,15 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     for (int i = 0; i < clusterSize(); i++) {
       assertExpectedThrottledRateForBroker(i, null);
     }
+    // ... so the executor state reports no broker yet.
+    assertTrue(throttleHelper.throttleRateByBroker().isEmpty());
     throttleHelper.setThrottles(Collections.singletonList(proposal));
     assertExpectedThrottledRatesForBroker(0, 150L, 250L);
     assertExpectedThrottledRateForBroker(1, throttleRate);
     assertExpectedThrottledRateForBroker(2, throttleRate);
     assertExpectedThrottledRateForBroker(3, null);
+    assertEquals(Map.of(0, List.of(150L, 250L), 1, List.of(throttleRate, throttleRate), 2, List.of(throttleRate, throttleRate)),
+                 leaderAndFollowerRateByBroker(throttleHelper));
 
     // Several throttled brokers are updated in one batch; broker 3 is not throttled, so its rates are only remembered.
     throttleHelper.updateThrottleRates(Map.of(1, 200L, 2, 210L, 3, 220L), Map.of(1, 300L, 2, 310L, 3, 320L));
@@ -354,12 +367,23 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
     assertExpectedThrottledRatesForBroker(2, 210L, 310L);
     assertExpectedThrottledRateForBroker(3, null);
     assertEquals(220L, throttleHelper.leaderThrottleRate(3).longValue());
+    // The executor state reports the throttled brokers only, at their current rates.
+    assertEquals(Map.of(0, List.of(150L, 250L), 1, List.of(200L, 300L), 2, List.of(210L, 310L)),
+                 leaderAndFollowerRateByBroker(throttleHelper));
 
     throttleHelper.clearThrottles(Collections.singletonList(completedTaskForProposal(0, proposal)), Collections.emptyList());
     for (int i = 0; i < clusterSize(); i++) {
       assertExpectedThrottledRateForBroker(i, null);
     }
     assertExpectedThrottledReplicas(TOPIC0, "");
+    assertTrue(throttleHelper.throttleRateByBroker().isEmpty());
+  }
+
+  private static Map<Integer, List<Long>> leaderAndFollowerRateByBroker(ReplicationThrottleHelper throttleHelper) {
+    Map<Integer, List<Long>> leaderAndFollowerRateByBroker = new HashMap<>();
+    throttleHelper.throttleRateByBroker()
+                  .forEach((brokerId, throttle) -> leaderAndFollowerRateByBroker.put(brokerId, List.of(throttle.leader(), throttle.follower())));
+    return leaderAndFollowerRateByBroker;
   }
 
   @Test

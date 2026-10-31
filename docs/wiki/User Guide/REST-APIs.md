@@ -119,6 +119,9 @@ The returned state contains the following information:
   * Intra-broker replica movement progress (if state is `INTRA_BROKER_REPLICA_MOVEMENT_IN_PROGRESS`)
   * Leadership movement progress (if state is `LEADERSHIP_MOVEMENT`)
   * movement concurrency
+  * Replication throttles in force on each broker throttled by the ongoing inter-broker replica movements (JSON only:
+    `ongoingReplicationThrottleByBroker`, e.g. `{"1": {"leader": 10485760, "follower": 20971520}}` in bytes/second), per broker
+    and direction since the concurrency adjuster may adjust them (see `concurrency.adjuster.replication.throttle.enabled`)
   * UUID triggers the execution
 * **Analyzer State**:
   * isProposalReady: Is there a proposal cached
