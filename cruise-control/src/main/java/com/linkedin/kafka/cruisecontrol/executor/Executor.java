@@ -834,10 +834,16 @@ public class Executor {
     }
 
     /**
-     * Track the progress of the in-progress inter-broker replica movements that are at their needed throttle -- on their leader or
-     * on the broker of a new replica -- and escalate the needed throttle of those that made no progress (see {@link MovementProgress}).
-     * The progress of a movement is the lag of its furthest-behind new replica behind the leader, from the log dir sizes of the
-     * brokers involved; a movement whose throttles are above its needed throttle is not checked, so it is never escalated.
+     * Track the progress of the replicas to catch up of the in-progress inter-broker replica movements (see {@link MovementProgress})
+     * from the log dir sizes of the brokers involved, and populate the replication traffic they measure through each throttle. A
+     * broker whose log dirs cannot be described contributes no lag at this run.
+     *
+     * <p>Escalate the needed throttle of a movement with a replica that made no progress if a throttle that replica fetches through --
+     * the leader throttle of the leader of the movement, or the follower throttle of the broker of the replica -- is full at its need,
+     * i.e. if more throttle is what it lacks. A replica that made no progress through throttles that are not full at their need is
+     * reported once instead: something else holds it back (e.g. the disk or the network of a broker), which more throttle would not
+     * fix -- or the throttle is above its need, which the concurrency adjuster raises further while it is full and the network
+     * headroom allows.</p>
      *
      * @param tasks Execution tasks.
      * @param cluster Kafka cluster.
@@ -845,69 +851,96 @@ public class Executor {
      * @param throttleHelper The replication throttle helper of the ongoing inter-broker replica movements.
      * @param neededLeaderThrottleByBroker The leader throttle (bytes/sec) needed by each broker.
      * @param neededFollowerThrottleByBroker The follower throttle (bytes/sec) needed by each broker.
+     * @param throttleUse The replication traffic through the throttles of each broker, to populate.
      * @return {@code true} if the needed throttle of any movement was escalated, {@code false} otherwise.
      */
-    private boolean escalateStalledMovements(Collection<ExecutionTask> tasks,
-                                             Cluster cluster,
-                                             Map<TopicPartition, Double> writeRateKBpsByPartition,
-                                             ReplicationThrottleHelper throttleHelper,
-                                             Map<Integer, Long> neededLeaderThrottleByBroker,
-                                             Map<Integer, Long> neededFollowerThrottleByBroker) {
-      Map<TopicPartition, ExecutionProposal> movementsAtNeed = new HashMap<>();
-      Set<TopicPartition> inProgress = new HashSet<>();
-      Set<Integer> brokersToDescribe = new HashSet<>();
+    private boolean trackMovementProgress(Collection<ExecutionTask> tasks,
+                                          Cluster cluster,
+                                          Map<TopicPartition, Double> writeRateKBpsByPartition,
+                                          ReplicationThrottleHelper throttleHelper,
+                                          Map<Integer, Long> neededLeaderThrottleByBroker,
+                                          Map<Integer, Long> neededFollowerThrottleByBroker,
+                                          ReplicationThrottleUse throttleUse) {
+      Map<TopicPartition, ExecutionTask> taskByPartition = new HashMap<>();
       Map<TopicPartition, List<Integer>> replicasToCatchUpByPartition = new HashMap<>();
+      Set<Integer> brokersToDescribe = new HashSet<>();
       for (ExecutionTask task : tasks) {
         if (task.type() != ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION || task.state() != ExecutionTaskState.IN_PROGRESS) {
           continue;
         }
-        ExecutionProposal proposal = task.proposal();
-        List<Integer> replicasToCatchUp = replicasToCatchUp(proposal, cluster);
+        List<Integer> replicasToCatchUp = replicasToCatchUp(task.proposal(), cluster);
         if (replicasToCatchUp.isEmpty()) {
           continue;
         }
-        inProgress.add(proposal.topicPartition());
-        int leader = movementLeader(proposal, cluster);
-        boolean atNeed = atNeededThrottle(throttleHelper.leaderThrottleRate(leader), neededLeaderThrottleByBroker.getOrDefault(leader, 0L))
-                         || replicasToCatchUp.stream().anyMatch(brokerId -> atNeededThrottle(
-                             throttleHelper.followerThrottleRate(brokerId), neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L)));
-        if (atNeed) {
-          movementsAtNeed.put(proposal.topicPartition(), proposal);
-          replicasToCatchUpByPartition.put(proposal.topicPartition(), replicasToCatchUp);
-          brokersToDescribe.add(leader);
-          brokersToDescribe.addAll(replicasToCatchUp);
-        } else {
-          MovementProgress progress = _movementProgressByPartition.get(proposal.topicPartition());
-          if (progress != null) {
-            progress.notAtNeededThrottle();
-          }
-        }
+        TopicPartition tp = task.proposal().topicPartition();
+        taskByPartition.put(tp, task);
+        replicasToCatchUpByPartition.put(tp, replicasToCatchUp);
+        brokersToDescribe.add(movementLeader(task.proposal(), cluster));
+        brokersToDescribe.addAll(replicasToCatchUp);
       }
-      _movementProgressByPartition.keySet().retainAll(inProgress);
-      if (movementsAtNeed.isEmpty()) {
+      _movementProgressByPartition.keySet().retainAll(taskByPartition.keySet());
+      if (taskByPartition.isEmpty()) {
         return false;
       }
 
+      // Record the lag of each replica to catch up, and the copy rate it gives.
       Map<Integer, Map<TopicPartition, Long>> replicaSizeByBroker = replicaSizes(brokersToDescribe);
-      boolean escalated = false;
-      for (Map.Entry<TopicPartition, ExecutionProposal> entry : movementsAtNeed.entrySet()) {
+      long nowMs = _time.milliseconds();
+      for (Map.Entry<TopicPartition, ExecutionTask> entry : taskByPartition.entrySet()) {
         TopicPartition tp = entry.getKey();
-        ExecutionProposal proposal = entry.getValue();
-        Long leaderSize = replicaSizeByBroker.getOrDefault(movementLeader(proposal, cluster), Collections.emptyMap()).get(tp);
-        if (leaderSize == null) {
-          continue;
-        }
-        long smallestNewReplicaSize = replicasToCatchUpByPartition.get(tp).stream()
-            .mapToLong(brokerId -> replicaSizeByBroker.getOrDefault(brokerId, Collections.emptyMap()).getOrDefault(tp, 0L))
-            .min().orElse(0L);
+        int leader = movementLeader(entry.getValue().proposal(), cluster);
+        List<Integer> replicasToCatchUp = replicasToCatchUpByPartition.get(tp);
         MovementProgress progress = _movementProgressByPartition.computeIfAbsent(tp, k -> new MovementProgress());
-        long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBpsByPartition.getOrDefault(tp, 0.0)),
-                                         progress.escalatedNeed());
-        if (progress.recordLag(leaderSize - smallestNewReplicaSize, true, neededPerReplica)) {
-          LOG.info("The movement of {} made no progress for {} adjuster runs at its needed replication throttle (lag {} bytes); its "
-                   + "needed throttle is raised from {} to {} bytes/sec per new replica.", tp, REPLICATION_THROTTLE_RUNS_WITHOUT_PROGRESS_TO_ESCALATE,
-                   leaderSize - smallestNewReplicaSize, neededPerReplica, progress.escalatedNeed());
-          escalated = true;
+        progress.retainReplicas(replicasToCatchUp);
+        Map<TopicPartition, Long> leaderSizes = replicaSizeByBroker.get(leader);
+        Long leaderSize = leaderSizes == null ? null : leaderSizes.get(tp);
+        double writeRateBytesPerSec = writeRateKBpsByPartition.getOrDefault(tp, 0.0) * BYTES_IN_KB;
+        for (int brokerId : replicasToCatchUp) {
+          Map<TopicPartition, Long> sizes = replicaSizeByBroker.get(brokerId);
+          if (leaderSize != null && sizes != null) {
+            // A broker that was described without the replica has not created it yet: its size is 0.
+            progress.recordLag(brokerId, nowMs, leaderSize - sizes.getOrDefault(tp, 0L));
+          }
+          throttleUse.add(leader, brokerId, progress.copyRate(brokerId, writeRateBytesPerSec));
+        }
+      }
+
+      // Escalate the movements with a replica that made no progress through a throttle that is full at its need.
+      boolean escalated = false;
+      for (Map.Entry<TopicPartition, ExecutionTask> entry : taskByPartition.entrySet()) {
+        TopicPartition tp = entry.getKey();
+        int leader = movementLeader(entry.getValue().proposal(), cluster);
+        MovementProgress progress = _movementProgressByPartition.get(tp);
+        long leaderThrottle = throttleHelper.leaderThrottleRate(leader);
+        boolean leaderFullAtNeed = fullAtNeed(throttleUse.use(leader, true), leaderThrottle,
+                                              neededLeaderThrottleByBroker.getOrDefault(leader, 0L));
+        for (int brokerId : replicasToCatchUpByPartition.get(tp)) {
+          if (!progress.stalled(brokerId)) {
+            continue;
+          }
+          long followerThrottle = throttleHelper.followerThrottleRate(brokerId);
+          boolean followerFullAtNeed = fullAtNeed(throttleUse.use(brokerId, false), followerThrottle,
+                                                  neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L));
+          long lag = progress.lag(brokerId);
+          if (leaderFullAtNeed || followerFullAtNeed) {
+            long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBpsByPartition.getOrDefault(tp, 0.0)),
+                                             progress.escalatedNeed());
+            long escalatedNeed = progress.escalate(neededPerReplica);
+            LOG.info("The movement of {} made no progress over the last {} adjuster runs (lag of its replica on broker {}: {} bytes) "
+                     + "through the {} throttle of broker {}, which is full at its need; its needed throttle is raised from {} to {} "
+                     + "bytes/sec per replica to catch up.", tp, REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS, brokerId, lag,
+                     leaderFullAtNeed ? "leader" : "follower", leaderFullAtNeed ? leader : brokerId, neededPerReplica, escalatedNeed);
+            escalated = true;
+            break;
+          }
+          if (progress.reportStall()) {
+            LOG.info("The movement of {} made no progress over the last {} adjuster runs (lag of its replica on broker {}: {} bytes), "
+                     + "but the throttles it fetches through are not full at their need (leader throttle of broker {}: {} of {} "
+                     + "bytes/sec in use, follower throttle of broker {}: {} of {} bytes/sec in use): something other than the "
+                     + "replication throttle holds it back.", tp, REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS, brokerId, lag, leader,
+                     (long) throttleUse.use(leader, true), leaderThrottle, brokerId, (long) throttleUse.use(brokerId, false),
+                     followerThrottle);
+          }
         }
       }
       return escalated;
@@ -975,7 +1008,7 @@ public class Executor {
      * </ul>
      * In all cases, a throttle is never decreased below, and is raised to, the throttle needed by the in-progress movements of the
      * broker in that direction, which is escalated for movements that make no progress at it -- see
-     * {@link #escalateStalledMovements}. The new throttles of all brokers are applied in a single batch, unless replication throttle
+     * {@link #trackMovementProgress}. The new throttles of all brokers are applied in a single batch, unless replication throttle
      * adjustment is disabled meanwhile.
      *
      * @param canRunMetricsBasedCheck {@code true} if metric-based adjustment can be performed, {@code false} otherwise.
@@ -1004,8 +1037,9 @@ public class Executor {
       Set<ExecutionTask> tasks = inExecutionTasks();
       neededReplicationThrottles(tasks, writeRateKBpsByPartition, cluster, escalatedNeeds(), neededLeaderThrottleByBroker,
                                  neededFollowerThrottleByBroker);
-      if (escalateStalledMovements(tasks, cluster, writeRateKBpsByPartition, throttleHelper, neededLeaderThrottleByBroker,
-                                   neededFollowerThrottleByBroker)) {
+      ReplicationThrottleUse throttleUse = new ReplicationThrottleUse();
+      if (trackMovementProgress(tasks, cluster, writeRateKBpsByPartition, throttleHelper, neededLeaderThrottleByBroker,
+                                neededFollowerThrottleByBroker, throttleUse)) {
         neededLeaderThrottleByBroker.clear();
         neededFollowerThrottleByBroker.clear();
         neededReplicationThrottles(tasks, writeRateKBpsByPartition, cluster, escalatedNeeds(), neededLeaderThrottleByBroker,

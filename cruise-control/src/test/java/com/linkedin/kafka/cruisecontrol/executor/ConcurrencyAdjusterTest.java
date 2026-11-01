@@ -687,53 +687,100 @@ public class ConcurrencyAdjusterTest {
   }
 
   @Test
-  public void testMovementProgressEscalation() {
+  public void testMovementProgress() {
     long mb = MB_IN_BYTES;
-    // A movement making progress is never escalated.
+    int window = ExecutionUtils.REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS;
     ExecutionUtils.MovementProgress progress = new ExecutionUtils.MovementProgress();
-    for (long lag = 60; lag > 0; lag -= 10) {
-      assertFalse(progress.recordLag(lag * mb, true, mb));
+    // Nothing is known before two lags are recorded.
+    assertEquals(-1.0, progress.copyRate(1, mb), 0.0);
+    assertEquals(-1L, progress.lag(1));
+    progress.recordLag(1, 0L, 100 * mb);
+    assertEquals(-1.0, progress.copyRate(1, mb), 0.0);
+    assertFalse(progress.stalled(1));
+
+    // Broker 1's replica of a partition written at 1 MB/sec: its lag shrinks by 10 MB every 10 seconds, so it copies 2 MB/sec.
+    for (int run = 1; run < window; run++) {
+      progress.recordLag(1, run * 10_000L, (100 - 10 * run) * mb);
     }
-    assertEquals(0L, progress.escalatedNeed());
+    assertEquals(2.0 * mb, progress.copyRate(1, mb), 1.0);
+    assertEquals((100 - 10 * (window - 1)) * mb, progress.lag(1));
+    assertFalse(progress.stalled(1));
 
-    // A movement at its needed throttle whose lag does not shrink (a new replica truncated by retention over and over) is escalated
-    // after two runs without progress: its needed throttle doubles.
-    progress = new ExecutionUtils.MovementProgress();
-    assertFalse(progress.recordLag(40 * mb, true, mb));
-    assertFalse(progress.recordLag(65 * mb, true, mb));
-    assertTrue(progress.recordLag(41 * mb, true, mb));
-    assertEquals(2 * mb, progress.escalatedNeed());
-    // It needs progress at the escalated throttle: two more runs without it double it again.
-    assertFalse(progress.recordLag(50 * mb, true, 2 * mb));
-    assertTrue(progress.recordLag(60 * mb, true, 2 * mb));
-    assertEquals(4 * mb, progress.escalatedNeed());
-    // Progress resets the count.
-    assertFalse(progress.recordLag(30 * mb, true, 4 * mb));
-    assertFalse(progress.recordLag(35 * mb, true, 4 * mb));
-    assertFalse(progress.recordLag(20 * mb, true, 4 * mb));
-    assertEquals(4 * mb, progress.escalatedNeed());
+    // Broker 2's replica keeps up with the writes but does not catch up -- its lag jumps by a 1 GB segment that retention deletes from
+    // the leader before the replica, and back. It copies the write rate, and is stalled once a whole window of lags is recorded.
+    long[] lagsMB = {500, 500, 1524, 500, 500, 500};
+    for (int run = 0; run < window; run++) {
+      assertFalse(progress.stalled(2));
+      progress.recordLag(2, run * 10_000L, lagsMB[run] * mb);
+    }
+    assertTrue(progress.stalled(2));
+    assertEquals(1.0 * mb, progress.copyRate(2, mb), 1.0);
+    // Broker 3's replica gains 2 MB over the window, segment jump in between: progress, not a stall.
+    lagsMB = new long[]{500, 1524, 1523, 499, 499, 498};
+    for (int run = 0; run < window; run++) {
+      progress.recordLag(3, run * 10_000L, lagsMB[run] * mb);
+    }
+    assertFalse(progress.stalled(3));
+    // The window slides: only the last lags count. Broker 1's replica stops making progress.
+    long lastLag = progress.lag(1);
+    for (int run = window; run < 2 * window; run++) {
+      progress.recordLag(1, run * 10_000L, lastLag);
+    }
+    assertTrue(progress.stalled(1));
+    assertEquals(1.0 * mb, progress.copyRate(1, mb), 1.0);
+    // A lag growing faster than the write rate gives a copy rate of 0, not a negative one.
+    progress.recordLag(1, 2 * window * 10_000L, lastLag + 500 * mb);
+    assertEquals(0.0, progress.copyRate(1, mb), 0.0);
 
-    // A movement above its needed throttle is not throttle-bound, so it is never escalated, and only consecutive runs at the needed
-    // throttle count.
-    progress = new ExecutionUtils.MovementProgress();
-    assertFalse(progress.recordLag(40 * mb, false, mb));
-    assertFalse(progress.recordLag(40 * mb, false, mb));
-    assertFalse(progress.recordLag(40 * mb, true, mb));
-    progress.notAtNeededThrottle();
-    assertFalse(progress.recordLag(40 * mb, true, mb));
-    assertTrue(progress.recordLag(40 * mb, true, mb));
+    // A stall is reported once.
+    assertTrue(progress.reportStall());
+    assertFalse(progress.reportStall());
+    // A replica that no longer needs to catch up (e.g. back in the ISR) is forgotten.
+    progress.retainReplicas(Set.of(1, 2));
+    assertEquals(-1L, progress.lag(3));
 
+    // An escalation doubles the need, and measures the progress afresh at the escalated throttle -- and reports a stall again.
+    assertEquals(6 * mb, progress.escalate(3 * mb));
+    assertEquals(6 * mb, progress.escalatedNeed());
+    assertFalse(progress.stalled(2));
+    assertEquals(-1.0, progress.copyRate(2, mb), 0.0);
+    assertTrue(progress.reportStall());
+    // The next escalation doubles the escalated need, even if the need from the write rate is lower.
+    assertEquals(12 * mb, progress.escalate(mb));
     // An escalation with an unknown write rate starts from the minimum throttle, and never exceeds the maximum throttle.
-    progress = new ExecutionUtils.MovementProgress();
-    progress.recordLag(10 * mb, true, 0L);
-    progress.recordLag(10 * mb, true, 0L);
-    assertTrue(progress.recordLag(10 * mb, true, 0L));
-    assertEquals(2 * MOCK_MIN_REPLICATION_THROTTLE, progress.escalatedNeed());
-    progress = new ExecutionUtils.MovementProgress();
-    progress.recordLag(10 * mb, true, 80 * mb);
-    progress.recordLag(10 * mb, true, 80 * mb);
-    assertTrue(progress.recordLag(10 * mb, true, 80 * mb));
-    assertEquals(MOCK_MAX_REPLICATION_THROTTLE, progress.escalatedNeed());
+    assertEquals(2 * MOCK_MIN_REPLICATION_THROTTLE, new ExecutionUtils.MovementProgress().escalate(0L));
+    assertEquals(MOCK_MAX_REPLICATION_THROTTLE, new ExecutionUtils.MovementProgress().escalate(80 * mb));
+  }
+
+  @Test
+  public void testReplicationThrottleUse() {
+    double mb = MB_IN_BYTES;
+    ExecutionUtils.ReplicationThrottleUse use = new ExecutionUtils.ReplicationThrottleUse();
+    // Broker 0 leads replicas catching up on brokers 1 (3 MB/sec) and 2 (5 MB/sec). Broker 1 leads one on broker 2 whose copy rate is
+    // unknown yet: the leader side of broker 1 and the follower side of broker 2 are incomplete.
+    use.add(0, 1, 3 * mb);
+    use.add(0, 2, 5 * mb);
+    use.add(1, 2, -1.0);
+    assertEquals(8 * mb, use.use(0, true), 1.0);
+    assertTrue(use.complete(0, true));
+    assertEquals(3 * mb, use.use(1, false), 1.0);
+    assertTrue(use.complete(1, false));
+    assertEquals(5 * mb, use.use(2, false), 1.0);
+    assertFalse(use.complete(2, false));
+    assertEquals(0.0, use.use(1, true), 0.0);
+    assertFalse(use.complete(1, true));
+    assertEquals(0.0, use.use(3, true), 0.0);
+    assertTrue(use.complete(3, true));
+
+    // A throttle is full from 80% use on.
+    long throttle = 10 * MB_IN_BYTES;
+    assertTrue(ExecutionUtils.throttleFull(8.1 * mb, throttle));
+    assertFalse(ExecutionUtils.throttleFull(7.9 * mb, throttle));
+    // Only a throttle that is full at its need calls for an escalation: one above its need is raised by the concurrency adjuster
+    // while the network headroom allows, and one that is not full is not what holds the movements back.
+    assertTrue(ExecutionUtils.fullAtNeed(9 * mb, throttle, throttle));
+    assertFalse(ExecutionUtils.fullAtNeed(9 * mb, throttle, throttle / 2));
+    assertFalse(ExecutionUtils.fullAtNeed(5 * mb, throttle, throttle));
   }
 
   @Test

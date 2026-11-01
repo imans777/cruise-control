@@ -16,6 +16,7 @@ import com.linkedin.kafka.cruisecontrol.monitor.metricdefinition.KafkaMetricDef;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.BrokerEntity;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.PartitionEntity;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -112,13 +113,16 @@ public final class ExecutionUtils {
   // The additive increase of the replication throttle of a broker is at least this fraction of its network capacity in that
   // direction, so brokers with larger network capacity converge to their network headroom in a similar time.
   static final double REPLICATION_THROTTLE_MIN_INCREASE_FRACTION_OF_CAPACITY = 0.05;
-  // An in-progress movement whose new replicas made no progress for this many consecutive concurrency adjuster runs, while its
-  // replication throttle was at most its needed throttle, gets its needed throttle doubled.
-  static final int REPLICATION_THROTTLE_RUNS_WITHOUT_PROGRESS_TO_ESCALATE = 2;
-  // The minimum decrease (bytes) of the lag of the new replicas of a movement to count as progress.
+  // The progress of a replica to catch up is measured over its lag at this many consecutive concurrency adjuster runs -- i.e. over one
+  // fewer intervals: long enough that retention, which deletes whole segments at slightly different times on the leader and on the
+  // replica, does not hide the progress of a replica that catches up slowly.
+  static final int REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS = 6;
+  // The minimum decrease (bytes) of the lag of a replica to catch up over the progress window to count as progress.
   static final long REPLICATION_THROTTLE_MIN_PROGRESS_BYTES = 1024L * 1024L;
   // A throttle is considered at the needed throttle if it is at most this factor of it.
   static final double REPLICATION_THROTTLE_AT_NEED_FACTOR = 1.05;
+  // A throttle is considered full if the replicas catching up through it copy at least this fraction of it.
+  static final double REPLICATION_THROTTLE_FULL_USE_FRACTION = 0.8;
   // Bounds and adjustment parameters of the replication throttle (bytes/sec) used by the concurrency adjuster.
   private static long minReplicationThrottle;
   private static long maxReplicationThrottle;
@@ -336,58 +340,183 @@ public final class ExecutionUtils {
   }
 
   /**
-   * The progress of the new replicas of an in-progress inter-broker replica movement, used to escalate its needed throttle when it
-   * makes no progress at it -- i.e. when the needed throttle derived from the write rate is not enough. A new replica of a partition
-   * at its retention limit is truncated whenever retention deletes past it, so it may need several times the write rate, depending
-   * on the segment size, the retention and the throttle actually achieved.
+   * The progress of the replicas to catch up of an in-progress inter-broker replica movement (see
+   * {@link #replicasToCatchUp(ExecutionProposal, Cluster)}), from their lag behind the leader at the last
+   * {@link #REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS} concurrency adjuster runs. It gives
+   * <ul>
+   *   <li>the rate at which each replica copies the partition (see {@link #copyRate(int, double)}), i.e. its share of the replication
+   *   throttles it fetches through -- which tells whether a throttle is full, and</li>
+   *   <li>whether a replica makes no progress (see {@link #stalled(int)}), in which case the needed throttle of the movement is
+   *   escalated if a throttle it fetches through is full at its need -- i.e. if more throttle is what it lacks. A replica of a
+   *   partition at its retention limit is truncated whenever retention deletes past it, so it may need several times the write rate,
+   *   depending on the segment size, the retention and the throttle actually achieved.</li>
+   * </ul>
    */
   static final class MovementProgress {
-    private long _bestLagBytes = Long.MAX_VALUE;
-    private int _runsWithoutProgress = 0;
+    // The lag samples {time (ms), lag (bytes)} of each replica to catch up by broker, oldest first.
+    private final Map<Integer, ArrayDeque<long[]>> _lagSamplesByBroker = new HashMap<>();
     private long _escalatedNeed = 0L;
+    private boolean _stallReported = false;
 
     /**
-     * Record the lag of the new replicas of the movement, i.e. the leader size minus the size of the furthest-behind new replica.
+     * Forget the replicas that no longer need to catch up -- e.g. a kept replica that is back in the ISR.
      *
-     * @param lagBytes The current lag (bytes).
-     * @param atNeededThrottle {@code true} if the movement is at most at its needed throttle on its leader or on a new replica's
-     *                         broker -- i.e. if more throttle could be what it lacks.
-     * @param currentNeed The current throttle (bytes/sec) needed for each new replica of the movement.
-     * @return {@code true} if the needed throttle of the movement was escalated.
+     * @param brokerIds Ids of the brokers whose replica still needs to catch up.
      */
-    boolean recordLag(long lagBytes, boolean atNeededThrottle, long currentNeed) {
-      if (_bestLagBytes == Long.MAX_VALUE || lagBytes <= _bestLagBytes - REPLICATION_THROTTLE_MIN_PROGRESS_BYTES) {
-        _bestLagBytes = Math.min(_bestLagBytes, lagBytes);
-        _runsWithoutProgress = 0;
-        return false;
+    void retainReplicas(Collection<Integer> brokerIds) {
+      _lagSamplesByBroker.keySet().retainAll(brokerIds);
+    }
+
+    /**
+     * Record the lag of a replica to catch up, i.e. the size of the leader replica minus the size of that replica.
+     *
+     * @param brokerId Id of the broker of the replica.
+     * @param timeMs The time of the observation.
+     * @param lagBytes The lag (bytes).
+     */
+    void recordLag(int brokerId, long timeMs, long lagBytes) {
+      ArrayDeque<long[]> samples = _lagSamplesByBroker.computeIfAbsent(brokerId, b -> new ArrayDeque<>());
+      samples.addLast(new long[]{timeMs, lagBytes});
+      while (samples.size() > REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS) {
+        samples.removeFirst();
       }
-      if (!atNeededThrottle) {
-        _runsWithoutProgress = 0;
-        return false;
+    }
+
+    /**
+     * The rate at which a replica copies the partition: its lag shrinks by the copy rate minus the write rate -- also at the
+     * retention limit, where retention deletes the same old segments from the leader and from the replica.
+     *
+     * @param brokerId Id of the broker of the replica.
+     * @param writeRateBytesPerSec The write rate (bytes/sec) of the partition, {@code 0} if unknown.
+     * @return The copy rate (bytes/sec) of the replica over its recorded lags, or {@code -1} if fewer than two lags are recorded.
+     */
+    double copyRate(int brokerId, double writeRateBytesPerSec) {
+      ArrayDeque<long[]> samples = _lagSamplesByBroker.get(brokerId);
+      if (samples == null || samples.size() < 2 || samples.getLast()[0] <= samples.getFirst()[0]) {
+        return -1.0;
       }
-      if (++_runsWithoutProgress < REPLICATION_THROTTLE_RUNS_WITHOUT_PROGRESS_TO_ESCALATE) {
-        return false;
-      }
+      double seconds = (samples.getLast()[0] - samples.getFirst()[0]) / 1000.0;
+      return Math.max(0.0, writeRateBytesPerSec + (samples.getFirst()[1] - samples.getLast()[1]) / seconds);
+    }
+
+    /**
+     * @param brokerId Id of the broker of the replica.
+     * @return {@code true} if the lag of the replica was recorded at the last {@link #REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS} runs,
+     * and shrank by less than {@link #REPLICATION_THROTTLE_MIN_PROGRESS_BYTES} over them.
+     */
+    boolean stalled(int brokerId) {
+      ArrayDeque<long[]> samples = _lagSamplesByBroker.get(brokerId);
+      return samples != null && samples.size() == REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS
+             && samples.getFirst()[1] - samples.getLast()[1] < REPLICATION_THROTTLE_MIN_PROGRESS_BYTES;
+    }
+
+    /**
+     * @param brokerId Id of the broker of the replica.
+     * @return The last recorded lag (bytes) of the replica, or {@code -1} if none.
+     */
+    long lag(int brokerId) {
+      ArrayDeque<long[]> samples = _lagSamplesByBroker.get(brokerId);
+      return samples == null || samples.isEmpty() ? -1L : samples.getLast()[1];
+    }
+
+    /**
+     * Double the needed throttle of the movement (at least the minimum throttle, at most the maximum throttle), and measure the
+     * progress of its replicas afresh, at the escalated throttle.
+     *
+     * @param currentNeed The current throttle (bytes/sec) needed for each replica to catch up of the movement.
+     * @return The escalated need (bytes/sec).
+     */
+    long escalate(long currentNeed) {
       _escalatedNeed = Math.min(maxReplicationThrottle, 2 * Math.max(minReplicationThrottle, Math.max(currentNeed, _escalatedNeed)));
-      _runsWithoutProgress = 0;
-      // Progress is measured again from here, at the escalated throttle.
-      _bestLagBytes = lagBytes;
-      return true;
+      _lagSamplesByBroker.clear();
+      _stallReported = false;
+      return _escalatedNeed;
     }
 
     /**
-     * Record that the movement is not at its needed throttle at this run: only consecutive runs at it count towards an escalation.
+     * @return {@code true} the first time it is called since the movement was tracked or escalated: a stall that more throttle
+     * would not fix is reported once.
      */
-    void notAtNeededThrottle() {
-      _runsWithoutProgress = 0;
+    boolean reportStall() {
+      boolean firstReport = !_stallReported;
+      _stallReported = true;
+      return firstReport;
     }
 
     /**
-     * @return The escalated throttle (bytes/sec) needed for each new replica of the movement, or {@code 0} if not escalated.
+     * @return The escalated throttle (bytes/sec) needed for each replica to catch up of the movement, or {@code 0} if not escalated.
      */
     long escalatedNeed() {
       return _escalatedNeed;
     }
+  }
+
+  /**
+   * The replication traffic (bytes/sec) of the replicas to catch up of the in-progress movements on each broker side, from their copy
+   * rates -- see {@link MovementProgress#copyRate(int, double)}. A side with a replica whose copy rate is unknown is incomplete: its
+   * traffic is a lower bound.
+   */
+  static final class ReplicationThrottleUse {
+    private final Map<Integer, Double> _leaderUseByBroker = new HashMap<>();
+    private final Map<Integer, Double> _followerUseByBroker = new HashMap<>();
+    private final Set<Integer> _incompleteLeaderSides = new HashSet<>();
+    private final Set<Integer> _incompleteFollowerSides = new HashSet<>();
+
+    /**
+     * @param leader Id of the broker that the replica fetches from.
+     * @param follower Id of the broker of the replica.
+     * @param copyRate The copy rate (bytes/sec) of the replica, negative if unknown.
+     */
+    void add(int leader, int follower, double copyRate) {
+      if (copyRate < 0) {
+        _incompleteLeaderSides.add(leader);
+        _incompleteFollowerSides.add(follower);
+        _leaderUseByBroker.putIfAbsent(leader, 0.0);
+        _followerUseByBroker.putIfAbsent(follower, 0.0);
+      } else {
+        _leaderUseByBroker.merge(leader, copyRate, Double::sum);
+        _followerUseByBroker.merge(follower, copyRate, Double::sum);
+      }
+    }
+
+    /**
+     * @param brokerId Broker id.
+     * @param leader {@code true} for the leader side, {@code false} for the follower side.
+     * @return The measured replication traffic (bytes/sec) on the given side of the broker, {@code 0} if none.
+     */
+    double use(int brokerId, boolean leader) {
+      return (leader ? _leaderUseByBroker : _followerUseByBroker).getOrDefault(brokerId, 0.0);
+    }
+
+    /**
+     * @param brokerId Broker id.
+     * @param leader {@code true} for the leader side, {@code false} for the follower side.
+     * @return {@code true} if the copy rate of every replica catching up through the given side of the broker is known.
+     */
+    boolean complete(int brokerId, boolean leader) {
+      return !(leader ? _incompleteLeaderSides : _incompleteFollowerSides).contains(brokerId);
+    }
+  }
+
+  /**
+   * @param use The replication traffic (bytes/sec) through a throttle.
+   * @param throttle The throttle (bytes/sec).
+   * @return {@code true} if the traffic is at least {@link #REPLICATION_THROTTLE_FULL_USE_FRACTION} of the throttle.
+   */
+  static boolean throttleFull(double use, long throttle) {
+    return use >= REPLICATION_THROTTLE_FULL_USE_FRACTION * throttle;
+  }
+
+  /**
+   * @param use The replication traffic (bytes/sec) through a throttle.
+   * @param throttle The throttle (bytes/sec).
+   * @param neededThrottle The throttle (bytes/sec) needed by the in-progress movements through it.
+   * @return {@code true} if the throttle is full (see {@link #throttleFull(double, long)}) and at its need (see
+   * {@link #atNeededThrottle(long, long)}): a replica that makes no progress through it lacks throttle, which only an escalation of
+   * its need gives it.
+   */
+  static boolean fullAtNeed(double use, long throttle, long neededThrottle) {
+    return throttleFull(use, throttle) && atNeededThrottle(throttle, neededThrottle);
   }
 
   /**

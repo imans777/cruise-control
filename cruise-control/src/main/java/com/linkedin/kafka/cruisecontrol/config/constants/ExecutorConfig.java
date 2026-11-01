@@ -488,15 +488,15 @@ public final class ExecutorConfig {
       + "partitions with an out-of-sync replica (see concurrency.adjuster.replication.throttle.min.isr.check.enabled) or violates a "
       + "concurrency adjuster limit at two consecutive metric-based checks. It is never below the throttle needed by the write rate "
       + "of the partitions being moved (see concurrency.adjuster.replication.throttle.write.rate.margin), even above the network "
-      + "headroom -- a throttle below it stalls the movements -- and that need is doubled for a movement whose new replicas make no "
-      + "progress at it; only concurrency.adjuster.max.replication.throttle bounds it. A change smaller than 5% of the current "
-      + "throttle is ignored, so traffic fluctuations do not cause config updates. A broker without metrics in the current metrics "
-      + "window uses its last valid metrics from within one broker metrics window; without either, only the needed throttle is "
-      + "enforced. An execution started without a replication throttle (neither replication_throttle nor "
-      + "default.replication.throttle) starts each broker at its network headroom, bounded by the minimum and maximum replication "
-      + "throttles of the concurrency adjuster. It can be enabled or disabled at runtime with the replication_throttle_adjustment "
-      + "parameter of the admin endpoint; disabling it during an execution leaves the replication throttles at their last values "
-      + "until the execution ends.";
+      + "headroom -- a throttle below it stalls the movements -- and that need is doubled for a movement whose replicas make no "
+      + "progress through a throttle that they fill at its need; only concurrency.adjuster.max.replication.throttle bounds it. A "
+      + "change smaller than 5% of the current throttle is ignored, so traffic fluctuations do not cause config updates. A broker "
+      + "without metrics in the current metrics window uses its last valid metrics from within one broker metrics window; without "
+      + "either, only the needed throttle is enforced. An execution started without a replication throttle (neither "
+      + "replication_throttle nor default.replication.throttle) starts each broker at its network headroom, bounded by the minimum "
+      + "and maximum replication throttles of the concurrency adjuster. It can be enabled or disabled at runtime with the "
+      + "replication_throttle_adjustment parameter of the admin endpoint; disabling it during an execution leaves the replication "
+      + "throttles at their last values until the execution ends.";
 
   /**
    * <code>concurrency.adjuster.min.replication.throttle</code>
@@ -582,7 +582,9 @@ public final class ExecutorConfig {
       + "bounded only by concurrency.adjuster.max.replication.throttle: a throttle below the write rate stalls the movements, and a "
       + "stalled movement keeps using its throttle without making progress. A new replica of a partition at its retention limit can "
       + "need several times the write rate, since retention truncates a replica that falls behind the log start of the leader; so a "
-      + "movement whose new replicas make no progress for two adjuster runs at its needed throttle has it doubled.";
+      + "movement whose replicas make no progress over six adjuster runs, through a throttle that its replicas fill at its need, has "
+      + "that need doubled; one that makes no progress through throttles that are not full is reported instead (something else "
+      + "holds it back).";
 
   /**
    * <code>concurrency.adjuster.min.isr.cache.size</code>
