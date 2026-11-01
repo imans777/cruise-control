@@ -514,6 +514,13 @@ public class Executor {
     private final Map<Integer, Integer> _consecutiveOverLimitChecksByBroker = new HashMap<>();
     // The values of the limit metrics that count only when they rise, at the previous metric-based check of each broker.
     private final Map<Integer, Map<String, Double>> _lastRiseTriggeredLimitValuesByBroker = new HashMap<>();
+    // The brokers whose leader (follower) throttle is past slow start: it was decreased, or the broker was over a concurrency adjuster
+    // limit, during the ongoing execution -- from then on, a full throttle is raised by the additive increase instead of doubled.
+    private final Set<Integer> _leaderSlowStartEndedBrokers = new HashSet<>();
+    private final Set<Integer> _followerSlowStartEndedBrokers = new HashSet<>();
+    // The number of consecutive metric-based checks at which the leader (follower) throttle of each broker was far above its use.
+    private final Map<Integer, Integer> _leaderFarAboveUseChecksByBroker = new HashMap<>();
+    private final Map<Integer, Integer> _followerFarAboveUseChecksByBroker = new HashMap<>();
     // Brokers (and directions) already warned about for needing more than the maximum replication throttle.
     private final Set<String> _needAboveMaxWarnings = new HashSet<>();
 
@@ -562,6 +569,10 @@ public class Executor {
       _movementProgressByPartition.clear();
       _consecutiveOverLimitChecksByBroker.clear();
       _lastRiseTriggeredLimitValuesByBroker.clear();
+      _leaderSlowStartEndedBrokers.clear();
+      _followerSlowStartEndedBrokers.clear();
+      _leaderFarAboveUseChecksByBroker.clear();
+      _followerFarAboveUseChecksByBroker.clear();
       _needAboveMaxWarnings.clear();
       _executionConcurrencyManager.reset();
     }
@@ -782,16 +793,18 @@ public class Executor {
     }
 
     /**
-     * Get the replication throttles to start the given brokers at, for an execution that was started without a replication
-     * throttle while replication throttle adjustment is enabled: the network headroom of each broker -- see
-     * {@link ExecutionUtils#initialReplicationThrottle(double, double)}. Brokers whose capacity or metrics are unavailable are
-     * omitted.
+     * Get a fraction of the network headroom of the given brokers in each direction -- see
+     * {@link ExecutionUtils#initialReplicationThrottle(double, double, double)}: e.g. the replication throttles to start the brokers
+     * at, for an execution that was started without a replication throttle while replication throttle adjustment is enabled. Brokers
+     * whose capacity or metrics are unavailable are omitted.
      *
      * @param brokerIds Ids of the brokers.
-     * @param initialLeaderThrottleByBroker A map to populate with the initial leader throttle (bytes/sec) of each broker.
-     * @param initialFollowerThrottleByBroker A map to populate with the initial follower throttle (bytes/sec) of each broker.
+     * @param headroomFraction The fraction (in (0, 1]) of the network headroom.
+     * @param initialLeaderThrottleByBroker A map to populate with the leader throttle (bytes/sec) of each broker.
+     * @param initialFollowerThrottleByBroker A map to populate with the follower throttle (bytes/sec) of each broker.
      */
     synchronized void initialReplicationThrottles(Set<Integer> brokerIds,
+                                                  double headroomFraction,
                                                   Map<Integer, Long> initialLeaderThrottleByBroker,
                                                   Map<Integer, Long> initialFollowerThrottleByBroker) {
       ClusterModel clusterCapacity = clusterCapacity(brokerIds);
@@ -814,9 +827,11 @@ public class Executor {
           continue;
         }
         initialLeaderThrottleByBroker.put(brokerId, initialReplicationThrottle(
-            broker.capacityFor(Resource.NW_OUT), leaderBytesOut + inSyncLeaderOutKBpsByBroker.getOrDefault(brokerId, 0.0)));
+            broker.capacityFor(Resource.NW_OUT), leaderBytesOut + inSyncLeaderOutKBpsByBroker.getOrDefault(brokerId, 0.0),
+            headroomFraction));
         initialFollowerThrottleByBroker.put(brokerId, initialReplicationThrottle(
-            broker.capacityFor(Resource.NW_IN), leaderBytesIn + inSyncFollowerInKBpsByBroker.getOrDefault(brokerId, 0.0)));
+            broker.capacityFor(Resource.NW_IN), leaderBytesIn + inSyncFollowerInKBpsByBroker.getOrDefault(brokerId, 0.0),
+            headroomFraction));
       }
     }
 
@@ -831,6 +846,21 @@ public class Executor {
         }
       });
       return escalatedNeedByPartition;
+    }
+
+    /**
+     * Count the consecutive metric-based checks at which the throttle of a broker in one direction was far above its use.
+     *
+     * @param farAboveUseChecksByBroker The number of consecutive checks by broker, to update.
+     * @param brokerId Broker id.
+     * @param farAboveUse {@code true} if the throttle is far above its (completely measured) use at this check.
+     */
+    private void countFarAboveUse(Map<Integer, Integer> farAboveUseChecksByBroker, int brokerId, boolean farAboveUse) {
+      if (farAboveUse) {
+        farAboveUseChecksByBroker.merge(brokerId, 1, Integer::sum);
+      } else {
+        farAboveUseChecksByBroker.remove(brokerId);
+      }
     }
 
     /**
@@ -1002,9 +1032,11 @@ public class Executor {
      *   <li>Leave its throttles unchanged if its metrics or capacity are unavailable -- i.e. neither the current metric window nor
      *   the last valid metrics within one broker metric window have valid values -- unless they are below the needed throttle.</li>
      *   <li>Otherwise, decrease its follower (leader) throttle at once to its inbound (outbound) network headroom if it is above it,
-     *   at each run. At metric-based checks, also raise it towards the headroom while replicas are being moved to (from) the broker,
-     *   and at once to the throttle needed by the write rate of the partitions being moved to (from) the broker if the headroom
-     *   allows -- see {@link ExecutionUtils#recommendedReplicationThrottle(long, long, boolean, double, double, boolean)}.</li>
+     *   at each run. At metric-based checks, while replicas are being moved to (from) the broker, also raise it towards the headroom
+     *   if the replicas catching up through it fill it -- doubling it until its first decrease or concurrency adjuster limit violation
+     *   (slow start), by the additive increase after that -- and lower it to their traffic if it was far above it at consecutive
+     *   checks -- see {@link ExecutionUtils#recommendedReplicationThrottle(long, long, boolean, double, double, boolean, double,
+     *   boolean, boolean)}.</li>
      * </ul>
      * In all cases, a throttle is never decreased below, and is raised to, the throttle needed by the in-progress movements of the
      * broker in that direction, which is escalated for movements that make no progress at it -- see
@@ -1100,23 +1132,35 @@ public class Executor {
           double nonThrottledOutKBps = leaderBytesOut + inSyncLeaderOutKBpsByBroker.getOrDefault(brokerId, 0.0);
           // A first check over a concurrency adjuster limit allows no increase, but does not decrease yet.
           boolean canIncrease = canRunMetricsBasedCheck && !overLimit;
-          newLeaderThrottle = recommendedReplicationThrottle(leaderThrottle, neededLeaderThrottle,
-                                                             neededLeaderThrottleByBroker.containsKey(brokerId),
-                                                             broker.capacityFor(Resource.NW_OUT), nonThrottledOutKBps, canIncrease);
-          newFollowerThrottle = recommendedReplicationThrottle(followerThrottle, neededFollowerThrottle,
-                                                               neededFollowerThrottleByBroker.containsKey(brokerId),
-                                                               broker.capacityFor(Resource.NW_IN), nonThrottledInKBps, canIncrease);
+          double leaderUse = throttleUse.use(brokerId, true);
+          double followerUse = throttleUse.use(brokerId, false);
+          boolean hasLeaderMovements = neededLeaderThrottleByBroker.containsKey(brokerId);
+          boolean hasFollowerMovements = neededFollowerThrottleByBroker.containsKey(brokerId);
+          if (canIncrease) {
+            countFarAboveUse(_leaderFarAboveUseChecksByBroker, brokerId, hasLeaderMovements && throttleUse.complete(brokerId, true)
+                                                                         && throttleFarAboveUse(leaderUse, leaderThrottle));
+            countFarAboveUse(_followerFarAboveUseChecksByBroker, brokerId, hasFollowerMovements && throttleUse.complete(brokerId, false)
+                                                                           && throttleFarAboveUse(followerUse, followerThrottle));
+          }
+          newLeaderThrottle = recommendedReplicationThrottle(
+              leaderThrottle, neededLeaderThrottle, hasLeaderMovements, broker.capacityFor(Resource.NW_OUT), nonThrottledOutKBps,
+              canIncrease, leaderUse, !_leaderSlowStartEndedBrokers.contains(brokerId),
+              _leaderFarAboveUseChecksByBroker.getOrDefault(brokerId, 0) >= REPLICATION_THROTTLE_LOW_USE_CHECKS_TO_LOWER);
+          newFollowerThrottle = recommendedReplicationThrottle(
+              followerThrottle, neededFollowerThrottle, hasFollowerMovements, broker.capacityFor(Resource.NW_IN), nonThrottledInKBps,
+              canIncrease, followerUse, !_followerSlowStartEndedBrokers.contains(brokerId),
+              _followerFarAboveUseChecksByBroker.getOrDefault(brokerId, 0) >= REPLICATION_THROTTLE_LOW_USE_CHECKS_TO_LOWER);
           LOG.debug("Replication throttle adjustment for broker {} ({}): capacity in/out {}/{} KB/sec, non-throttled traffic in/out "
-                    + "{}/{} KB/sec, needed leader/follower throttle {}/{} bytes/sec, movements from/to the broker {}/{}, leader "
-                    + "throttle {} -> {}, follower throttle {} -> {} bytes/sec.", brokerId,
-                    canRunMetricsBasedCheck ? "metric-based check" : "decrease only", broker.capacityFor(Resource.NW_IN),
-                    broker.capacityFor(Resource.NW_OUT), nonThrottledInKBps, nonThrottledOutKBps, neededLeaderThrottle,
-                    neededFollowerThrottle, neededLeaderThrottleByBroker.containsKey(brokerId),
-                    neededFollowerThrottleByBroker.containsKey(brokerId), leaderThrottle, newLeaderThrottle, followerThrottle,
-                    newFollowerThrottle);
-          reason = String.format("network headroom%s and the throttle needed by in-progress movements (leader: %d, follower: %d "
-                                 + "bytes/sec)", overLimit ? " (first check over a concurrency adjuster limit)" : "",
-                                 neededLeaderThrottle, neededFollowerThrottle);
+                    + "{}/{} KB/sec, needed leader/follower throttle {}/{} bytes/sec, movements from/to the broker {}/{}, replication "
+                    + "traffic through the leader/follower throttle {}/{} bytes/sec, leader throttle {} -> {}, follower throttle {} -> "
+                    + "{} bytes/sec.", brokerId, canRunMetricsBasedCheck ? "metric-based check" : "decrease only",
+                    broker.capacityFor(Resource.NW_IN), broker.capacityFor(Resource.NW_OUT), nonThrottledInKBps, nonThrottledOutKBps,
+                    neededLeaderThrottle, neededFollowerThrottle, hasLeaderMovements, hasFollowerMovements, (long) leaderUse,
+                    (long) followerUse, leaderThrottle, newLeaderThrottle, followerThrottle, newFollowerThrottle);
+          reason = String.format("network headroom%s, the replication traffic through the throttle (leader: %d, follower: %d "
+                                 + "bytes/sec) and the throttle needed by in-progress movements (leader: %d, follower: %d bytes/sec)",
+                                 overLimit ? " (first check over a concurrency adjuster limit)" : "", (long) leaderUse,
+                                 (long) followerUse, neededLeaderThrottle, neededFollowerThrottle);
         }
         // The MinISR brake applies to each direction separately: the follower throttle of a broker whose replica is the one out of
         // sync is what that replica catches up with -- see ExecutionUtils#brokersHostingMinIsrPartitions.
@@ -1134,6 +1178,13 @@ public class Executor {
           reason = String.format("(At/Under)MinISR partitions for the leader throttle, and %s for the follower throttle", reason);
         } else if (followerBraked) {
           reason = String.format("(At/Under)MinISR partitions for the follower throttle, and %s for the leader throttle", reason);
+        }
+        // Slow start ends at the first sign of stress: a decrease, or a check over a concurrency adjuster limit.
+        if (overLimit || newLeaderThrottle < leaderThrottle) {
+          _leaderSlowStartEndedBrokers.add(brokerId);
+        }
+        if (overLimit || newFollowerThrottle < followerThrottle) {
+          _followerSlowStartEndedBrokers.add(brokerId);
         }
 
         if (newLeaderThrottle != leaderThrottle || newFollowerThrottle != followerThrottle) {
@@ -2147,29 +2198,34 @@ public class Executor {
 
     /**
      * Create the throttle helper of an execution that was started without a replication throttle while replication throttle
-     * adjustment is enabled: each broker starts at its network headroom, and brokers whose headroom is unknown start at the maximum
-     * replication throttle of the concurrency adjuster, which then adjusts them as usual.
+     * adjustment is enabled: each broker starts at a fraction of its network headroom (see
+     * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_INITIAL_HEADROOM_FRACTION_CONFIG}), and brokers whose headroom
+     * is unknown start at that fraction of the maximum replication throttle of the concurrency adjuster, which then adjusts them as
+     * usual -- doubling the throttles that the movements fill until the first sign of stress (slow start).
      *
      * @param deadBrokersWithReplicas Dead brokers with replicas.
      * @return The throttle helper of the execution.
      */
     private ReplicationThrottleHelper throttleHelperStartingAtHeadroom(Set<Integer> deadBrokersWithReplicas)
         throws InterruptedException, ExecutionException, TimeoutException {
-      ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, maxReplicationThrottle(),
+      double headroomFraction = initialReplicationThrottleHeadroomFraction();
+      long defaultThrottle = Math.max(1L, (long) (headroomFraction * maxReplicationThrottle()));
+      ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, defaultThrottle,
                                                                                deadBrokersWithReplicas);
       Map<Integer, Long> initialLeaderThrottleByBroker = new TreeMap<>();
       Map<Integer, Long> initialFollowerThrottleByBroker = new TreeMap<>();
       try {
         Set<Integer> brokerIds = _metadataClient.cluster().nodes().stream().map(Node::id).collect(Collectors.toSet());
-        _concurrencyAdjuster.initialReplicationThrottles(brokerIds, initialLeaderThrottleByBroker, initialFollowerThrottleByBroker);
+        _concurrencyAdjuster.initialReplicationThrottles(brokerIds, headroomFraction, initialLeaderThrottleByBroker,
+                                                         initialFollowerThrottleByBroker);
       } catch (RuntimeException e) {
-        LOG.warn("Failed to compute the network headroom of brokers; they start at the maximum replication throttle.", e);
+        LOG.warn("Failed to compute the network headroom of brokers; they start at {} bytes/sec.", defaultThrottle, e);
       }
       // No broker is throttled yet, so this only sets the rates to apply when the brokers participate in a batch of movements.
       throttleHelper.updateThrottleRates(initialLeaderThrottleByBroker, initialFollowerThrottleByBroker);
-      LOG.info("User task {}: No replication throttle was requested; the replication throttle adjuster starts brokers at their network "
-               + "headroom (leader: {}, follower: {} bytes/sec), and the others at {} bytes/sec.", _uuid, initialLeaderThrottleByBroker,
-               initialFollowerThrottleByBroker, maxReplicationThrottle());
+      LOG.info("User task {}: No replication throttle was requested; the replication throttle adjuster starts brokers at {} of their "
+               + "network headroom (leader: {}, follower: {} bytes/sec), and the others at {} bytes/sec.", _uuid, headroomFraction,
+               initialLeaderThrottleByBroker, initialFollowerThrottleByBroker, defaultThrottle);
       return throttleHelper;
     }
 

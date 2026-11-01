@@ -335,9 +335,27 @@ public class ConcurrencyAdjusterTest {
    */
   private static double recommendedReplicationThrottleInMB(double currentThrottleMB, double capacityMB, double nonThrottledMB,
                                                            boolean hasInProgressMovements) {
-    long recommended = ExecutionUtils.recommendedReplicationThrottle((long) (currentThrottleMB * MB_IN_BYTES), 0L, hasInProgressMovements,
-                                                                     capacityMB * MB_IN_KB, nonThrottledMB * MB_IN_KB, true);
+    long recommended = recommendedAtFullThrottle((long) (currentThrottleMB * MB_IN_BYTES), 0L, hasInProgressMovements,
+                                                 capacityMB * MB_IN_KB, nonThrottledMB * MB_IN_KB, true);
     return (double) recommended / MB_IN_BYTES;
+  }
+
+  /**
+   * Recommend a replication throttle for movements that fill it -- i.e. the throttle is what limits them -- after slow start, and
+   * without a throttle far above its use: see {@link ExecutionUtils#recommendedReplicationThrottle}.
+   *
+   * @param currentThrottle Current throttle (bytes/sec).
+   * @param neededThrottle Throttle needed by the in-progress movements (bytes/sec).
+   * @param hasInProgressMovements {@code true} if the broker has in-progress throttled movements, {@code false} otherwise.
+   * @param capacityKBps Network capacity (KB/sec).
+   * @param nonThrottledKBps Traffic that the throttle does not limit (KB/sec).
+   * @param canIncrease {@code true} if the throttle may be increased, {@code false} otherwise.
+   * @return The recommended throttle (bytes/sec).
+   */
+  private static long recommendedAtFullThrottle(long currentThrottle, long neededThrottle, boolean hasInProgressMovements,
+                                                double capacityKBps, double nonThrottledKBps, boolean canIncrease) {
+    return ExecutionUtils.recommendedReplicationThrottle(currentThrottle, neededThrottle, hasInProgressMovements, capacityKBps,
+                                                         nonThrottledKBps, canIncrease, currentThrottle, false, false);
   }
 
   /**
@@ -357,8 +375,8 @@ public class ConcurrencyAdjusterTest {
     List<Double> throttleMBByRound = new ArrayList<>(leaderMBByRound.length);
     long throttle = (long) (initialThrottleMB * MB_IN_BYTES);
     for (double leaderMB : leaderMBByRound) {
-      throttle = ExecutionUtils.recommendedReplicationThrottle(throttle, (long) (neededMB * MB_IN_BYTES), true, capacityMB * MB_IN_KB,
-                                                               (leaderMB + inSyncReplicationMB) * MB_IN_KB, true);
+      throttle = recommendedAtFullThrottle(throttle, (long) (neededMB * MB_IN_BYTES), true, capacityMB * MB_IN_KB,
+                                           (leaderMB + inSyncReplicationMB) * MB_IN_KB, true);
       throttleMBByRound.add((double) throttle / MB_IN_BYTES);
     }
     return throttleMBByRound;
@@ -418,10 +436,10 @@ public class ConcurrencyAdjusterTest {
 
     // Between metric-based checks, only decreases apply: a throttle above the headroom is decreased at once, ...
     long mb = MB_IN_BYTES;
-    assertEquals(5 * mb, ExecutionUtils.recommendedReplicationThrottle(30 * mb, 0L, true, 100 * MB_IN_KB, 75 * MB_IN_KB, false));
+    assertEquals(5 * mb, recommendedAtFullThrottle(30 * mb, 0L, true, 100 * MB_IN_KB, 75 * MB_IN_KB, false));
     // ... and the additive increase does not apply, but the needed throttle does: it is a floor, enforced at each run.
-    assertEquals(20 * mb, ExecutionUtils.recommendedReplicationThrottle(20 * mb, 0L, true, 100 * MB_IN_KB, 10 * MB_IN_KB, false));
-    assertEquals(40 * mb, ExecutionUtils.recommendedReplicationThrottle(20 * mb, 40 * mb, true, 100 * MB_IN_KB, 10 * MB_IN_KB, false));
+    assertEquals(20 * mb, recommendedAtFullThrottle(20 * mb, 0L, true, 100 * MB_IN_KB, 10 * MB_IN_KB, false));
+    assertEquals(40 * mb, recommendedAtFullThrottle(20 * mb, 40 * mb, true, 100 * MB_IN_KB, 10 * MB_IN_KB, false));
 
     // A change smaller than 5% of the current throttle is ignored: the headroom fluctuates with the traffic.
     // Headroom: 0.8 * 100 - 12 = 68 MB/sec, 2.9% below 70 MB/sec. No change.
@@ -433,15 +451,72 @@ public class ConcurrencyAdjusterTest {
   }
 
   @Test
+  public void testReplicationThrottleFollowsItsUse() {
+    long mb = MB_IN_BYTES;
+    // A broker with 200 MB/sec network capacity and no other traffic: headroom 0.8 * 200 = 160 MB/sec, additive increase 10 MB/sec.
+    double capacityKB = 200 * MB_IN_KB;
+    // The movements use 20 of the 40 MB/sec throttle: something else holds them back, so more throttle would not help. No increase.
+    assertEquals(40 * mb, recommended(40 * mb, 0L, capacityKB, 0.0, 20 * mb, false, false));
+    // They fill it (36 of 40): the throttle is what limits them. Additive increase ...
+    assertEquals(50 * mb, recommended(40 * mb, 0L, capacityKB, 0.0, 36 * mb, false, false));
+    // ... or doubled during slow start -- by at least the additive increase, ...
+    assertEquals(80 * mb, recommended(40 * mb, 0L, capacityKB, 0.0, 36 * mb, true, false));
+    assertEquals(14 * mb, recommended(4 * mb, 0L, capacityKB, 0.0, 4 * mb, true, false));
+    // ... never above the maximum throttle (100 MB/sec) or the headroom (0.8 * 100 = 80 MB/sec on a 100 MB/sec broker).
+    assertEquals(MOCK_MAX_REPLICATION_THROTTLE, recommended(80 * mb, 0L, capacityKB, 0.0, 80 * mb, true, false));
+    assertEquals(80 * mb, recommended(60 * mb, 0L, 100 * MB_IN_KB, 0.0, 60 * mb, true, false));
+    // An unknown use (e.g. the movements just started) changes nothing, ...
+    assertEquals(40 * mb, recommended(40 * mb, 0L, capacityKB, 0.0, -1.0, true, true));
+    // ... and neither does a full throttle between metric-based checks, or without in-progress movements in that direction.
+    assertEquals(40 * mb, ExecutionUtils.recommendedReplicationThrottle(40 * mb, 0L, true, capacityKB, 0.0, false, 40 * mb, true, false));
+    assertEquals(40 * mb, ExecutionUtils.recommendedReplicationThrottle(40 * mb, 0L, false, capacityKB, 0.0, true, 40 * mb, true, false));
+    // A throttle above the headroom is still decreased to it at once, whatever its use: 0.8 * 100 - 70 = 10 MB/sec.
+    assertEquals(10 * mb, recommended(40 * mb, 0L, 100 * MB_IN_KB, 70 * MB_IN_KB, 40 * mb, true, false));
+
+    // A throttle far above its use at consecutive checks (lowerToUse) protects nothing: the movements would burst up to it as soon as
+    // whatever holds them back clears. It is lowered to the use plus the additive increase, ...
+    assertTrue(ExecutionUtils.throttleFarAboveUse(10 * mb, 80 * mb));
+    assertFalse(ExecutionUtils.throttleFarAboveUse(40 * mb, 80 * mb));
+    assertEquals(20 * mb, recommended(80 * mb, 0L, capacityKB, 0.0, 10 * mb, false, true));
+    // ... never below the throttle needed by the movements, nor above the current throttle.
+    assertEquals(30 * mb, recommended(80 * mb, 30 * mb, capacityKB, 0.0, 10 * mb, false, true));
+    assertEquals(15 * mb, recommended(15 * mb, 0L, capacityKB, 0.0, 10 * mb, false, true));
+    // Without lowerToUse, a throttle far above its use is left unchanged.
+    assertEquals(80 * mb, recommended(80 * mb, 0L, capacityKB, 0.0, 10 * mb, false, false));
+  }
+
+  /**
+   * @param currentThrottle Current throttle (bytes/sec) of a broker with in-progress movements in that direction.
+   * @param neededThrottle Throttle needed by the in-progress movements (bytes/sec).
+   * @param capacityKBps Network capacity (KB/sec).
+   * @param nonThrottledKBps Traffic that the throttle does not limit (KB/sec).
+   * @param useBytesPerSec Replication traffic through the throttle (bytes/sec), negative if unknown.
+   * @param slowStart {@code true} during slow start.
+   * @param lowerToUse {@code true} if the throttle was far above its use at consecutive checks.
+   * @return The throttle (bytes/sec) recommended at a metric-based check.
+   */
+  private static long recommended(long currentThrottle, long neededThrottle, double capacityKBps, double nonThrottledKBps,
+                                  double useBytesPerSec, boolean slowStart, boolean lowerToUse) {
+    return ExecutionUtils.recommendedReplicationThrottle(currentThrottle, neededThrottle, true, capacityKBps, nonThrottledKBps, true,
+                                                         useBytesPerSec, slowStart, lowerToUse);
+  }
+
+  @Test
   public void testInitialReplicationThrottle() {
     long mb = MB_IN_BYTES;
     // The headroom: 0.8 * 100 - 30 = 50 MB/sec.
-    assertEquals(50 * mb, ExecutionUtils.initialReplicationThrottle(100 * MB_IN_KB, 30 * MB_IN_KB));
+    assertEquals(50 * mb, ExecutionUtils.initialReplicationThrottle(100 * MB_IN_KB, 30 * MB_IN_KB, 1.0));
     // Bounded by the minimum throttle when there is no headroom ...
-    assertEquals(MOCK_MIN_REPLICATION_THROTTLE, ExecutionUtils.initialReplicationThrottle(100 * MB_IN_KB, 90 * MB_IN_KB));
+    assertEquals(MOCK_MIN_REPLICATION_THROTTLE, ExecutionUtils.initialReplicationThrottle(100 * MB_IN_KB, 90 * MB_IN_KB, 1.0));
     // ... and by the maximum throttle.
-    assertEquals(MOCK_MAX_REPLICATION_THROTTLE, ExecutionUtils.initialReplicationThrottle(1000 * MB_IN_KB, 0.0));
+    assertEquals(MOCK_MAX_REPLICATION_THROTTLE, ExecutionUtils.initialReplicationThrottle(1000 * MB_IN_KB, 0.0, 1.0));
     assertEquals(MOCK_MAX_REPLICATION_THROTTLE, ExecutionUtils.maxReplicationThrottle());
+    // An execution started without a replication throttle starts each broker at a fraction of its headroom (default 0.2): 10 MB/sec of
+    // its 50 MB/sec, ...
+    assertEquals(0.2, ExecutionUtils.initialReplicationThrottleHeadroomFraction(), 0.0);
+    assertEquals(10 * mb, ExecutionUtils.initialReplicationThrottle(100 * MB_IN_KB, 30 * MB_IN_KB, 0.2));
+    // ... at least the minimum throttle.
+    assertEquals(MOCK_MIN_REPLICATION_THROTTLE, ExecutionUtils.initialReplicationThrottle(100 * MB_IN_KB, 78 * MB_IN_KB, 0.2));
   }
 
   @Test
@@ -670,12 +745,12 @@ public class ConcurrencyAdjusterTest {
   public void testNeededThrottleFloorAndCapacityScaledIncrease() {
     long mb = MB_IN_BYTES;
     // The needed throttle beats the network headroom: 0.8 * 100 - 75 = 5 MB/sec, but the movements need 30 MB/sec.
-    assertEquals(30 * mb, ExecutionUtils.recommendedReplicationThrottle(50 * mb, 30 * mb, true, 100 * MB_IN_KB, 75 * MB_IN_KB, true));
+    assertEquals(30 * mb, recommendedAtFullThrottle(50 * mb, 30 * mb, true, 100 * MB_IN_KB, 75 * MB_IN_KB, true));
     // ... and is reached at once from below, even at a run that only allows decreases.
-    assertEquals(30 * mb, ExecutionUtils.recommendedReplicationThrottle(2 * mb, 30 * mb, true, 100 * MB_IN_KB, 75 * MB_IN_KB, false));
+    assertEquals(30 * mb, recommendedAtFullThrottle(2 * mb, 30 * mb, true, 100 * MB_IN_KB, 75 * MB_IN_KB, false));
     // Only the maximum throttle (100 MB/sec) bounds it.
     assertEquals(MOCK_MAX_REPLICATION_THROTTLE,
-                 ExecutionUtils.recommendedReplicationThrottle(50 * mb, 150 * mb, true, 100 * MB_IN_KB, 75 * MB_IN_KB, true));
+                 recommendedAtFullThrottle(50 * mb, 150 * mb, true, 100 * MB_IN_KB, 75 * MB_IN_KB, true));
 
     // The additive increase is at least 5% of the broker's network capacity: 10 MB/sec (configured) on a 125 MB/sec (1 Gbps)
     // broker, 62.5 MB/sec on a 1250 MB/sec (10 Gbps) broker.
@@ -683,7 +758,7 @@ public class ConcurrencyAdjusterTest {
     assertEquals((long) (62.5 * mb), ExecutionUtils.additiveIncreaseStep(1250 * MB_IN_KB));
     // On the 10 Gbps broker, a throttle of 20 MB/sec rises to 82.5 MB/sec in one metric-based check (MAX: 100 MB/sec).
     assertEquals((long) (82.5 * mb),
-                 ExecutionUtils.recommendedReplicationThrottle(20 * mb, 0L, true, 1250 * MB_IN_KB, 100 * MB_IN_KB, true));
+                 recommendedAtFullThrottle(20 * mb, 0L, true, 1250 * MB_IN_KB, 100 * MB_IN_KB, true));
   }
 
   @Test

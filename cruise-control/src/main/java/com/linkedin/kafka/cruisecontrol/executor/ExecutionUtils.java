@@ -123,6 +123,10 @@ public final class ExecutionUtils {
   static final double REPLICATION_THROTTLE_AT_NEED_FACTOR = 1.05;
   // A throttle is considered full if the replicas catching up through it copy at least this fraction of it.
   static final double REPLICATION_THROTTLE_FULL_USE_FRACTION = 0.8;
+  // A throttle is considered far above its use if the replicas catching up through it copy less than this fraction of it.
+  static final double REPLICATION_THROTTLE_LOW_USE_FRACTION = 0.4;
+  // A throttle far above its use at this many consecutive metric-based checks is lowered to its use.
+  static final int REPLICATION_THROTTLE_LOW_USE_CHECKS_TO_LOWER = 2;
   // Bounds and adjustment parameters of the replication throttle (bytes/sec) used by the concurrency adjuster.
   private static long minReplicationThrottle;
   private static long maxReplicationThrottle;
@@ -130,6 +134,7 @@ public final class ExecutionUtils {
   private static int multiplicativeDecreaseReplicationThrottle;
   private static double replicationThrottleTargetNetworkUtilization;
   private static double replicationThrottleWriteRateMargin;
+  private static double initialReplicationThrottleHeadroomFraction;
 
   private ExecutionUtils() { }
 
@@ -185,6 +190,8 @@ public final class ExecutionUtils {
     replicationThrottleTargetNetworkUtilization =
         config.getDouble(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_TARGET_NETWORK_UTILIZATION_CONFIG);
     replicationThrottleWriteRateMargin = config.getDouble(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_WRITE_RATE_MARGIN_CONFIG);
+    initialReplicationThrottleHeadroomFraction =
+        config.getDouble(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_INITIAL_HEADROOM_FRACTION_CONFIG);
   }
 
   /**
@@ -638,8 +645,17 @@ public final class ExecutionUtils {
    *   <li>If the target is below the current throttle, the throttle is decreased to the target at once (bounded by the minimum
    *   throttle).</li>
    *   <li>Otherwise, if {@code canIncrease} is {@code true} and the broker has in-progress throttled replica movements in this
-   *   direction -- i.e. only if the throttle may be limiting replica movements -- it is raised by the additive increase (see
-   *   {@link #additiveIncreaseStep}), but never above the target or the maximum throttle.</li>
+   *   direction, the throttle follows the replication traffic measured through it (see {@link ReplicationThrottleUse}):
+   *   <ul>
+   *     <li>If the traffic fills it (see {@link #throttleFull(double, long)}) -- i.e. only if the throttle is what limits the
+   *     movements -- it is raised, never above the target or the maximum throttle: doubled during slow start (from the start of the
+   *     execution until the first decrease or concurrency adjuster limit violation of the broker), by the additive increase (see
+   *     {@link #additiveIncreaseStep}) after that.</li>
+   *     <li>If it is far above the traffic at consecutive checks ({@code lowerToUse}, see {@link #throttleFarAboveUse(double, long)}),
+   *     it is lowered to the traffic plus the additive increase: a throttle far above what the movements use protects nothing, as
+   *     the movements burst up to it as soon as whatever holds them back clears.</li>
+   *     <li>Otherwise, or if the traffic is unknown, it is left unchanged.</li>
+   *   </ul></li>
    *   <li>In all cases, the throttle is at least the throttle needed by the in-progress replica movements (see
    *   {@link #neededReplicationThrottles}), even above the target: a throttle below it would stall them -- see
    *   {@link #withNeededThrottleFloor}. Only the maximum throttle bounds it.</li>
@@ -655,7 +671,11 @@ public final class ExecutionUtils {
    * @param networkCapacityKBps The network capacity (KB/sec) of the broker in the relevant direction.
    * @param nonThrottledTrafficKBps The traffic (KB/sec) of the broker in the relevant direction that the throttle does not limit,
    *                                i.e. the leader traffic and the replication traffic of in-sync followers.
-   * @param canIncrease {@code true} if the throttle may be increased, {@code false} if it may only be decreased.
+   * @param canIncrease {@code true} if the throttle may be changed by the replication traffic through it, {@code false} if it may
+   *                    only be decreased to the target.
+   * @param useBytesPerSec The replication traffic (bytes/sec) measured through the throttle, or a negative value if unknown.
+   * @param slowStart {@code true} to double the throttle when it is full, {@code false} to raise it by the additive increase.
+   * @param lowerToUse {@code true} if the throttle has been far above the replication traffic through it at consecutive checks.
    * @return The recommended throttle (bytes/sec) of the broker in the relevant direction.
    */
   static long recommendedReplicationThrottle(long currentThrottle,
@@ -663,18 +683,37 @@ public final class ExecutionUtils {
                                              boolean hasInProgressMovements,
                                              double networkCapacityKBps,
                                              double nonThrottledTrafficKBps,
-                                             boolean canIncrease) {
+                                             boolean canIncrease,
+                                             double useBytesPerSec,
+                                             boolean slowStart,
+                                             boolean lowerToUse) {
     long targetThrottle = targetReplicationThrottle(networkCapacityKBps, nonThrottledTrafficKBps);
     long recommendedThrottle = currentThrottle;
     if (targetThrottle < currentThrottle) {
       // Decrease at once (MIN: minReplicationThrottle, and the needed throttle below).
       recommendedThrottle = Math.min(currentThrottle, Math.max(minReplicationThrottle, targetThrottle));
-    } else if (canIncrease && hasInProgressMovements) {
-      // Additive-increase (MAX: target throttle and maxReplicationThrottle).
-      long maxThrottle = Math.min(targetThrottle, maxReplicationThrottle);
-      recommendedThrottle = Math.max(currentThrottle, Math.min(maxThrottle, currentThrottle + additiveIncreaseStep(networkCapacityKBps)));
+    } else if (canIncrease && hasInProgressMovements && useBytesPerSec >= 0) {
+      long step = additiveIncreaseStep(networkCapacityKBps);
+      if (throttleFull(useBytesPerSec, currentThrottle)) {
+        // Increase (MAX: target throttle and maxReplicationThrottle): double during slow start, additive increase after it.
+        long maxThrottle = Math.min(targetThrottle, maxReplicationThrottle);
+        long increase = slowStart ? Math.max(currentThrottle, step) : step;
+        recommendedThrottle = Math.max(currentThrottle, Math.min(maxThrottle, currentThrottle + increase));
+      } else if (lowerToUse) {
+        // Lower to the traffic plus a step (MIN: minReplicationThrottle, and the needed throttle below).
+        recommendedThrottle = Math.min(currentThrottle, Math.max(minReplicationThrottle, (long) useBytesPerSec + step));
+      }
     }
     return withNeededThrottleFloor(currentThrottle, recommendedThrottle, neededThrottle);
+  }
+
+  /**
+   * @param use The replication traffic (bytes/sec) through a throttle.
+   * @param throttle The throttle (bytes/sec).
+   * @return {@code true} if the traffic is below {@link #REPLICATION_THROTTLE_LOW_USE_FRACTION} of the throttle.
+   */
+  static boolean throttleFarAboveUse(double use, long throttle) {
+    return use < REPLICATION_THROTTLE_LOW_USE_FRACTION * throttle;
   }
 
   /**
@@ -717,17 +756,28 @@ public final class ExecutionUtils {
   }
 
   /**
-   * Get the replication throttle to start a broker at, in one traffic direction, for an execution that was started without a
-   * replication throttle while replication throttle adjustment is enabled: its network headroom (see
-   * {@link #targetReplicationThrottle}), bounded by the minimum and maximum throttles of the concurrency adjuster.
+   * Get a fraction of the network headroom of a broker in one traffic direction (see {@link #targetReplicationThrottle}), bounded by
+   * the minimum and maximum throttles of the concurrency adjuster -- e.g. the replication throttle to start a broker at, for an
+   * execution that was started without a replication throttle while replication throttle adjustment is enabled (see
+   * {@link #initialReplicationThrottleHeadroomFraction()}).
    *
    * @param networkCapacityKBps The network capacity (KB/sec) of the broker in that direction.
    * @param nonThrottledTrafficKBps The traffic (KB/sec) of the broker in that direction that the throttle does not limit.
-   * @return The initial replication throttle (bytes/sec) of the broker in that direction.
+   * @param headroomFraction The fraction (in (0, 1]) of the network headroom.
+   * @return The replication throttle (bytes/sec) of the broker in that direction.
    */
-  static long initialReplicationThrottle(double networkCapacityKBps, double nonThrottledTrafficKBps) {
-    return Math.min(maxReplicationThrottle, Math.max(minReplicationThrottle, targetReplicationThrottle(networkCapacityKBps,
-                                                                                                        nonThrottledTrafficKBps)));
+  static long initialReplicationThrottle(double networkCapacityKBps, double nonThrottledTrafficKBps, double headroomFraction) {
+    long headroom = targetReplicationThrottle(networkCapacityKBps, nonThrottledTrafficKBps);
+    return Math.min(maxReplicationThrottle, Math.max(minReplicationThrottle, (long) (headroomFraction * headroom)));
+  }
+
+  /**
+   * @return The fraction of its network headroom that each broker starts at, in an execution started without a replication throttle
+   * while replication throttle adjustment is enabled -- see
+   * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_INITIAL_HEADROOM_FRACTION_CONFIG}.
+   */
+  static double initialReplicationThrottleHeadroomFraction() {
+    return initialReplicationThrottleHeadroomFraction;
   }
 
   /**
