@@ -143,6 +143,19 @@ class ReplicationThrottleBudget {
   }
 
   /**
+   * Reserve the given rates on each side of each broker, so that they are considered to be in use by {@link #fits(ExecutionTask)} --
+   * e.g. the throttle that the concurrency adjuster keeps for the in-progress movements, which also covers the replicas they keep that
+   * fell out of the ISR, and the escalated needs of movements that stalled at their throttle.
+   *
+   * @param leaderRateByBrokerId The rate (bytes/sec) to reserve on the leader side of each broker.
+   * @param followerRateByBrokerId The rate (bytes/sec) to reserve on the follower side of each broker.
+   */
+  void reserve(Map<Integer, Long> leaderRateByBrokerId, Map<Integer, Long> followerRateByBrokerId) {
+    leaderRateByBrokerId.forEach((brokerId, rate) -> _leaderUsageByBrokerId.merge(brokerId, rate.doubleValue(), Double::sum));
+    followerRateByBrokerId.forEach((brokerId, rate) -> _followerUsageByBrokerId.merge(brokerId, rate.doubleValue(), Double::sum));
+  }
+
+  /**
    * Reserve the write rate of the given task, so that it is considered to be in use by {@link #fits(ExecutionTask)}.
    *
    * @param task Inter-broker replica movement task.
