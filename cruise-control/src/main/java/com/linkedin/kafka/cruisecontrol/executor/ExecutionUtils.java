@@ -121,8 +121,10 @@ public final class ExecutionUtils {
   static final long REPLICATION_THROTTLE_MIN_PROGRESS_BYTES = 1024L * 1024L;
   // A throttle is considered at the needed throttle if it is at most this factor of it.
   static final double REPLICATION_THROTTLE_AT_NEED_FACTOR = 1.05;
-  // A throttle is considered full if the replicas catching up through it copy at least this fraction of it.
-  static final double REPLICATION_THROTTLE_FULL_USE_FRACTION = 0.8;
+  // A throttle is considered full if the out-of-sync replicas fetching through it copy at least this fraction of it: Kafka's quota
+  // enforcement and fetch sizes leave a throttle-bound movement well below its throttle (60-75% measured at 1 MB/sec), and a movement
+  // held back by something else uses a small fraction of it.
+  static final double REPLICATION_THROTTLE_FULL_USE_FRACTION = 0.6;
   // A throttle is considered far above its use if the replicas catching up through it copy less than this fraction of it.
   static final double REPLICATION_THROTTLE_LOW_USE_FRACTION = 0.4;
   // A throttle far above its use at this many consecutive metric-based checks is lowered to its use.
@@ -363,7 +365,7 @@ public final class ExecutionUtils {
    * </ul>
    */
   static final class MovementProgress {
-    // The lag samples {time (ms), lag (bytes)} of each out-of-sync replica by broker, oldest first.
+    // The samples {time (ms), lag (bytes), size (bytes)} of each out-of-sync replica by broker, oldest first.
     private final Map<Integer, ArrayDeque<long[]>> _lagSamplesByBroker = new HashMap<>();
     private long _escalatedNeed = 0L;
     private boolean _stallReported = false;
@@ -378,27 +380,34 @@ public final class ExecutionUtils {
     }
 
     /**
-     * Record the lag of an out-of-sync replica, i.e. the size of the leader replica minus the size of that replica.
+     * Record the lag of an out-of-sync replica, i.e. the size of the leader replica minus the size of that replica, and its size.
      *
      * @param brokerId Id of the broker of the replica.
      * @param timeMs The time of the observation.
      * @param lagBytes The lag (bytes).
+     * @param sizeBytes The size (bytes) of the replica.
      */
-    void recordLag(int brokerId, long timeMs, long lagBytes) {
+    void recordLag(int brokerId, long timeMs, long lagBytes, long sizeBytes) {
       ArrayDeque<long[]> samples = _lagSamplesByBroker.computeIfAbsent(brokerId, b -> new ArrayDeque<>());
-      samples.addLast(new long[]{timeMs, lagBytes});
+      samples.addLast(new long[]{timeMs, lagBytes, sizeBytes});
       while (samples.size() > REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS) {
         samples.removeFirst();
       }
     }
 
     /**
-     * The rate at which a replica copies the partition: its lag shrinks by the copy rate minus the write rate -- also at the
-     * retention limit, where retention deletes the same old segments from the leader and from the replica.
+     * The rate at which a replica copies the partition, over its recorded samples: the larger of
+     * <ul>
+     *   <li>the write rate plus the rate at which its lag shrinks -- right also at the retention limit, where retention deletes the
+     *   same old segments from the leader and from the replica, and</li>
+     *   <li>the sum of its size increases over the samples -- right while a replica that falls behind the log start of the leader is
+     *   truncated over and over (a partition at its retention limit copied at about its write rate): each truncation makes its lag
+     *   jump, but not what it copied between truncations.</li>
+     * </ul>
      *
      * @param brokerId Id of the broker of the replica.
      * @param writeRateBytesPerSec The write rate (bytes/sec) of the partition, {@code 0} if unknown.
-     * @return The copy rate (bytes/sec) of the replica over its recorded lags, or {@code -1} if fewer than two lags are recorded.
+     * @return The copy rate (bytes/sec) of the replica, or {@code -1} if fewer than two samples are recorded.
      */
     double copyRate(int brokerId, double writeRateBytesPerSec) {
       ArrayDeque<long[]> samples = _lagSamplesByBroker.get(brokerId);
@@ -406,7 +415,16 @@ public final class ExecutionUtils {
         return -1.0;
       }
       double seconds = (samples.getLast()[0] - samples.getFirst()[0]) / 1000.0;
-      return Math.max(0.0, writeRateBytesPerSec + (samples.getFirst()[1] - samples.getLast()[1]) / seconds);
+      double fromLag = writeRateBytesPerSec + (samples.getFirst()[1] - samples.getLast()[1]) / seconds;
+      long growth = 0L;
+      long[] previous = null;
+      for (long[] sample : samples) {
+        if (previous != null) {
+          growth += Math.max(0L, sample[2] - previous[2]);
+        }
+        previous = sample;
+      }
+      return Math.max(0.0, Math.max(fromLag, growth / seconds));
     }
 
     /**

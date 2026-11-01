@@ -929,7 +929,8 @@ public class Executor {
           Map<TopicPartition, Long> sizes = replicaSizeByBroker.get(brokerId);
           if (leaderSize != null && sizes != null) {
             // A broker that was described without the replica has not created it yet: its size is 0.
-            progress.recordLag(brokerId, nowMs, leaderSize - sizes.getOrDefault(tp, 0L));
+            long size = sizes.getOrDefault(tp, 0L);
+            progress.recordLag(brokerId, nowMs, leaderSize - size, size);
           }
           throttleUse.add(leader, brokerId, progress.copyRate(brokerId, writeRateBytesPerSec));
         }

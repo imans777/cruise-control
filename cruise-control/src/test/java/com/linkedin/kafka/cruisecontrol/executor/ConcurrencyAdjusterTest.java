@@ -480,7 +480,7 @@ public class ConcurrencyAdjusterTest {
     assertEquals(20 * mb, recommended(80 * mb, 0L, capacityKB, 0.0, 10 * mb, false, true));
     // ... never below the throttle needed by the movements, nor above the current throttle.
     assertEquals(30 * mb, recommended(80 * mb, 30 * mb, capacityKB, 0.0, 10 * mb, false, true));
-    assertEquals(15 * mb, recommended(15 * mb, 0L, capacityKB, 0.0, 10 * mb, false, true));
+    assertEquals(18 * mb, recommended(18 * mb, 0L, capacityKB, 0.0, 10 * mb, false, true));
     // Without lowerToUse, a throttle far above its use is left unchanged.
     assertEquals(80 * mb, recommended(80 * mb, 0L, capacityKB, 0.0, 10 * mb, false, false));
   }
@@ -776,13 +776,13 @@ public class ConcurrencyAdjusterTest {
     // Nothing is known before two lags are recorded.
     assertEquals(-1.0, progress.copyRate(1, mb), 0.0);
     assertEquals(-1L, progress.lag(1));
-    progress.recordLag(1, 0L, 100 * mb);
+    progress.recordLag(1, 0L, 100 * mb, 0L);
     assertEquals(-1.0, progress.copyRate(1, mb), 0.0);
     assertFalse(progress.stalled(1));
 
     // Broker 1's replica of a partition written at 1 MB/sec: its lag shrinks by 10 MB every 10 seconds, so it copies 2 MB/sec.
     for (int run = 1; run < window; run++) {
-      progress.recordLag(1, run * 10_000L, (100 - 10 * run) * mb);
+      progress.recordLag(1, run * 10_000L, (100 - 10 * run) * mb, 0L);
     }
     assertEquals(2.0 * mb, progress.copyRate(1, mb), 1.0);
     assertEquals((100 - 10 * (window - 1)) * mb, progress.lag(1));
@@ -793,25 +793,33 @@ public class ConcurrencyAdjusterTest {
     long[] lagsMB = {500, 500, 1524, 500, 500, 500};
     for (int run = 0; run < window; run++) {
       assertFalse(progress.stalled(2));
-      progress.recordLag(2, run * 10_000L, lagsMB[run] * mb);
+      progress.recordLag(2, run * 10_000L, lagsMB[run] * mb, 0L);
     }
     assertTrue(progress.stalled(2));
     assertEquals(1.0 * mb, progress.copyRate(2, mb), 1.0);
     // Broker 3's replica gains 2 MB over the window, segment jump in between: progress, not a stall.
     lagsMB = new long[]{500, 1524, 1523, 499, 499, 498};
     for (int run = 0; run < window; run++) {
-      progress.recordLag(3, run * 10_000L, lagsMB[run] * mb);
+      progress.recordLag(3, run * 10_000L, lagsMB[run] * mb, 0L);
     }
     assertFalse(progress.stalled(3));
     // The window slides: only the last lags count. Broker 1's replica stops making progress.
     long lastLag = progress.lag(1);
     for (int run = window; run < 2 * window; run++) {
-      progress.recordLag(1, run * 10_000L, lastLag);
+      progress.recordLag(1, run * 10_000L, lastLag, 0L);
     }
     assertTrue(progress.stalled(1));
     assertEquals(1.0 * mb, progress.copyRate(1, mb), 1.0);
+    // A replica of a partition at its retention limit (60 MB, written at 0.5 MB/sec) that falls behind the log start of the leader is
+    // truncated, and starts over: it copies 4 MB every 10 seconds, and is truncated once. Its lag jumps (40 -> 54 MB: 0.5 - 0.28 =
+    // 0.22 MB/sec from the lag), but its size increases tell what it copied: 16 MB in 50 seconds, i.e. 0.32 MB/sec.
+    long[] sizesMB = {20, 24, 28, 32, 2, 6};
+    for (int run = 0; run < window; run++) {
+      progress.recordLag(4, run * 10_000L, (60 - sizesMB[run]) * mb, sizesMB[run] * mb);
+    }
+    assertEquals(16.0 / 50 * mb, progress.copyRate(4, mb / 2.0), 1.0);
     // A lag growing faster than the write rate gives a copy rate of 0, not a negative one.
-    progress.recordLag(1, 2 * window * 10_000L, lastLag + 500 * mb);
+    progress.recordLag(1, 2 * window * 10_000L, lastLag + 500 * mb, 0L);
     assertEquals(0.0, progress.copyRate(1, mb), 0.0);
 
     // A stall is reported once.
@@ -854,10 +862,10 @@ public class ConcurrencyAdjusterTest {
     assertEquals(0.0, use.use(3, true), 0.0);
     assertTrue(use.complete(3, true));
 
-    // A throttle is full from 80% use on.
     long throttle = 10 * MB_IN_BYTES;
-    assertTrue(ExecutionUtils.throttleFull(8.1 * mb, throttle));
-    assertFalse(ExecutionUtils.throttleFull(7.9 * mb, throttle));
+    // A throttle-bound movement stays well below its throttle (Kafka's quota enforcement): full from 60% use on.
+    assertTrue(ExecutionUtils.throttleFull(6.1 * mb, throttle));
+    assertFalse(ExecutionUtils.throttleFull(5.9 * mb, throttle));
     // Only a throttle that is full at its need calls for an escalation: one above its need is raised by the concurrency adjuster
     // while the network headroom allows, and one that is not full is not what holds the movements back.
     assertTrue(ExecutionUtils.fullAtNeed(9 * mb, throttle, throttle));

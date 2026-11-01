@@ -602,8 +602,8 @@ public final class ExecutorConfig {
       + "stalled movement keeps using its throttle without making progress. A new replica of a partition at its retention limit can "
       + "need several times the write rate, since retention truncates a replica that falls behind the log start of the leader; so a "
       + "movement whose replicas make no progress over six adjuster runs, through a throttle that its replicas fill at its need, has "
-      + "that need doubled; one that makes no progress through throttles that are not full is reported instead (something else "
-      + "holds it back).";
+      + "that need doubled; one that makes no progress through throttles that are not full is reported instead (something else holds "
+      + "it back).";
 
   /**
    * <code>concurrency.adjuster.min.isr.cache.size</code>
