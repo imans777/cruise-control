@@ -97,6 +97,9 @@ public final class ExecutionUtils {
   static final Map<ConcurrencyType, Integer> MAX_CONCURRENCY = new HashMap<>();
   static final Map<ConcurrencyType, Integer> MIN_CONCURRENCY = new HashMap<>();
   static final Map<String, Double> CONCURRENCY_ADJUSTER_LIMIT_BY_METRIC_NAME = new HashMap<>();
+  // The metrics over their concurrency adjuster limit that count for replication throttle adjustment only when they rise -- see
+  // withinReplicationThrottleAdjusterLimit.
+  static final Set<String> RISE_TRIGGERED_LIMIT_METRIC_NAMES = Set.of(BROKER_LOG_FLUSH_TIME_MS_999TH.name());
   // Cluster concurrency would be decreased if the number of brokers with metrics above the limits defined in
   // CONCURRENCY_ADJUSTER_LIMIT_BY_METRIC_NAME is greater than this value.
   private static int minNumBrokersViolateMetricLimitToDecreaseClusterConcurrency;
@@ -702,6 +705,48 @@ public final class ExecutionUtils {
           overLimitDetailsByMetricName.get(metricName).append(String.format("%d(%.2f) ", brokerId, metricValue));
           withinAdjusterLimit = false;
         }
+      }
+    }
+    return withinAdjusterLimit;
+  }
+
+  /**
+   * Check whether the current metrics of a broker are within the concurrency adjuster limits for replication throttle adjustment:
+   * like {@link #withinConcurrencyAdjusterLimit(int, ValuesAndExtrapolations, Map)}, except that a metric in
+   * {@link #RISE_TRIGGERED_LIMIT_METRIC_NAMES} counts only if it is over its limit and rose since the previous metric-based check
+   * of the broker -- not at the first check, and not while it stays at the same value.
+   *
+   * <p>Kafka reports the log flush time from a histogram of about a thousand recent samples, and logs are flushed rarely (about once
+   * per segment roll), so its 99.9th percentile is in effect the slowest of the recent flushes: a single slow flush keeps it over its
+   * limit for hours, at a value that does not change. A rise means a new, slower flush since the previous check.</p>
+   *
+   * @param brokerId Broker id.
+   * @param currentMetrics Current metrics of the broker.
+   * @param lastRiseTriggeredValueByMetricName The values of the metrics in {@link #RISE_TRIGGERED_LIMIT_METRIC_NAMES} at the
+   *                                           previous metric-based check of the broker; updated with the current values.
+   * @param overLimitDetailsByMetricName The string builder to build the over-limit report.
+   * @return {@code true} if the broker is within the limits, {@code false} otherwise.
+   */
+  static boolean withinReplicationThrottleAdjusterLimit(int brokerId,
+                                                        ValuesAndExtrapolations currentMetrics,
+                                                        Map<String, Double> lastRiseTriggeredValueByMetricName,
+                                                        Map<String, StringBuilder> overLimitDetailsByMetricName) {
+    boolean withinAdjusterLimit = true;
+    for (Short metricId : currentMetrics.metricValues().metricIds()) {
+      String metricName = toMetricName(metricId);
+      Double limit = CONCURRENCY_ADJUSTER_LIMIT_BY_METRIC_NAME.get(metricName);
+      if (limit == null) {
+        continue;
+      }
+      double metricValue = currentMetrics.metricValues().valuesFor(metricId).latest();
+      boolean overLimit = metricValue > limit;
+      if (RISE_TRIGGERED_LIMIT_METRIC_NAMES.contains(metricName)) {
+        Double previousValue = lastRiseTriggeredValueByMetricName.put(metricName, metricValue);
+        overLimit = overLimit && previousValue != null && metricValue > previousValue;
+      }
+      if (overLimit) {
+        overLimitDetailsByMetricName.get(metricName).append(String.format("%d(%.2f) ", brokerId, metricValue));
+        withinAdjusterLimit = false;
       }
     }
     return withinAdjusterLimit;

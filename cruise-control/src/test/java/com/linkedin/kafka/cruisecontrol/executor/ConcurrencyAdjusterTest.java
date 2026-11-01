@@ -365,6 +365,33 @@ public class ConcurrencyAdjusterTest {
   }
 
   @Test
+  public void testWithinReplicationThrottleAdjusterLimit() {
+    short logFlushId = KafkaMetricDef.brokerMetricDef().metricInfo(KafkaMetricDef.BROKER_LOG_FLUSH_TIME_MS_999TH.name()).id();
+    short produceId = KafkaMetricDef.brokerMetricDef().metricInfo(KafkaMetricDef.BROKER_PRODUCE_LOCAL_TIME_MS_999TH.name()).id();
+    double limit = MOCK_COMMON_CONCURRENCY_ADJUSTER_LIMIT;
+    Map<String, Double> lastValues = new HashMap<>();
+    // The log flush time is over its limit at the first check: it may be an old slow flush that the 99.9th percentile still holds.
+    assertTrue(withinReplicationThrottleAdjusterLimit(Map.of(logFlushId, 3 * limit, produceId, 0.0), lastValues));
+    // It stays at the same value: no new slow flush.
+    assertTrue(withinReplicationThrottleAdjusterLimit(Map.of(logFlushId, 3 * limit, produceId, 0.0), lastValues));
+    // It rises: a new, slower flush.
+    assertFalse(withinReplicationThrottleAdjusterLimit(Map.of(logFlushId, 4 * limit, produceId, 0.0), lastValues));
+    // It drops (the slowest flush aged out of the histogram), still over the limit: no new slow flush.
+    assertTrue(withinReplicationThrottleAdjusterLimit(Map.of(logFlushId, 2 * limit, produceId, 0.0), lastValues));
+    // It rises again, but stays within its limit.
+    assertTrue(withinReplicationThrottleAdjusterLimit(Map.of(logFlushId, limit / 2, produceId, 0.0), lastValues));
+    assertTrue(withinReplicationThrottleAdjusterLimit(Map.of(logFlushId, limit, produceId, 0.0), lastValues));
+    // The other metrics count whenever they are over their limit, even at an unchanged value.
+    assertFalse(withinReplicationThrottleAdjusterLimit(Map.of(logFlushId, 0.0, produceId, 2 * limit), lastValues));
+    assertFalse(withinReplicationThrottleAdjusterLimit(Map.of(logFlushId, 0.0, produceId, 2 * limit), lastValues));
+  }
+
+  private static boolean withinReplicationThrottleAdjusterLimit(Map<Short, Double> metricValueById, Map<String, Double> lastValues) {
+    return ExecutionUtils.withinReplicationThrottleAdjusterLimit(0, buildValuesAndExtrapolations(metricValueById), lastValues,
+                                                                 initOverLimitDetailsByMetricNameMap());
+  }
+
+  @Test
   public void testRecommendedReplicationThrottle() {
     double delta = 1.0 / MB_IN_BYTES;
     // Headroom: 0.8 * 100 - 15 = 65 MB/sec > 20 MB/sec. Increase is bounded by the additive increase.

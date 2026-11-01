@@ -512,6 +512,8 @@ public class Executor {
     private final Map<TopicPartition, MovementProgress> _movementProgressByPartition = new HashMap<>();
     // The number of consecutive metric-based checks at which the metrics of each broker were over a concurrency adjuster limit.
     private final Map<Integer, Integer> _consecutiveOverLimitChecksByBroker = new HashMap<>();
+    // The values of the limit metrics that count only when they rise, at the previous metric-based check of each broker.
+    private final Map<Integer, Map<String, Double>> _lastRiseTriggeredLimitValuesByBroker = new HashMap<>();
     // Brokers (and directions) already warned about for needing more than the maximum replication throttle.
     private final Set<String> _needAboveMaxWarnings = new HashSet<>();
 
@@ -559,6 +561,7 @@ public class Executor {
       _lastValidBrokerMetricsById.clear();
       _movementProgressByPartition.clear();
       _consecutiveOverLimitChecksByBroker.clear();
+      _lastRiseTriggeredLimitValuesByBroker.clear();
       _needAboveMaxWarnings.clear();
       _executionConcurrencyManager.reset();
     }
@@ -961,7 +964,8 @@ public class Executor {
      *   <li>Decrease its throttles multiplicatively if (1) it hosts a replica of an (At/Under)MinISR partition with an out-of-sync
      *   replica and without offline replicas -- see {@link #brokersWithMinIsrPartitionsForThrottle(Set, Set)}, checked at each run,
      *   except the follower throttle of a broker whose replica is the one out of sync, or (2) its metrics violate any concurrency
-     *   adjuster limit at two consecutive metric-based checks.</li>
+     *   adjuster limit at two consecutive metric-based checks -- the log flush time only while it rises, see
+     *   {@link ExecutionUtils#withinReplicationThrottleAdjusterLimit(int, ValuesAndExtrapolations, Map, Map)}.</li>
      *   <li>Leave its throttles unchanged if its metrics or capacity are unavailable -- i.e. neither the current metric window nor
      *   the last valid metrics within one broker metric window have valid values -- unless they are below the needed throttle.</li>
      *   <li>Otherwise, decrease its follower (leader) throttle at once to its inbound (outbound) network headroom if it is above it,
@@ -1033,7 +1037,9 @@ public class Executor {
         long neededFollowerThrottle = neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L);
         boolean overLimit = false;
         if (canRunMetricsBasedCheck && metrics != null) {
-          overLimit = !withinConcurrencyAdjusterLimit(brokerId, metrics, overLimitDetailsByMetricName);
+          overLimit = !withinReplicationThrottleAdjusterLimit(
+              brokerId, metrics, _lastRiseTriggeredLimitValuesByBroker.computeIfAbsent(brokerId, b -> new HashMap<>()),
+              overLimitDetailsByMetricName);
           if (overLimit) {
             _consecutiveOverLimitChecksByBroker.merge(brokerId, 1, Integer::sum);
           } else {

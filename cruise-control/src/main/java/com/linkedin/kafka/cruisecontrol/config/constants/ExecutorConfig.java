@@ -312,7 +312,9 @@ public final class ExecutorConfig {
   public static final double DEFAULT_CONCURRENCY_ADJUSTER_LIMIT_LOG_FLUSH_TIME_MS = TimeUnit.SECONDS.toMillis(2);
   public static final String CONCURRENCY_ADJUSTER_LIMIT_LOG_FLUSH_TIME_MS_DOC = "The limit on the 99.9th percentile broker metric"
       + " value of log flush time. If any broker exceeds this limit during an ongoing reassignment, the relevant concurrency "
-      + "adjuster (if enabled) attempts to decrease the number of allowed concurrent movements.";
+      + "adjuster (if enabled) attempts to decrease the number of allowed concurrent movements. For replication throttle "
+      + "adjustment, it counts only when it rises over the limit since the previous metric-based check: the 99.9th percentile is in "
+      + "effect the slowest of the recent log flushes, so a single slow flush keeps it over the limit for hours at an unchanged value.";
 
   /**
    * <code>concurrency.adjuster.limit.follower.fetch.local.time.ms</code>
