@@ -864,7 +864,7 @@ public class Executor {
     }
 
     /**
-     * Track the progress of the replicas to catch up of the in-progress inter-broker replica movements (see {@link MovementProgress})
+     * Track the progress of the out-of-sync replicas of the in-progress inter-broker replica movements (see {@link MovementProgress})
      * from the log dir sizes of the brokers involved, and populate the replication traffic they measure through each throttle. A
      * broker whose log dirs cannot be described contributes no lag at this run.
      *
@@ -892,40 +892,40 @@ public class Executor {
                                           Map<Integer, Long> neededFollowerThrottleByBroker,
                                           ReplicationThrottleUse throttleUse) {
       Map<TopicPartition, ExecutionTask> taskByPartition = new HashMap<>();
-      Map<TopicPartition, List<Integer>> replicasToCatchUpByPartition = new HashMap<>();
+      Map<TopicPartition, List<Integer>> outOfSyncReplicasByPartition = new HashMap<>();
       Set<Integer> brokersToDescribe = new HashSet<>();
       for (ExecutionTask task : tasks) {
         if (task.type() != ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION || task.state() != ExecutionTaskState.IN_PROGRESS) {
           continue;
         }
-        List<Integer> replicasToCatchUp = replicasToCatchUp(task.proposal(), cluster);
-        if (replicasToCatchUp.isEmpty()) {
+        List<Integer> outOfSyncReplicas = outOfSyncReplicas(task.proposal(), cluster);
+        if (outOfSyncReplicas.isEmpty()) {
           continue;
         }
         TopicPartition tp = task.proposal().topicPartition();
         taskByPartition.put(tp, task);
-        replicasToCatchUpByPartition.put(tp, replicasToCatchUp);
+        outOfSyncReplicasByPartition.put(tp, outOfSyncReplicas);
         brokersToDescribe.add(movementLeader(task.proposal(), cluster));
-        brokersToDescribe.addAll(replicasToCatchUp);
+        brokersToDescribe.addAll(outOfSyncReplicas);
       }
       _movementProgressByPartition.keySet().retainAll(taskByPartition.keySet());
       if (taskByPartition.isEmpty()) {
         return false;
       }
 
-      // Record the lag of each replica to catch up, and the copy rate it gives.
+      // Record the lag of each out-of-sync replica, and the copy rate it gives.
       Map<Integer, Map<TopicPartition, Long>> replicaSizeByBroker = replicaSizes(brokersToDescribe);
       long nowMs = _time.milliseconds();
       for (Map.Entry<TopicPartition, ExecutionTask> entry : taskByPartition.entrySet()) {
         TopicPartition tp = entry.getKey();
         int leader = movementLeader(entry.getValue().proposal(), cluster);
-        List<Integer> replicasToCatchUp = replicasToCatchUpByPartition.get(tp);
+        List<Integer> outOfSyncReplicas = outOfSyncReplicasByPartition.get(tp);
         MovementProgress progress = _movementProgressByPartition.computeIfAbsent(tp, k -> new MovementProgress());
-        progress.retainReplicas(replicasToCatchUp);
+        progress.retainReplicas(outOfSyncReplicas);
         Map<TopicPartition, Long> leaderSizes = replicaSizeByBroker.get(leader);
         Long leaderSize = leaderSizes == null ? null : leaderSizes.get(tp);
         double writeRateBytesPerSec = writeRateKBpsByPartition.getOrDefault(tp, 0.0) * BYTES_IN_KB;
-        for (int brokerId : replicasToCatchUp) {
+        for (int brokerId : outOfSyncReplicas) {
           Map<TopicPartition, Long> sizes = replicaSizeByBroker.get(brokerId);
           if (leaderSize != null && sizes != null) {
             // A broker that was described without the replica has not created it yet: its size is 0.
@@ -944,8 +944,11 @@ public class Executor {
         long leaderThrottle = throttleHelper.leaderThrottleRate(leader);
         boolean leaderFullAtNeed = fullAtNeed(throttleUse.use(leader, true), leaderThrottle,
                                               neededLeaderThrottleByBroker.getOrDefault(leader, 0L));
-        for (int brokerId : replicasToCatchUpByPartition.get(tp)) {
-          if (!progress.stalled(brokerId)) {
+        Set<Integer> replicasToRemove = new HashSet<>();
+        entry.getValue().proposal().replicasToRemove().forEach(r -> replicasToRemove.add(r.brokerId()));
+        for (int brokerId : outOfSyncReplicasByPartition.get(tp)) {
+          // A replica to remove uses its share of the throttle, but need not catch up: it is deleted once the reassignment completes.
+          if (replicasToRemove.contains(brokerId) || !progress.stalled(brokerId)) {
             continue;
           }
           long followerThrottle = throttleHelper.followerThrottleRate(brokerId);
@@ -958,7 +961,7 @@ public class Executor {
             long escalatedNeed = progress.escalate(neededPerReplica);
             LOG.info("The movement of {} made no progress over the last {} adjuster runs (lag of its replica on broker {}: {} bytes) "
                      + "through the {} throttle of broker {}, which is full at its need; its needed throttle is raised from {} to {} "
-                     + "bytes/sec per replica to catch up.", tp, REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS, brokerId, lag,
+                     + "bytes/sec per out-of-sync replica.", tp, REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS, brokerId, lag,
                      leaderFullAtNeed ? "leader" : "follower", leaderFullAtNeed ? leader : brokerId, neededPerReplica, escalatedNeed);
             escalated = true;
             break;

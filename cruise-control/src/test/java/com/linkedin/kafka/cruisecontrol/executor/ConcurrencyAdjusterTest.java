@@ -695,7 +695,7 @@ public class ConcurrencyAdjusterTest {
   }
 
   @Test
-  public void testReplicasToCatchUp() {
+  public void testOutOfSyncReplicas() {
     ReplicaPlacementInfo[] r = new ReplicaPlacementInfo[5];
     Node[] nodes = new Node[5];
     for (int brokerId = 0; brokerId < r.length; brokerId++) {
@@ -706,7 +706,7 @@ public class ConcurrencyAdjusterTest {
     TopicPartition tp1 = new TopicPartition(TOPIC1, 1);
     TopicPartition tp2 = new TopicPartition(TOPIC1, 2);
     // tp0: [0, 1, 2] -> [0, 1, 3]. Broker 1's replica (kept) fell out of the ISR, broker 2's replica (removed) too, and broker 3's
-    // (added) is not in sync yet: brokers 3 and 1 must catch up, not broker 2, whose replica is deleted once the movement completes.
+    // (added) is not in sync yet: all three fetch under the throttle -- broker 2's until the movement completes and deletes it.
     ExecutionProposal p0 = new ExecutionProposal(tp0, 0, r[0], List.of(r[0], r[1], r[2]), List.of(r[0], r[1], r[3]));
     // tp1: [0, 4] -> [0, 2]. All in sync except the replica to add.
     ExecutionProposal p1 = new ExecutionProposal(tp1, 0, r[0], List.of(r[0], r[4]), List.of(r[0], r[2]));
@@ -719,15 +719,21 @@ public class ConcurrencyAdjusterTest {
                                                            new Node[]{nodes[0], nodes[4]}),
                                          new PartitionInfo(TOPIC1, 2, null, new Node[]{nodes[1], nodes[2], nodes[3]}, new Node[0])),
                                   Collections.emptySet(), Collections.emptySet());
-    assertEquals(List.of(3, 1), ExecutionUtils.replicasToCatchUp(p0, cluster));
-    assertEquals(List.of(2), ExecutionUtils.replicasToCatchUp(p1, cluster));
-    assertEquals(List.of(3), ExecutionUtils.replicasToCatchUp(p2, cluster));
+    assertEquals(List.of(3, 1, 2), ExecutionUtils.outOfSyncReplicas(p0, cluster));
+    assertEquals(List.of(2), ExecutionUtils.outOfSyncReplicas(p1, cluster));
+    assertEquals(List.of(3), ExecutionUtils.outOfSyncReplicas(p2, cluster));
     // An unknown partition: only its replicas to add.
     Cluster empty = new Cluster("id", Arrays.asList(nodes), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
-    assertEquals(List.of(3), ExecutionUtils.replicasToCatchUp(p0, empty));
+    assertEquals(List.of(3), ExecutionUtils.outOfSyncReplicas(p0, empty));
+    // A replica to remove that is no longer assigned (deleted by Kafka) does not fetch.
+    Cluster removed = new Cluster("id", Arrays.asList(nodes),
+                                  Set.of(new PartitionInfo(TOPIC1, 0, nodes[0], new Node[]{nodes[0], nodes[1], nodes[3]}, new Node[]{nodes[0]})),
+                                  Collections.emptySet(), Collections.emptySet());
+    assertEquals(List.of(3, 1), ExecutionUtils.outOfSyncReplicas(p0, removed));
 
-    // tp0 (10 MB/sec): the leader (broker 0) serves both replicas to catch up, and broker 1 needs the write rate to catch up like
-    // broker 3 -- otherwise a brake could decrease its follower throttle to the minimum and keep its replica out of the ISR.
+    // tp0 (10 MB/sec): the leader (broker 0) serves the three out-of-sync replicas. Broker 1 needs the write rate to catch up like
+    // broker 3 -- otherwise a brake could decrease its follower throttle to the minimum and keep its replica out of the ISR -- and broker
+    // 2, whose replica shares the throttle there until the movement completes, needs it too.
     Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
     Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
     ExecutionUtils.neededReplicationThrottles(List.of(inProgressTask(0L, p0, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION)),
@@ -735,10 +741,11 @@ public class ConcurrencyAdjusterTest {
                                               neededFollowerThrottleByBroker);
     double margin = 1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN;
     assertEquals(Set.of(0), neededLeaderThrottleByBroker.keySet());
-    assertEquals(2 * 10 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
-    assertEquals(Set.of(1, 3), neededFollowerThrottleByBroker.keySet());
-    assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(1), 1.0);
-    assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(3), 1.0);
+    assertEquals(3 * 10 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
+    assertEquals(Set.of(1, 2, 3), neededFollowerThrottleByBroker.keySet());
+    for (int brokerId : List.of(1, 2, 3)) {
+      assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(brokerId), 1.0);
+    }
   }
 
   @Test
@@ -970,6 +977,16 @@ public class ConcurrencyAdjusterTest {
     // ... but not if its movement is not in progress yet.
     assertEquals(List.of(Set.of(0, 1, 2), Set.of(0, 1)), brokersToBrake(
         cluster, minIsrByTopic, List.of(new ExecutionTask(0L, proposal, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, MOCK_TIME_MS))));
+    // TP2 [0, 1] -> [0, 2] in progress, with broker 1's replica (to remove) out of sync: AtMinISR (minISR 1) with an out-of-sync replica.
+    // Only broker 0 hosts an in-sync replica: the follower throttles of brokers 1 and 2 are what their replicas fetch through.
+    Cluster moving = new Cluster("id", Arrays.asList(nodes),
+                                 Set.of(new PartitionInfo(TOPIC2, TP2.partition(), nodes[0], new Node[]{nodes[0], nodes[1], nodes[2]},
+                                                          new Node[]{nodes[0]})),
+                                 Collections.emptySet(), Collections.emptySet());
+    ExecutionProposal moveOff1 = new ExecutionProposal(TP2, 0, r[0], List.of(r[0], r[1]), List.of(r[0], r[2]));
+    assertEquals(List.of(Set.of(0, 1, 2), Set.of(0)), brokersToBrake(
+        moving, Map.of(TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS)),
+        List.of(inProgressTask(1L, moveOff1, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION))));
   }
 
   /**
