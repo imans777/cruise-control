@@ -122,11 +122,11 @@ public final class ExecutionUtils {
   // A throttle is considered at the needed throttle if it is at most this factor of it.
   static final double REPLICATION_THROTTLE_AT_NEED_FACTOR = 1.05;
   // A throttle is considered full if the out-of-sync replicas fetching through it copy at least this fraction of it: Kafka's quota
-  // enforcement and fetch sizes leave a throttle-bound movement well below its throttle (60-75% measured at 1 MB/sec), and a movement
-  // held back by something else uses a small fraction of it.
-  static final double REPLICATION_THROTTLE_FULL_USE_FRACTION = 0.6;
-  // A throttle is considered far above its use if the replicas catching up through it copy less than this fraction of it.
-  static final double REPLICATION_THROTTLE_LOW_USE_FRACTION = 0.4;
+  // enforcement and fetch sizes keep a throttle-bound movement well below its throttle (40-75% measured at 1 MB/sec).
+  static final double REPLICATION_THROTTLE_FULL_USE_FRACTION = 0.5;
+  // A throttle is considered far above its use -- mostly idle -- if the out-of-sync replicas fetching through it copy less than this
+  // fraction of it: what holds them back is not the throttle (e.g. 3% of it on a production cluster with a disk-bound movement).
+  static final double REPLICATION_THROTTLE_LOW_USE_FRACTION = 0.25;
   // A throttle far above its use at this many consecutive metric-based checks is lowered to its use.
   static final int REPLICATION_THROTTLE_LOW_USE_CHECKS_TO_LOWER = 2;
   // Bounds and adjustment parameters of the replication throttle (bytes/sec) used by the concurrency adjuster.
@@ -359,7 +359,7 @@ public final class ExecutionUtils {
    *   <li>the rate at which each replica copies the partition (see {@link #copyRate(int, double)}), i.e. its share of the replication
    *   throttles it fetches through -- which tells whether a throttle is full, and</li>
    *   <li>whether a replica makes no progress (see {@link #stalled(int)}), in which case the needed throttle of the movement is
-   *   escalated if a throttle it fetches through is full at its need -- i.e. if more throttle is what it lacks. A replica of a
+   *   escalated if a throttle it fetches through is at its need and in use -- i.e. if more throttle is what it lacks. A replica of a
    *   partition at its retention limit is truncated whenever retention deletes past it, so it may need several times the write rate,
    *   depending on the segment size, the retention and the throttle actually achieved.</li>
    * </ul>
@@ -539,12 +539,13 @@ public final class ExecutionUtils {
    * @param use The replication traffic (bytes/sec) through a throttle.
    * @param throttle The throttle (bytes/sec).
    * @param neededThrottle The throttle (bytes/sec) needed by the in-progress movements through it.
-   * @return {@code true} if the throttle is full (see {@link #throttleFull(double, long)}) and at its need (see
-   * {@link #atNeededThrottle(long, long)}): a replica that makes no progress through it lacks throttle, which only an escalation of
-   * its need gives it.
+   * @return {@code true} if the throttle is at its need (see {@link #atNeededThrottle(long, long)}) and in use, i.e. not far above its
+   * use (see {@link #throttleFarAboveUse(double, long)}): a replica that makes no progress through it lacks throttle, which only an
+   * escalation of its need gives it. Kafka's quota enforcement keeps a throttle-bound movement well below a small throttle, so "full"
+   * is not required; a throttle the movements leave mostly idle is not what holds them back.
    */
-  static boolean fullAtNeed(double use, long throttle, long neededThrottle) {
-    return throttleFull(use, throttle) && atNeededThrottle(throttle, neededThrottle);
+  static boolean throttleLimitsAtNeed(double use, long throttle, long neededThrottle) {
+    return !throttleFarAboveUse(use, throttle) && atNeededThrottle(throttle, neededThrottle);
   }
 
   /**

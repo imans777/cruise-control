@@ -869,8 +869,9 @@ public class Executor {
      * broker whose log dirs cannot be described contributes no lag at this run.
      *
      * <p>Escalate the needed throttle of a movement with a replica that made no progress if a throttle that replica fetches through --
-     * the leader throttle of the leader of the movement, or the follower throttle of the broker of the replica -- is full at its need,
-     * i.e. if more throttle is what it lacks. A replica that made no progress through throttles that are not full at their need is
+     * the leader throttle of the leader of the movement, or the follower throttle of the broker of the replica -- is at its need and in
+     * use (see {@link ExecutionUtils#throttleLimitsAtNeed}), i.e. if more throttle is what it lacks. A replica that made no progress through
+     * throttles that are mostly idle or above their need is
      * reported once instead: something else holds it back (e.g. the disk or the network of a broker), which more throttle would not
      * fix -- or the throttle is above its need, which the concurrency adjuster raises further while it is full and the network
      * headroom allows.</p>
@@ -936,14 +937,14 @@ public class Executor {
         }
       }
 
-      // Escalate the movements with a replica that made no progress through a throttle that is full at its need.
+      // Escalate the movements with a replica that made no progress through a throttle that is in use at its need.
       boolean escalated = false;
       for (Map.Entry<TopicPartition, ExecutionTask> entry : taskByPartition.entrySet()) {
         TopicPartition tp = entry.getKey();
         int leader = movementLeader(entry.getValue().proposal(), cluster);
         MovementProgress progress = _movementProgressByPartition.get(tp);
         long leaderThrottle = throttleHelper.leaderThrottleRate(leader);
-        boolean leaderFullAtNeed = fullAtNeed(throttleUse.use(leader, true), leaderThrottle,
+        boolean leaderLimitsAtNeed = throttleLimitsAtNeed(throttleUse.use(leader, true), leaderThrottle,
                                               neededLeaderThrottleByBroker.getOrDefault(leader, 0L));
         Set<Integer> replicasToRemove = new HashSet<>();
         entry.getValue().proposal().replicasToRemove().forEach(r -> replicasToRemove.add(r.brokerId()));
@@ -953,23 +954,23 @@ public class Executor {
             continue;
           }
           long followerThrottle = throttleHelper.followerThrottleRate(brokerId);
-          boolean followerFullAtNeed = fullAtNeed(throttleUse.use(brokerId, false), followerThrottle,
+          boolean followerLimitsAtNeed = throttleLimitsAtNeed(throttleUse.use(brokerId, false), followerThrottle,
                                                   neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L));
           long lag = progress.lag(brokerId);
-          if (leaderFullAtNeed || followerFullAtNeed) {
+          if (leaderLimitsAtNeed || followerLimitsAtNeed) {
             long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBpsByPartition.getOrDefault(tp, 0.0)),
                                              progress.escalatedNeed());
             long escalatedNeed = progress.escalate(neededPerReplica);
             LOG.info("The movement of {} made no progress over the last {} adjuster runs (lag of its replica on broker {}: {} bytes) "
-                     + "through the {} throttle of broker {}, which is full at its need; its needed throttle is raised from {} to {} "
+                     + "through the {} throttle of broker {}, which is in use at its need; its needed throttle is raised from {} to {} "
                      + "bytes/sec per out-of-sync replica.", tp, REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS, brokerId, lag,
-                     leaderFullAtNeed ? "leader" : "follower", leaderFullAtNeed ? leader : brokerId, neededPerReplica, escalatedNeed);
+                     leaderLimitsAtNeed ? "leader" : "follower", leaderLimitsAtNeed ? leader : brokerId, neededPerReplica, escalatedNeed);
             escalated = true;
             break;
           }
           if (progress.reportStall()) {
             LOG.info("The movement of {} made no progress over the last {} adjuster runs (lag of its replica on broker {}: {} bytes), "
-                     + "but the throttles it fetches through are not full at their need (leader throttle of broker {}: {} of {} "
+                     + "but the throttles it fetches through are not in use at their need (leader throttle of broker {}: {} of {} "
                      + "bytes/sec in use, follower throttle of broker {}: {} of {} bytes/sec in use): something other than the "
                      + "replication throttle holds it back.", tp, REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS, brokerId, lag, leader,
                      (long) throttleUse.use(leader, true), leaderThrottle, brokerId, (long) throttleUse.use(brokerId, false),

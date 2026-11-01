@@ -455,8 +455,8 @@ public class ConcurrencyAdjusterTest {
     long mb = MB_IN_BYTES;
     // A broker with 200 MB/sec network capacity and no other traffic: headroom 0.8 * 200 = 160 MB/sec, additive increase 10 MB/sec.
     double capacityKB = 200 * MB_IN_KB;
-    // The movements use 20 of the 40 MB/sec throttle: something else holds them back, so more throttle would not help. No increase.
-    assertEquals(40 * mb, recommended(40 * mb, 0L, capacityKB, 0.0, 20 * mb, false, false));
+    // The movements use 18 of the 40 MB/sec throttle: it is not what limits them, so more throttle would not help. No increase.
+    assertEquals(40 * mb, recommended(40 * mb, 0L, capacityKB, 0.0, 18 * mb, false, false));
     // They fill it (36 of 40): the throttle is what limits them. Additive increase ...
     assertEquals(50 * mb, recommended(40 * mb, 0L, capacityKB, 0.0, 36 * mb, false, false));
     // ... or doubled during slow start -- by at least the additive increase, ...
@@ -480,7 +480,7 @@ public class ConcurrencyAdjusterTest {
     assertEquals(20 * mb, recommended(80 * mb, 0L, capacityKB, 0.0, 10 * mb, false, true));
     // ... never below the throttle needed by the movements, nor above the current throttle.
     assertEquals(30 * mb, recommended(80 * mb, 30 * mb, capacityKB, 0.0, 10 * mb, false, true));
-    assertEquals(18 * mb, recommended(18 * mb, 0L, capacityKB, 0.0, 10 * mb, false, true));
+    assertEquals(19 * mb, recommended(19 * mb, 0L, capacityKB, 0.0, 9 * mb, false, true));
     // Without lowerToUse, a throttle far above its use is left unchanged.
     assertEquals(80 * mb, recommended(80 * mb, 0L, capacityKB, 0.0, 10 * mb, false, false));
   }
@@ -863,14 +863,15 @@ public class ConcurrencyAdjusterTest {
     assertTrue(use.complete(3, true));
 
     long throttle = 10 * MB_IN_BYTES;
-    // A throttle-bound movement stays well below its throttle (Kafka's quota enforcement): full from 60% use on.
-    assertTrue(ExecutionUtils.throttleFull(6.1 * mb, throttle));
-    assertFalse(ExecutionUtils.throttleFull(5.9 * mb, throttle));
-    // Only a throttle that is full at its need calls for an escalation: one above its need is raised by the concurrency adjuster
-    // while the network headroom allows, and one that is not full is not what holds the movements back.
-    assertTrue(ExecutionUtils.fullAtNeed(9 * mb, throttle, throttle));
-    assertFalse(ExecutionUtils.fullAtNeed(9 * mb, throttle, throttle / 2));
-    assertFalse(ExecutionUtils.fullAtNeed(5 * mb, throttle, throttle));
+    // A throttle-bound movement stays well below its throttle (Kafka's quota enforcement): full from 50% use on.
+    assertTrue(ExecutionUtils.throttleFull(5.1 * mb, throttle));
+    assertFalse(ExecutionUtils.throttleFull(4.9 * mb, throttle));
+    // Only a throttle at its need that is in use calls for an escalation: one above its need is raised by the concurrency adjuster
+    // while it is full and the network headroom allows, and one that is mostly idle (< 25% used) is not what holds the movements back.
+    assertTrue(ExecutionUtils.throttleLimitsAtNeed(9 * mb, throttle, throttle));
+    assertTrue(ExecutionUtils.throttleLimitsAtNeed(4 * mb, throttle, throttle));
+    assertFalse(ExecutionUtils.throttleLimitsAtNeed(9 * mb, throttle, throttle / 2));
+    assertFalse(ExecutionUtils.throttleLimitsAtNeed(2 * mb, throttle, throttle));
   }
 
   @Test

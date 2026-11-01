@@ -493,9 +493,9 @@ public final class ExecutorConfig {
       + "limit at two consecutive metric-based checks. It is never below the throttle needed by the write rate of the partitions "
       + "being moved, for each of their replicas out of the ISR -- also an old replica that fell behind (see "
       + "concurrency.adjuster.replication.throttle.write.rate.margin), even above the network headroom -- a throttle below it stalls "
-      + "the movements -- and that need is doubled for a movement whose replicas make no progress through a throttle that they fill "
-      + "at its need; only concurrency.adjuster.max.replication.throttle bounds it. A change smaller than 5% of the current throttle "
-      + "is ignored, so traffic fluctuations do not cause config updates. A broker without metrics in the current metrics window uses "
+      + "the movements -- and that need is doubled for a movement whose replicas make no progress through a throttle at its need that "
+      + "they use; only concurrency.adjuster.max.replication.throttle bounds it. A change smaller than 5% of the current throttle is "
+      + "ignored, so traffic fluctuations do not cause config updates. A broker without metrics in the current metrics window uses "
       + "its last valid metrics from within one broker metrics window; without either, only the needed throttle is enforced. An "
       + "execution started without a replication throttle (neither replication_throttle nor default.replication.throttle) starts each "
       + "broker at a fraction of its network headroom (see concurrency.adjuster.replication.throttle.initial.headroom.fraction). It "
@@ -601,9 +601,9 @@ public final class ExecutorConfig {
       + "bounded only by concurrency.adjuster.max.replication.throttle: a throttle below the write rate stalls the movements, and a "
       + "stalled movement keeps using its throttle without making progress. A new replica of a partition at its retention limit can "
       + "need several times the write rate, since retention truncates a replica that falls behind the log start of the leader; so a "
-      + "movement whose replicas make no progress over six adjuster runs, through a throttle that its replicas fill at its need, has "
-      + "that need doubled; one that makes no progress through throttles that are not full is reported instead (something else holds "
-      + "it back).";
+      + "movement whose replicas make no progress over six adjuster runs, through a throttle at its need that is in use, has that "
+      + "need doubled; one that makes no progress through throttles that are mostly idle is reported instead (something else holds it "
+      + "back).";
 
   /**
    * <code>concurrency.adjuster.min.isr.cache.size</code>
