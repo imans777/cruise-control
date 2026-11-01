@@ -443,14 +443,24 @@ public final class ExecutionUtils {
    * its configuration (e.g. a topic with a replication factor of 1, or equal to its minISR), which replication traffic does not
    * change, so it is excluded.</p>
    *
+   * <p>The leader throttle of every broker hosting a replica of such a partition is decreased, and so is its follower throttle,
+   * except on the brokers whose replica of the partition is out of sync (other than replicas being added): their follower throttle
+   * is what that replica catches up with, so decreasing it would keep the partition (At/Under)MinISR -- the very thing the
+   * decrease is meant to end.</p>
+   *
    * @param cluster Kafka cluster.
    * @param minIsrWithTimeByTopic Value and capture time of {@link org.apache.kafka.common.config.TopicConfig#MIN_IN_SYNC_REPLICAS_CONFIG} by topic.
    * @param tasks Execution tasks, to exclude the replicas being added by in-progress inter-broker replica movements.
-   * @return The brokers hosting a replica of an (At/Under)MinISR partition with an out-of-sync replica and without offline replicas.
+   * @param leaderBrokers A set to populate with the brokers hosting a replica of an (At/Under)MinISR partition with an out-of-sync
+   *                      replica and without offline replicas.
+   * @param followerBrokers A set to populate with the same brokers, except those whose replica of every such partition they host is
+   *                        out of sync and not being added.
    */
-  static Set<Integer> brokersHostingMinIsrPartitions(Cluster cluster,
-                                                     Map<String, MinIsrWithTime> minIsrWithTimeByTopic,
-                                                     Collection<ExecutionTask> tasks) {
+  static void brokersHostingMinIsrPartitions(Cluster cluster,
+                                             Map<String, MinIsrWithTime> minIsrWithTimeByTopic,
+                                             Collection<ExecutionTask> tasks,
+                                             Set<Integer> leaderBrokers,
+                                             Set<Integer> followerBrokers) {
     Map<TopicPartition, Set<Integer>> replicasToAddByPartition = new HashMap<>();
     for (ExecutionTask task : tasks) {
       if (task.type() == ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION && task.state() == ExecutionTaskState.IN_PROGRESS) {
@@ -462,7 +472,6 @@ public final class ExecutionUtils {
     Set<PartitionInfo> underMinIsr = new TreeSet<>(comparator);
     Set<PartitionInfo> atMinIsr = new TreeSet<>(comparator);
     populateMinIsrState(cluster, minIsrWithTimeByTopic, underMinIsr, atMinIsr, false);
-    Set<Integer> brokers = new TreeSet<>();
     for (Set<PartitionInfo> partitions : Arrays.asList(underMinIsr, atMinIsr)) {
       for (PartitionInfo partitionInfo : partitions) {
         Set<Integer> replicasToAdd = replicasToAddByPartition.getOrDefault(
@@ -472,12 +481,16 @@ public final class ExecutionUtils {
           // (At/Under)MinISR by configuration, not because a replica is out of sync.
           continue;
         }
+        Set<Integer> inSync = new HashSet<>();
+        Arrays.stream(partitionInfo.inSyncReplicas()).forEach(node -> inSync.add(node.id()));
         for (Node replica : partitionInfo.replicas()) {
-          brokers.add(replica.id());
+          leaderBrokers.add(replica.id());
+          if (inSync.contains(replica.id()) || replicasToAdd.contains(replica.id())) {
+            followerBrokers.add(replica.id());
+          }
         }
       }
     }
-    return brokers;
   }
 
   /**
