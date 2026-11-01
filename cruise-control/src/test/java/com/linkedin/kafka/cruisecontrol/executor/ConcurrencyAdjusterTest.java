@@ -593,6 +593,53 @@ public class ConcurrencyAdjusterTest {
   }
 
   @Test
+  public void testReplicasToCatchUp() {
+    ReplicaPlacementInfo[] r = new ReplicaPlacementInfo[5];
+    Node[] nodes = new Node[5];
+    for (int brokerId = 0; brokerId < r.length; brokerId++) {
+      r[brokerId] = new ReplicaPlacementInfo(brokerId);
+      nodes[brokerId] = new Node(brokerId, "host" + brokerId, 100);
+    }
+    TopicPartition tp0 = new TopicPartition(TOPIC1, 0);
+    TopicPartition tp1 = new TopicPartition(TOPIC1, 1);
+    TopicPartition tp2 = new TopicPartition(TOPIC1, 2);
+    // tp0: [0, 1, 2] -> [0, 1, 3]. Broker 1's replica (kept) fell out of the ISR, broker 2's replica (removed) too, and broker 3's
+    // (added) is not in sync yet: brokers 3 and 1 must catch up, not broker 2, whose replica is deleted once the movement completes.
+    ExecutionProposal p0 = new ExecutionProposal(tp0, 0, r[0], List.of(r[0], r[1], r[2]), List.of(r[0], r[1], r[3]));
+    // tp1: [0, 4] -> [0, 2]. All in sync except the replica to add.
+    ExecutionProposal p1 = new ExecutionProposal(tp1, 0, r[0], List.of(r[0], r[4]), List.of(r[0], r[2]));
+    // tp2: [1, 2] -> [1, 3], offline (no in-sync replica): only the replica to add counts.
+    ExecutionProposal p2 = new ExecutionProposal(tp2, 0, r[1], List.of(r[1], r[2]), List.of(r[1], r[3]));
+    Cluster cluster = new Cluster("id", Arrays.asList(nodes),
+                                  Set.of(new PartitionInfo(TOPIC1, 0, nodes[0], new Node[]{nodes[0], nodes[1], nodes[2], nodes[3]},
+                                                           new Node[]{nodes[0]}),
+                                         new PartitionInfo(TOPIC1, 1, nodes[0], new Node[]{nodes[0], nodes[4], nodes[2]},
+                                                           new Node[]{nodes[0], nodes[4]}),
+                                         new PartitionInfo(TOPIC1, 2, null, new Node[]{nodes[1], nodes[2], nodes[3]}, new Node[0])),
+                                  Collections.emptySet(), Collections.emptySet());
+    assertEquals(List.of(3, 1), ExecutionUtils.replicasToCatchUp(p0, cluster));
+    assertEquals(List.of(2), ExecutionUtils.replicasToCatchUp(p1, cluster));
+    assertEquals(List.of(3), ExecutionUtils.replicasToCatchUp(p2, cluster));
+    // An unknown partition: only its replicas to add.
+    Cluster empty = new Cluster("id", Arrays.asList(nodes), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
+    assertEquals(List.of(3), ExecutionUtils.replicasToCatchUp(p0, empty));
+
+    // tp0 (10 MB/sec): the leader (broker 0) serves both replicas to catch up, and broker 1 needs the write rate to catch up like
+    // broker 3 -- otherwise a brake could decrease its follower throttle to the minimum and keep its replica out of the ISR.
+    Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
+    Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
+    ExecutionUtils.neededReplicationThrottles(List.of(inProgressTask(0L, p0, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION)),
+                                              Map.of(tp0, 10 * MB_IN_KB), cluster, Collections.emptyMap(), neededLeaderThrottleByBroker,
+                                              neededFollowerThrottleByBroker);
+    double margin = 1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN;
+    assertEquals(Set.of(0), neededLeaderThrottleByBroker.keySet());
+    assertEquals(2 * 10 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
+    assertEquals(Set.of(1, 3), neededFollowerThrottleByBroker.keySet());
+    assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(1), 1.0);
+    assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(3), 1.0);
+  }
+
+  @Test
   public void testNeededThrottleFloorAndCapacityScaledIncrease() {
     long mb = MB_IN_BYTES;
     // The needed throttle beats the network headroom: 0.8 * 100 - 75 = 5 MB/sec, but the movements need 30 MB/sec.

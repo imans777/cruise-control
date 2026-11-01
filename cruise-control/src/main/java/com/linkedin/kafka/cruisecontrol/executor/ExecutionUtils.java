@@ -234,12 +234,14 @@ public final class ExecutionUtils {
    * because retention truncates a replica that falls behind the log start of the leader. For a partition with write rate
    * {@code w}:
    * <ul>
-   *   <li>Leader throttle: its current leader (or its old leader, if the current leader is unknown), which the new replicas fetch
-   *   from, needs {@code w} for each replica to add that is not in sync yet.</li>
-   *   <li>Follower throttle: each broker to add a replica to needs {@code w}, until the replica is in sync.</li>
+   *   <li>Leader throttle: its current leader (or its old leader, if the current leader is unknown), which the replicas to catch up
+   *   fetch from, needs {@code w} for each replica to catch up -- see {@link #replicasToCatchUp(ExecutionProposal, Cluster)}.</li>
+   *   <li>Follower throttle: each broker with a replica to catch up needs {@code w}, until the replica is in sync.</li>
    * </ul>
    * Kafka does not throttle in-sync replicas, so a new replica in the ISR needs nothing -- e.g. one that caught up and became the
-   * leader before the executor noticed that the movement completed.
+   * leader before the executor noticed that the movement completed. A replica that the movement keeps is throttled too, so once it
+   * falls out of the ISR (e.g. under the load of the movements), it needs {@code w} to catch up like a new replica: without it, the
+   * concurrency adjuster could decrease the throttle of its broker to the minimum throttle and keep it out of the ISR for good.
    * Each broker with in-progress movements in a direction has an entry in the corresponding map, even if the write rate of the
    * partitions being moved is unknown (counted as {@code 0}). Tasks other than in-progress inter-broker replica movements are
    * ignored. The throttle needed by a movement that made no progress at its needed throttle is escalated -- see
@@ -264,34 +266,50 @@ public final class ExecutionUtils {
         continue;
       }
       ExecutionProposal proposal = task.proposal();
-      List<Integer> newReplicasOutOfSync = newReplicasOutOfSync(proposal, cluster);
-      if (newReplicasOutOfSync.isEmpty()) {
+      List<Integer> replicasToCatchUp = replicasToCatchUp(proposal, cluster);
+      if (replicasToCatchUp.isEmpty()) {
         continue;
       }
       TopicPartition tp = proposal.topicPartition();
       long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBpsByPartition.getOrDefault(tp, 0.0)),
                                        escalatedNeedByPartition.getOrDefault(tp, 0L));
       int leader = movementLeader(proposal, cluster);
-      neededLeaderThrottleByBroker.merge(leader, neededPerReplica * newReplicasOutOfSync.size(), Long::sum);
-      newReplicasOutOfSync.forEach(brokerId -> neededFollowerThrottleByBroker.merge(brokerId, neededPerReplica, Long::sum));
+      neededLeaderThrottleByBroker.merge(leader, neededPerReplica * replicasToCatchUp.size(), Long::sum);
+      replicasToCatchUp.forEach(brokerId -> neededFollowerThrottleByBroker.merge(brokerId, neededPerReplica, Long::sum));
     }
   }
 
   /**
+   * The replicas of a movement that fetch from its leader under the replication throttle: Kafka throttles the replicas of a
+   * throttled partition that are not in sync, i.e.
+   * <ul>
+   *   <li>the replicas to add that are not in the ISR yet -- all of them if the partition is unknown, and</li>
+   *   <li>the replicas to keep that are out of the ISR -- e.g. a follower that fell behind under the load of the movements, which
+   *   must catch up for the partition to be fully in sync again, and (with ZooKeeper) for its reassignment to complete.</li>
+   * </ul>
+   * A replica to remove is not included: it is deleted once the reassignment completes, whether it caught up or not.
+   *
    * @param proposal The proposal of an inter-broker replica movement.
    * @param cluster Kafka cluster.
-   * @return Ids of the brokers that the movement adds a replica to and whose replica is not in the ISR of the partition yet -- all of
-   * them if the partition is unknown.
+   * @return Ids of the brokers whose replica of the movement must catch up with its leader, replicas to add first.
    */
-  static List<Integer> newReplicasOutOfSync(ExecutionProposal proposal, Cluster cluster) {
+  static List<Integer> replicasToCatchUp(ExecutionProposal proposal, Cluster cluster) {
     PartitionInfo partitionInfo = cluster.partition(proposal.topicPartition());
     Set<Integer> inSync = new HashSet<>();
     if (partitionInfo != null && partitionInfo.inSyncReplicas() != null) {
       Arrays.stream(partitionInfo.inSyncReplicas()).forEach(node -> inSync.add(node.id()));
     }
-    List<Integer> outOfSync = new ArrayList<>();
-    proposal.replicasToAdd().stream().map(ReplicaPlacementInfo::brokerId).filter(id -> !inSync.contains(id)).forEach(outOfSync::add);
-    return outOfSync;
+    List<Integer> replicasToCatchUp = new ArrayList<>();
+    proposal.replicasToAdd().stream().map(ReplicaPlacementInfo::brokerId).filter(id -> !inSync.contains(id))
+            .forEach(replicasToCatchUp::add);
+    if (!inSync.isEmpty()) {
+      // A partition without in-sync replicas (e.g. offline) has nothing for its replicas to catch up with.
+      Set<Integer> newReplicas = new HashSet<>();
+      proposal.newReplicas().forEach(r -> newReplicas.add(r.brokerId()));
+      proposal.oldReplicas().stream().map(ReplicaPlacementInfo::brokerId).filter(id -> newReplicas.contains(id) && !inSync.contains(id))
+              .forEach(replicasToCatchUp::add);
+    }
+    return replicasToCatchUp;
   }
 
   /**

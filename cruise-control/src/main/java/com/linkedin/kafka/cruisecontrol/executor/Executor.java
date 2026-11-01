@@ -851,26 +851,26 @@ public class Executor {
       Map<TopicPartition, ExecutionProposal> movementsAtNeed = new HashMap<>();
       Set<TopicPartition> inProgress = new HashSet<>();
       Set<Integer> brokersToDescribe = new HashSet<>();
-      Map<TopicPartition, List<Integer>> newReplicasOutOfSyncByPartition = new HashMap<>();
+      Map<TopicPartition, List<Integer>> replicasToCatchUpByPartition = new HashMap<>();
       for (ExecutionTask task : tasks) {
         if (task.type() != ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION || task.state() != ExecutionTaskState.IN_PROGRESS) {
           continue;
         }
         ExecutionProposal proposal = task.proposal();
-        List<Integer> newReplicasOutOfSync = newReplicasOutOfSync(proposal, cluster);
-        if (newReplicasOutOfSync.isEmpty()) {
+        List<Integer> replicasToCatchUp = replicasToCatchUp(proposal, cluster);
+        if (replicasToCatchUp.isEmpty()) {
           continue;
         }
         inProgress.add(proposal.topicPartition());
         int leader = movementLeader(proposal, cluster);
         boolean atNeed = atNeededThrottle(throttleHelper.leaderThrottleRate(leader), neededLeaderThrottleByBroker.getOrDefault(leader, 0L))
-                         || newReplicasOutOfSync.stream().anyMatch(brokerId -> atNeededThrottle(
+                         || replicasToCatchUp.stream().anyMatch(brokerId -> atNeededThrottle(
                              throttleHelper.followerThrottleRate(brokerId), neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L)));
         if (atNeed) {
           movementsAtNeed.put(proposal.topicPartition(), proposal);
-          newReplicasOutOfSyncByPartition.put(proposal.topicPartition(), newReplicasOutOfSync);
+          replicasToCatchUpByPartition.put(proposal.topicPartition(), replicasToCatchUp);
           brokersToDescribe.add(leader);
-          brokersToDescribe.addAll(newReplicasOutOfSync);
+          brokersToDescribe.addAll(replicasToCatchUp);
         } else {
           MovementProgress progress = _movementProgressByPartition.get(proposal.topicPartition());
           if (progress != null) {
@@ -892,7 +892,7 @@ public class Executor {
         if (leaderSize == null) {
           continue;
         }
-        long smallestNewReplicaSize = newReplicasOutOfSyncByPartition.get(tp).stream()
+        long smallestNewReplicaSize = replicasToCatchUpByPartition.get(tp).stream()
             .mapToLong(brokerId -> replicaSizeByBroker.getOrDefault(brokerId, Collections.emptyMap()).getOrDefault(tp, 0L))
             .min().orElse(0L);
         MovementProgress progress = _movementProgressByPartition.computeIfAbsent(tp, k -> new MovementProgress());
