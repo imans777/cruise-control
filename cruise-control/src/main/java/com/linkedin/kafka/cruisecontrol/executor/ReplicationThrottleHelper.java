@@ -96,15 +96,17 @@ class ReplicationThrottleHelper {
     if (throttlingEnabled()) {
       LOG.info("Setting a rebalance throttle of {} bytes/sec", _throttleRate);
       Set<Integer> participatingBrokers = getParticipatingBrokers(replicaMovementProposals);
-      Map<String, Set<String>> throttledReplicas = getThrottledReplicasByTopic(replicaMovementProposals);
+      Map<String, Set<String>> leaderThrottledReplicas = getThrottledReplicasByTopic(replicaMovementProposals);
+      Map<String, Set<String>> followerThrottledReplicas = getFollowerThrottledReplicasByTopic(replicaMovementProposals);
       // Record the throttles before setting them, so that the throttles are removed even if setting them fails halfway.
       _appliedThrottles._brokers.addAll(participatingBrokers);
       _appliedThrottles._proposals.addAll(replicaMovementProposals);
       for (int broker : participatingBrokers) {
         setThrottledRateIfNecessary(broker);
       }
-      for (Map.Entry<String, Set<String>> entry : throttledReplicas.entrySet()) {
-        setThrottledReplicas(entry.getKey(), entry.getValue());
+      for (Map.Entry<String, Set<String>> entry : leaderThrottledReplicas.entrySet()) {
+        String topic = entry.getKey();
+        setThrottledReplicas(topic, entry.getValue(), followerThrottledReplicas.getOrDefault(topic, Collections.emptySet()));
       }
     }
   }
@@ -254,6 +256,14 @@ class ReplicationThrottleHelper {
     return participatingBrokers;
   }
 
+  /**
+   * The replicas to list in {@link #LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG}: the old replicas and the replicas to add of the
+   * given movements, as any of them may be the leader that the replicas being added fetch from. Removing throttles removes these
+   * from both lists, which also covers the follower lists set by earlier versions, which listed them all.
+   *
+   * @param replicaMovementProposals Inter-broker replica movements.
+   * @return The leader throttled replicas ({@code partition:broker}) by topic.
+   */
   private Map<String, Set<String>> getThrottledReplicasByTopic(List<ExecutionProposal> replicaMovementProposals) {
     Map<String, Set<String>> throttledReplicasByTopic = new HashMap<>();
     for (ExecutionProposal proposal : replicaMovementProposals) {
@@ -265,6 +275,25 @@ class ReplicationThrottleHelper {
       Set<String> throttledReplicas = throttledReplicasByTopic
         .computeIfAbsent(topic, x -> new TreeSet<>());
       brokers.forEach(brokerId -> throttledReplicas.add(partitionId + ":" + brokerId));
+    }
+    return throttledReplicasByTopic;
+  }
+
+  /**
+   * The replicas to list in {@link #FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG}: only the replicas to add of the given movements,
+   * as with Kafka's own reassignment tool. A follower quota blocks every listed replica that lags behind its leader once the quota
+   * is exceeded, in sync or not, so listing a replica that stays (e.g. a follower that fell behind under the load of the movements)
+   * would keep it from catching up for as long as the movements run, and its own traffic would take the throttle from the replicas
+   * being added.
+   *
+   * @param replicaMovementProposals Inter-broker replica movements.
+   * @return The follower throttled replicas ({@code partition:broker}) by topic.
+   */
+  private static Map<String, Set<String>> getFollowerThrottledReplicasByTopic(List<ExecutionProposal> replicaMovementProposals) {
+    Map<String, Set<String>> throttledReplicasByTopic = new HashMap<>();
+    for (ExecutionProposal proposal : replicaMovementProposals) {
+      Set<String> throttledReplicas = throttledReplicasByTopic.computeIfAbsent(proposal.topic(), x -> new TreeSet<>());
+      proposal.replicasToAdd().forEach(replica -> throttledReplicas.add(proposal.partitionId() + ":" + replica.brokerId()));
     }
     return throttledReplicasByTopic;
   }
@@ -308,12 +337,20 @@ class ReplicationThrottleHelper {
     return configs.get(cf);
   }
 
-  private void setThrottledReplicas(String topic, Set<String> replicas)
+  private void setThrottledReplicas(String topic, Set<String> leaderReplicas, Set<String> followerReplicas)
   throws ExecutionException, InterruptedException, TimeoutException {
     Config topicConfigs = getTopicConfigs(topic);
     List<AlterConfigOp> ops = new ArrayList<>();
+    Map<String, Set<String>> replicasByConfigKey = new HashMap<>(2);
+    replicasByConfigKey.put(LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG, leaderReplicas);
+    replicasByConfigKey.put(FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG, followerReplicas);
     for (String replicaThrottleConfigKey : Arrays.asList(LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG,
             FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG)) {
+      Set<String> replicas = replicasByConfigKey.get(replicaThrottleConfigKey);
+      if (replicas.isEmpty()) {
+        // E.g. the movements of the topic only remove replicas, so no follower is to be throttled.
+        continue;
+      }
       ConfigEntry currThrottledReplicas = topicConfigs.get(replicaThrottleConfigKey);
       if (currThrottledReplicas != null && currThrottledReplicas.value().trim().equals(WILDCARD_ASTERISK)) {
         // The existing setup throttles all replica. So, nothing needs to be changed.
