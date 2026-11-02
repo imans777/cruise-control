@@ -926,6 +926,7 @@ public class Executor {
         Map<TopicPartition, Long> leaderSizes = replicaSizeByBroker.get(leader);
         Long leaderSize = leaderSizes == null ? null : leaderSizes.get(tp);
         double writeRateBytesPerSec = writeRateKBpsByPartition.getOrDefault(tp, 0.0) * BYTES_IN_KB;
+        ExecutionProposal proposal = entry.getValue().proposal();
         for (int brokerId : outOfSyncReplicas) {
           Map<TopicPartition, Long> sizes = replicaSizeByBroker.get(brokerId);
           if (leaderSize != null && sizes != null) {
@@ -933,7 +934,11 @@ public class Executor {
             long size = sizes.getOrDefault(tp, 0L);
             progress.recordLag(brokerId, nowMs, leaderSize - size, size);
           }
-          throttleUse.add(leader, brokerId, progress.copyRate(brokerId, writeRateBytesPerSec));
+          throttleUse.add(leader, brokerId, followerThrottled(proposal, brokerId), progress.copyRate(brokerId, writeRateBytesPerSec));
+        }
+        // Kafka counts what in-sync followers fetch against the throttle too.
+        for (int brokerId : inSyncFollowers(proposal, cluster)) {
+          throttleUse.add(leader, brokerId, followerThrottled(proposal, brokerId), writeRateBytesPerSec);
         }
       }
 
@@ -954,8 +959,9 @@ public class Executor {
             continue;
           }
           long followerThrottle = throttleHelper.followerThrottleRate(brokerId);
-          boolean followerLimitsAtNeed = throttleLimitsAtNeed(throttleUse.use(brokerId, false), followerThrottle,
-                                                  neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L));
+          boolean followerLimitsAtNeed = followerThrottled(entry.getValue().proposal(), brokerId)
+                                         && throttleLimitsAtNeed(throttleUse.use(brokerId, false), followerThrottle,
+                                                                 neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L));
           long lag = progress.lag(brokerId);
           if (leaderLimitsAtNeed || followerLimitsAtNeed) {
             long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBpsByPartition.getOrDefault(tp, 0.0)),

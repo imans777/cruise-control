@@ -646,16 +646,21 @@ public class ConcurrencyAdjusterTest {
     ExecutionUtils.neededReplicationThrottles(List.of(task0, task1, task2, task3, task4, task5), writeRateKBpsByPartition, cluster,
                                               Collections.emptyMap(), neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
     double margin = 1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN;
-    // Leader throttle: broker 0 (current leader of tp0) serves one new replica of tp0, broker 1 (current leader of tp1) serves three
-    // new replicas of tp1, and broker 2 (old leader of tp4, whose current leader is unknown) serves one new replica of tp4.
+    // Leader throttle: broker 0 (current leader of tp0) serves one new replica of tp0 and the in-sync replica of tp0 on broker 1,
+    // broker 1 (current leader of tp1) serves three new replicas of tp1 and its in-sync replicas on brokers 0 and 2, and broker 2
+    // (old leader of tp4, whose current leader is unknown) serves one new replica of tp4. Kafka counts what in-sync replicas fetch
+    // against the throttle, so they need the write rate.
     assertEquals(Set.of(0, 1, 2), neededLeaderThrottleByBroker.keySet());
-    assertEquals(10 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
-    assertEquals(3 * 5 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(1), 1.0);
+    assertEquals((10 * margin + 10) * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
+    assertEquals((3 * 5 * margin + 2 * 5) * MB_IN_BYTES, neededLeaderThrottleByBroker.get(1), 1.0);
     assertEquals(2 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(2), 1.0);
-    // Follower throttle: brokers 2 (tp0), 3, 4 (tp1), 5 (tp1 and tp4) and 6 (tp3, unknown write rate) fetch new replicas.
-    assertEquals(Set.of(2, 3, 4, 5, 6), neededFollowerThrottleByBroker.keySet());
+    // Follower throttle: brokers 2 (tp0), 3, 4 (tp1), 5 (tp1 and tp4) and 6 (tp3, unknown write rate) fetch new replicas, and the
+    // in-sync replicas of tp0 (broker 1) and tp1 (brokers 0 and 2) are follower throttled replicas too.
+    assertEquals(Set.of(0, 1, 2, 3, 4, 5, 6), neededFollowerThrottleByBroker.keySet());
     assertEquals(0L, neededFollowerThrottleByBroker.get(6).longValue());
-    assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(2), 1.0);
+    assertEquals(5 * MB_IN_BYTES, neededFollowerThrottleByBroker.get(0), 1.0);
+    assertEquals(10 * MB_IN_BYTES, neededFollowerThrottleByBroker.get(1), 1.0);
+    assertEquals((10 * margin + 5) * MB_IN_BYTES, neededFollowerThrottleByBroker.get(2), 1.0);
     assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(3), 1.0);
     assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(4), 1.0);
     assertEquals((5 + 2) * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(5), 1.0);
@@ -666,7 +671,8 @@ public class ConcurrencyAdjusterTest {
     ExecutionUtils.neededReplicationThrottles(List.of(task0, task1, task2, task3, task4, task5), writeRateKBpsByPartition, cluster,
                                               Map.of(tp1, 50 * MB_IN_BYTES, tp3, 3 * MB_IN_BYTES), neededLeaderThrottleByBroker,
                                               neededFollowerThrottleByBroker);
-    assertEquals(3 * 50 * MB_IN_BYTES + 3 * MB_IN_BYTES, neededLeaderThrottleByBroker.get(1), 1.0);
+    // The escalation raises the need of the out-of-sync replicas only: the in-sync replicas still fetch the write rate.
+    assertEquals((3 * 50 + 2 * 5 + 3) * MB_IN_BYTES, neededLeaderThrottleByBroker.get(1), 1.0);
     assertEquals(50 * MB_IN_BYTES, neededFollowerThrottleByBroker.get(3), 1.0);
     assertEquals(50 * MB_IN_BYTES + 2 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(5), 1.0);
     assertEquals(3 * MB_IN_BYTES, neededFollowerThrottleByBroker.get(6), 1.0);
@@ -677,8 +683,9 @@ public class ConcurrencyAdjusterTest {
                                               neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
     assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(2), 1.0);
 
-    // New replicas in the ISR are not throttled, so they need nothing: tp1's new replica on broker 3 is in sync, and tp0's new replica
-    // on broker 2 caught up and became the leader before the movement was noticed to be completed.
+    // New replicas in the ISR need no catch-up, only the write rate like the other in-sync replicas: tp1's new replica on broker 3 is
+    // in sync, and tp0's new replica on broker 2 caught up and became the leader before the movement was noticed to be completed --
+    // with every replica in sync, tp0's movement needs nothing.
     Cluster caughtUpCluster = new Cluster("id", Arrays.asList(nodes),
                                           Set.of(new PartitionInfo(TOPIC1, 0, nodes[2], new Node[]{nodes[0], nodes[2]},
                                                                    new Node[]{nodes[0], nodes[2]}),
@@ -690,8 +697,9 @@ public class ConcurrencyAdjusterTest {
     ExecutionUtils.neededReplicationThrottles(List.of(task0, task1), writeRateKBpsByPartition, caughtUpCluster, Collections.emptyMap(),
                                               neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
     assertEquals(Set.of(1), neededLeaderThrottleByBroker.keySet());
-    assertEquals(2 * 5 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(1), 1.0);
-    assertEquals(Set.of(4, 5), neededFollowerThrottleByBroker.keySet());
+    assertEquals((2 * 5 * margin + 3 * 5) * MB_IN_BYTES, neededLeaderThrottleByBroker.get(1), 1.0);
+    assertEquals(Set.of(0, 2, 3, 4, 5), neededFollowerThrottleByBroker.keySet());
+    assertEquals(5 * MB_IN_BYTES, neededFollowerThrottleByBroker.get(3), 1.0);
   }
 
   @Test
@@ -746,6 +754,66 @@ public class ConcurrencyAdjusterTest {
     for (int brokerId : List.of(1, 2, 3)) {
       assertEquals(10 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(brokerId), 1.0);
     }
+  }
+
+  @Test
+  public void testInSyncFollowersCountAgainstTheThrottle() {
+    ReplicaPlacementInfo[] r = new ReplicaPlacementInfo[4];
+    Node[] nodes = new Node[4];
+    for (int brokerId = 0; brokerId < r.length; brokerId++) {
+      r[brokerId] = new ReplicaPlacementInfo(brokerId);
+      nodes[brokerId] = new Node(brokerId, "host" + brokerId, 100);
+    }
+    TopicPartition tp0 = new TopicPartition(TOPIC1, 0);
+    // tp0 (5 MB/sec): [0, 1] -> [0, 1, 2]. Broker 1 keeps its replica, broker 2's is being added.
+    ExecutionProposal p0 = new ExecutionProposal(tp0, 0, r[0], List.of(r[0], r[1]), List.of(r[0], r[1], r[2]));
+    ExecutionTask task0 = inProgressTask(0L, p0, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
+    Cluster inSync = new Cluster("id", Arrays.asList(nodes),
+                                 Set.of(new PartitionInfo(TOPIC1, 0, nodes[0], new Node[]{nodes[0], nodes[1], nodes[2]},
+                                                          new Node[]{nodes[0], nodes[1]})),
+                                 Collections.emptySet(), Collections.emptySet());
+    Cluster lagging = new Cluster("id", Arrays.asList(nodes),
+                                  Set.of(new PartitionInfo(TOPIC1, 0, nodes[0], new Node[]{nodes[0], nodes[1], nodes[2]},
+                                                           new Node[]{nodes[0]})),
+                                  Collections.emptySet(), Collections.emptySet());
+    assertEquals(List.of(1), ExecutionUtils.inSyncFollowers(p0, inSync));
+    assertEquals(List.of(), ExecutionUtils.inSyncFollowers(p0, lagging));
+    Cluster unknown = new Cluster("id", Arrays.asList(nodes), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
+    assertEquals(List.of(), ExecutionUtils.inSyncFollowers(p0, unknown));
+    assertTrue(ExecutionUtils.followerThrottled(p0, 1));
+    assertTrue(ExecutionUtils.followerThrottled(p0, 2));
+    assertFalse(ExecutionUtils.followerThrottled(p0, 3));
+
+    double margin = 1 + MOCK_REPLICATION_THROTTLE_WRITE_RATE_MARGIN;
+    Map<TopicPartition, Double> writeRates = Map.of(tp0, 5 * MB_IN_KB);
+    // The kept replica is in sync: the leader throttle must carry its 5 MB/sec on top of the new replica's need, or the new replica
+    // gets only what the kept one leaves.
+    Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
+    Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
+    ExecutionUtils.neededReplicationThrottles(List.of(task0), writeRates, inSync, Collections.emptyMap(), neededLeaderThrottleByBroker,
+                                              neededFollowerThrottleByBroker);
+    assertEquals((5 * margin + 5) * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
+    assertEquals(5 * MB_IN_BYTES, neededFollowerThrottleByBroker.get(1), 1.0);
+    assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(2), 1.0);
+    // The kept replica fell behind: it needs to catch up like the new replica.
+    neededLeaderThrottleByBroker.clear();
+    neededFollowerThrottleByBroker.clear();
+    ExecutionUtils.neededReplicationThrottles(List.of(task0), writeRates, lagging, Collections.emptyMap(), neededLeaderThrottleByBroker,
+                                              neededFollowerThrottleByBroker);
+    assertEquals(2 * 5 * margin * MB_IN_BYTES, neededLeaderThrottleByBroker.get(0), 1.0);
+    assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(1), 1.0);
+    assertEquals(5 * margin * MB_IN_BYTES, neededFollowerThrottleByBroker.get(2), 1.0);
+
+    // A replica that its follower throttle does not apply to is counted on the leader side only.
+    ExecutionUtils.ReplicationThrottleUse use = new ExecutionUtils.ReplicationThrottleUse();
+    use.add(0, 1, false, 5 * MB_IN_BYTES);
+    use.add(0, 2, true, 3 * MB_IN_BYTES);
+    use.add(0, 3, false, -1.0);
+    assertEquals(8 * MB_IN_BYTES, use.use(0, true), 1.0);
+    assertFalse(use.complete(0, true));
+    assertEquals(0.0, use.use(1, false), 0.0);
+    assertEquals(3 * MB_IN_BYTES, use.use(2, false), 1.0);
+    assertTrue(use.complete(3, false));
   }
 
   @Test

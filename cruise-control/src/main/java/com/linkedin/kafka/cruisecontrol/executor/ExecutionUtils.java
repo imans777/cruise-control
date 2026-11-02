@@ -251,14 +251,20 @@ public final class ExecutionUtils {
    * {@code w}:
    * <ul>
    *   <li>Leader throttle: its current leader (or its old leader, if the current leader is unknown), which the out-of-sync replicas
-   *   fetch from, needs {@code w} for each out-of-sync replica -- see {@link #outOfSyncReplicas(ExecutionProposal, Cluster)}.</li>
-   *   <li>Follower throttle: each broker with an out-of-sync replica needs {@code w}, until the replica is in sync.</li>
+   *   fetch from, needs {@code w} for each out-of-sync replica -- see {@link #outOfSyncReplicas(ExecutionProposal, Cluster)} -- plus
+   *   the write rate for each in-sync follower -- see {@link #inSyncFollowers(ExecutionProposal, Cluster)}.</li>
+   *   <li>Follower throttle: each broker with an out-of-sync replica needs {@code w}, until the replica is in sync, and each broker
+   *   with an in-sync follower needs the write rate -- if its replica is a follower throttled replica (see
+   *   {@link #followerThrottled(ExecutionProposal, int)}).</li>
    * </ul>
-   * Kafka does not throttle in-sync replicas, so a new replica in the ISR needs nothing -- e.g. one that caught up and became the
-   * leader before the executor noticed that the movement completed. The old replicas of the movement are throttled too, so once one
-   * falls out of the ISR (e.g. under the load of the movements), it needs {@code w} like a new replica: a replica to keep to catch up --
-   * without it, the concurrency adjuster could decrease the throttle of its broker to the minimum throttle and keep it out of the ISR
-   * for good -- and a replica to remove because it keeps fetching under that throttle, taking its share from the others there.
+   * Kafka counts the replication traffic of every replica of a throttled partition against the throttle, in sync or not, and only
+   * spares the in-sync ones from being blocked once the throttle is exceeded. So the traffic of the in-sync followers takes its share
+   * of the throttle first: a throttle at the need of the out-of-sync replicas alone would leave them only what the in-sync followers do
+   * not use -- e.g. nothing for a new replica, if the throttle is at the traffic of a kept replica. The old replicas of the movement are
+   * throttled too, so once one falls out of the ISR (e.g. under the load of the movements), it needs {@code w} like a new replica: a
+   * replica to keep to catch up -- without it, the concurrency adjuster could decrease the throttle of its broker to the minimum
+   * throttle and keep it out of the ISR for good -- and a replica to remove because it keeps fetching under that throttle, taking its
+   * share from the others there.
    * Each broker with in-progress movements in a direction has an entry in the corresponding map, even if the write rate of the
    * partitions being moved is unknown (counted as {@code 0}). Tasks other than in-progress inter-broker replica movements are
    * ignored. The throttle needed by a movement that made no progress at its needed throttle is escalated -- see
@@ -288,17 +294,30 @@ public final class ExecutionUtils {
         continue;
       }
       TopicPartition tp = proposal.topicPartition();
-      long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBpsByPartition.getOrDefault(tp, 0.0)),
-                                       escalatedNeedByPartition.getOrDefault(tp, 0L));
+      double writeRateKBps = writeRateKBpsByPartition.getOrDefault(tp, 0.0);
+      long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBps), escalatedNeedByPartition.getOrDefault(tp, 0L));
+      long inSyncPerReplica = (long) (writeRateKBps * BYTES_IN_KB);
+      List<Integer> inSyncFollowers = inSyncFollowers(proposal, cluster);
       int leader = movementLeader(proposal, cluster);
-      neededLeaderThrottleByBroker.merge(leader, neededPerReplica * outOfSyncReplicas.size(), Long::sum);
-      outOfSyncReplicas.forEach(brokerId -> neededFollowerThrottleByBroker.merge(brokerId, neededPerReplica, Long::sum));
+      neededLeaderThrottleByBroker.merge(leader, neededPerReplica * outOfSyncReplicas.size() + inSyncPerReplica * inSyncFollowers.size(),
+                                         Long::sum);
+      for (int brokerId : outOfSyncReplicas) {
+        if (followerThrottled(proposal, brokerId)) {
+          neededFollowerThrottleByBroker.merge(brokerId, neededPerReplica, Long::sum);
+        }
+      }
+      for (int brokerId : inSyncFollowers) {
+        if (followerThrottled(proposal, brokerId)) {
+          neededFollowerThrottleByBroker.merge(brokerId, inSyncPerReplica, Long::sum);
+        }
+      }
     }
   }
 
   /**
-   * The replicas of a movement that fetch from its leader under the replication throttle: Kafka throttles every replica of a
-   * throttled partition that is not in sync (the throttled replicas of a movement are its old replicas and its replicas to add), i.e.
+   * The replicas of a movement that fetch from its leader under the replication throttle and are blocked once it is exceeded: Kafka
+   * blocks every replica of a throttled partition that is not in sync (the throttled replicas of a movement are its old replicas and
+   * its replicas to add), i.e.
    * <ul>
    *   <li>the replicas to add that are not in the ISR yet -- all of them if the partition is unknown,</li>
    *   <li>the replicas to keep that are out of the ISR -- e.g. a follower that fell behind under the load of the movements, which
@@ -329,6 +348,43 @@ public final class ExecutionUtils {
               .forEach(outOfSyncReplicas::add);
     }
     return outOfSyncReplicas;
+  }
+
+  /**
+   * The in-sync followers of a movement: the assigned replicas in the ISR other than the leader. Kafka never blocks them, but counts
+   * what they fetch -- the write rate of the partition -- against the replication throttle of the leader, and against their own
+   * follower throttle if their replica is a follower throttled replica (see {@link #followerThrottled(ExecutionProposal, int)}).
+   * E.g. a replica to keep, a replica to remove until the movement completes, or a replica to add that caught up.
+   *
+   * @param proposal The proposal of an inter-broker replica movement.
+   * @param cluster Kafka cluster.
+   * @return Ids of the brokers whose replica of the movement is an in-sync follower, empty if the partition or its leader is unknown.
+   */
+  static List<Integer> inSyncFollowers(ExecutionProposal proposal, Cluster cluster) {
+    PartitionInfo partitionInfo = cluster.partition(proposal.topicPartition());
+    if (partitionInfo == null || partitionInfo.leader() == null || partitionInfo.inSyncReplicas() == null) {
+      return Collections.emptyList();
+    }
+    Set<Integer> assigned = new HashSet<>();
+    Arrays.stream(partitionInfo.replicas()).forEach(node -> assigned.add(node.id()));
+    List<Integer> inSyncFollowers = new ArrayList<>();
+    for (Node node : partitionInfo.inSyncReplicas()) {
+      if (node.id() != partitionInfo.leader().id() && assigned.contains(node.id())) {
+        inSyncFollowers.add(node.id());
+      }
+    }
+    return inSyncFollowers;
+  }
+
+  /**
+   * @param proposal The proposal of an inter-broker replica movement.
+   * @param brokerId Id of a broker with a replica of the movement.
+   * @return {@code true} if the follower throttle of the broker applies to its replica of the movement, i.e. if the replica is a
+   * follower throttled replica: {@link ReplicationThrottleHelper} lists the old replicas and the replicas to add of a movement.
+   */
+  static boolean followerThrottled(ExecutionProposal proposal, int brokerId) {
+    return proposal.oldReplicas().stream().anyMatch(r -> r.brokerId() == brokerId)
+           || proposal.replicasToAdd().stream().anyMatch(r -> r.brokerId() == brokerId);
   }
 
   /**
@@ -480,9 +536,10 @@ public final class ExecutionUtils {
   }
 
   /**
-   * The replication traffic (bytes/sec) of the out-of-sync replicas of the in-progress movements on each broker side, from their copy
-   * rates -- see {@link MovementProgress#copyRate(int, double)}. A side with a replica whose copy rate is unknown is incomplete: its
-   * traffic is a lower bound.
+   * The replication traffic (bytes/sec) of the in-progress movements on each broker side: of their out-of-sync replicas, from their
+   * copy rates -- see {@link MovementProgress#copyRate(int, double)} -- and of their in-sync followers, from the write rate (see
+   * {@link #inSyncFollowers(ExecutionProposal, Cluster)}), which Kafka counts against the throttle too. A side with a replica whose
+   * copy rate is unknown is incomplete: its traffic is a lower bound.
    */
   static final class ReplicationThrottleUse {
     private final Map<Integer, Double> _leaderUseByBroker = new HashMap<>();
@@ -496,14 +553,29 @@ public final class ExecutionUtils {
      * @param copyRate The copy rate (bytes/sec) of the replica, negative if unknown.
      */
     void add(int leader, int follower, double copyRate) {
+      add(leader, follower, true, copyRate);
+    }
+
+    /**
+     * @param leader Id of the broker that the replica fetches from.
+     * @param follower Id of the broker of the replica.
+     * @param followerThrottled {@code true} if the follower throttle of its broker applies to the replica (see
+     *                          {@link #followerThrottled(ExecutionProposal, int)}), {@code false} to count it on the leader side only.
+     * @param copyRate The copy rate (bytes/sec) of the replica, negative if unknown.
+     */
+    void add(int leader, int follower, boolean followerThrottled, double copyRate) {
       if (copyRate < 0) {
         _incompleteLeaderSides.add(leader);
-        _incompleteFollowerSides.add(follower);
         _leaderUseByBroker.putIfAbsent(leader, 0.0);
-        _followerUseByBroker.putIfAbsent(follower, 0.0);
+        if (followerThrottled) {
+          _incompleteFollowerSides.add(follower);
+          _followerUseByBroker.putIfAbsent(follower, 0.0);
+        }
       } else {
         _leaderUseByBroker.merge(leader, copyRate, Double::sum);
-        _followerUseByBroker.merge(follower, copyRate, Double::sum);
+        if (followerThrottled) {
+          _followerUseByBroker.merge(follower, copyRate, Double::sum);
+        }
       }
     }
 
@@ -560,9 +632,10 @@ public final class ExecutionUtils {
 
   /**
    * Populate the replication traffic (KB/sec) of in-sync followers on each broker, using the write rate of partitions: an in-sync
-   * follower of a partition with write rate {@code w} fetches {@code w} from the leader. Kafka does not apply the replication
-   * throttle to in-sync followers, so this is the replication traffic that the throttle does not limit -- unlike the traffic of
-   * out-of-sync replicas, such as the new replicas of the throttled replica movements.
+   * follower of a partition with write rate {@code w} fetches {@code w} from the leader. Kafka never blocks in-sync followers, so
+   * this is replication traffic that the throttle does not limit -- unlike the traffic of out-of-sync replicas, such as the new
+   * replicas of the throttled replica movements -- although Kafka counts it against the throttle for the partitions being moved
+   * (see {@link #neededReplicationThrottles}).
    *
    * <p>The broker-level replication metrics cannot be used instead: Kafka reports {@code ReplicationBytesInPerSec} and
    * {@code ReplicationBytesOutPerSec} for all topics only, and the broker metric sample replaces them with the sum of the
