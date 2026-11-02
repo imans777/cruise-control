@@ -138,6 +138,7 @@ public class Executor {
   private final ScheduledExecutorService _executionHistoryScannerExecutor;
   // Replication throttles that executions have set, but not removed yet (see #removeLeftoverReplicationThrottles).
   private final ReplicationThrottleHelper.AppliedThrottles _appliedReplicationThrottles;
+  private final boolean _clearReplicationThrottlesBeforeExecution;
   private final AtomicBoolean _leftoverReplicationThrottleRemovalQueued;
   private final ScheduledExecutorService _leftoverReplicationThrottleCleanerExecutor;
   private UserTaskManager _userTaskManager;
@@ -265,6 +266,7 @@ public class Executor {
                                                          ExecutionUtils.EXECUTION_HISTORY_SCANNER_PERIOD_SECONDS,
                                                          TimeUnit.SECONDS);
     _appliedReplicationThrottles = new ReplicationThrottleHelper.AppliedThrottles();
+    _clearReplicationThrottlesBeforeExecution = config.getBoolean(ExecutorConfig.CLEAR_REPLICATION_THROTTLES_BEFORE_EXECUTION_CONFIG);
     _leftoverReplicationThrottleRemovalQueued = new AtomicBoolean(false);
     _leftoverReplicationThrottleCleanerExecutor = Executors.newSingleThreadScheduledExecutor(
         new KafkaCruiseControlThreadFactory(LeftoverReplicationThrottleCleaner.class.getSimpleName()));
@@ -1512,6 +1514,12 @@ public class Executor {
         // Ensure that sampling mode is adjusted properly to avoid the loss of partition metric accuracy
         // and enable the collection of broker metric samples during an ongoing execution.
         adjustSamplingModeBeforeExecution();
+
+        if (_clearReplicationThrottlesBeforeExecution) {
+          new ReplicationThrottleHelper(_adminClient, null, ReplicationThrottleHelper.RETRIES, Collections.emptySet(),
+                                        _appliedReplicationThrottles)
+              .clearAllThrottles(ExecutionUtils.ongoingPartitionReassignments(_adminClient));
+        }
 
         // 1. Inter-broker move replicas if possible.
         if (_executorState.state() == STARTING_EXECUTION) {

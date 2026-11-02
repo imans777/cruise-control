@@ -16,6 +16,7 @@ import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.clients.admin.ListTopicsResult;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.PartitionReassignment;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigResource;
@@ -688,6 +689,72 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
       assertExpectedThrottledRateForBroker(i, null);
     }
     assertExpectedThrottledReplicas(TOPIC0, "");
+    assertExpectedThrottledReplicas(TOPIC1, "");
+  }
+
+  @Test
+  public void testClearAllThrottlesRetainsThrottlesOfOngoingReassignments() throws Exception {
+    createTopics();
+
+    final long throttleRate = 100L;
+    final long otherToolThrottleRate = 300L;
+    ReplicationThrottleHelper.AppliedThrottles appliedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, throttleRate, ReplicationThrottleHelper.RETRIES,
+                                                                             new HashSet<>(), appliedThrottles);
+    // Throttles left by an earlier execution: brokers 0, 1, 3, topic1 leader replicas 0:0, 0:1, 0:3 and follower replica 0:3.
+    ExecutionProposal leftover = new ExecutionProposal(new TopicPartition(TOPIC1, 0), 100, new ReplicaPlacementInfo(0),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                       Arrays.asList(new ReplicaPlacementInfo(1), new ReplicaPlacementInfo(3)));
+    throttleHelper.setThrottles(Collections.singletonList(leftover));
+    // Throttles set by another tool, incl. those of partition 1 of topic0, which Kafka is still reassigning from [0] to [0, 2].
+    throttleHelper.changeBrokerConfigs(2, Arrays.asList(
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG,
+                                          String.valueOf(otherToolThrottleRate)), AlterConfigOp.OpType.SET),
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG,
+                                          String.valueOf(otherToolThrottleRate)), AlterConfigOp.OpType.SET)));
+    throttleHelper.changeTopicConfigs(TOPIC0, Arrays.asList(
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG, "0:1,1:0,1:2"),
+                          AlterConfigOp.OpType.SET),
+        new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG, "0:1,1:2"),
+                          AlterConfigOp.OpType.SET)));
+    TopicPartition reassigning = new TopicPartition(TOPIC0, 1);
+    Map<TopicPartition, PartitionReassignment> ongoingReassignments = Collections.singletonMap(
+        reassigning, new PartitionReassignment(Arrays.asList(0, 2), Collections.singletonList(2), Collections.emptyList()));
+
+    throttleHelper.clearAllThrottles(ongoingReassignments);
+    // The throttles of the ongoing reassignment and the rates of the brokers hosting it (0 and 2) are retained.
+    assertExpectedThrottledRateForBroker(0, throttleRate);
+    assertExpectedThrottledRateForBroker(1, null);
+    assertExpectedThrottledRateForBroker(2, otherToolThrottleRate);
+    assertExpectedThrottledRateForBroker(3, null);
+    assertExpectedThrottledReplicas(TOPIC0, "1:0,1:2", "1:2");
+    assertExpectedThrottledReplicas(TOPIC1, "");
+    // The record no longer holds the throttles that were removed.
+    assertEquals(Set.of(0), appliedThrottles.brokers());
+    assertTrue(appliedThrottles.proposals().isEmpty());
+
+    // A wildcard set by another tool is removed too, once no partition of the topic is being reassigned.
+    setWildcardThrottleReplicaForTopic(throttleHelper, TOPIC1);
+    throttleHelper.clearAllThrottles(Collections.emptyMap());
+    for (int i = 0; i < clusterSize(); i++) {
+      assertExpectedThrottledRateForBroker(i, null);
+    }
+    assertExpectedThrottledReplicas(TOPIC0, "");
+    assertExpectedThrottledReplicas(TOPIC1, "");
+    assertTrue(appliedThrottles.isEmpty());
+  }
+
+  @Test
+  public void testClearAllThrottlesKeepsWildcardOfTopicBeingReassigned() throws Exception {
+    createTopics();
+
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, 100L);
+    setWildcardThrottleReplicaForTopic(throttleHelper, TOPIC0);
+    setWildcardThrottleReplicaForTopic(throttleHelper, TOPIC1);
+    throttleHelper.clearAllThrottles(Collections.singletonMap(
+        new TopicPartition(TOPIC0, 0),
+        new PartitionReassignment(Arrays.asList(0, 1), Collections.singletonList(1), Collections.emptyList())));
+    assertExpectedThrottledReplicas(TOPIC0, ReplicationThrottleHelper.WILDCARD_ASTERISK);
     assertExpectedThrottledReplicas(TOPIC1, "");
   }
 

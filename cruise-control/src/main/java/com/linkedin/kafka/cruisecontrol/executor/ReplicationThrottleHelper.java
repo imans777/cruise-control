@@ -10,6 +10,9 @@ import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AlterConfigOp;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.ListTopicsOptions;
+import org.apache.kafka.clients.admin.PartitionReassignment;
+import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigResource;
@@ -197,6 +200,127 @@ class ReplicationThrottleHelper {
                inProgressProposals.size());
       removeThrottles(brokersToRemoveThrottlesFrom, finishedProposals);
     }
+  }
+
+  /**
+   * Removes every replication throttle in the cluster -- e.g. left by an execution that a crash or forced restart interrupted,
+   * or set by other tools -- so that stale throttles do not throttle the replicas of an execution that is about to start.
+   * Retains the throttled replicas of the given ongoing partition reassignments, the throttled rates of the brokers hosting
+   * them, rates from lower precedence sources (e.g. the cluster-wide default) and the rates of unavailable brokers. Failing to
+   * remove a throttle does not stop removing the others, but fails the call once the others are removed.
+   *
+   * @param ongoingReassignments Ongoing partition reassignments.
+   */
+  void clearAllThrottles(Map<TopicPartition, PartitionReassignment> ongoingReassignments)
+  throws ExecutionException, InterruptedException, TimeoutException {
+    Set<Integer> brokersToRetain = new HashSet<>();
+    ongoingReassignments.values().forEach(reassignment -> brokersToRetain.addAll(reassignment.replicas()));
+    Set<Integer> brokers = _adminClient.describeCluster().nodes().get(CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                                       .stream().map(Node::id).collect(Collectors.toCollection(TreeSet::new));
+    brokers.removeAll(brokersToRetain);
+    Set<String> topics = _adminClient.listTopics(new ListTopicsOptions().listInternal(true)).names()
+                                     .get(CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    Map<ConfigResource, KafkaFuture<Config>> topicConfigs = _adminClient.describeConfigs(
+        topics.stream().map(topic -> new ConfigResource(ConfigResource.Type.TOPIC, topic)).collect(Collectors.toList())).values();
+
+    Set<Integer> clearedBrokers = new TreeSet<>();
+    Set<Integer> failedBrokers = new TreeSet<>();
+    Set<String> clearedTopics = new TreeSet<>();
+    Set<String> failedTopics = new TreeSet<>();
+    Exception failure = null;
+    for (int broker : brokers) {
+      try {
+        if (removeThrottledRateFromBroker(broker)) {
+          clearedBrokers.add(broker);
+        }
+        _appliedThrottles._brokers.remove(broker);
+      } catch (ExecutionException | TimeoutException | RuntimeException e) {
+        LOG.warn("Failed to remove the replication throttled rate from broker {}.", broker, e);
+        failedBrokers.add(broker);
+        failure = failure == null ? e : failure;
+      }
+    }
+    for (Map.Entry<ConfigResource, KafkaFuture<Config>> entry : topicConfigs.entrySet()) {
+      String topic = entry.getKey().name();
+      try {
+        Config configs;
+        try {
+          configs = entry.getValue().get(CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (ExecutionException e) {
+          if (!topicExists(topic)) {
+            continue;
+          }
+          throw e;
+        }
+        if (clearThrottledReplicasOfTopic(topic, configs, ongoingReassignments.keySet())) {
+          clearedTopics.add(topic);
+        }
+        _appliedThrottles._proposals.removeIf(p -> p.topic().equals(topic) && !ongoingReassignments.containsKey(p.topicPartition()));
+      } catch (ExecutionException | TimeoutException | RuntimeException e) {
+        LOG.warn("Failed to remove the throttled replicas of topic {}.", topic, e);
+        failedTopics.add(topic);
+        failure = failure == null ? e : failure;
+      }
+    }
+    if (!clearedBrokers.isEmpty() || !clearedTopics.isEmpty()) {
+      LOG.info("Removed the replication throttles found before the execution: the throttled rates of brokers {} and the throttled "
+               + "replicas of topics {} (retaining the throttles of {} partitions being reassigned).", clearedBrokers, clearedTopics,
+               ongoingReassignments.size());
+    }
+    if (failure != null) {
+      throw new IllegalStateException(String.format("Failed to remove the replication throttles of brokers %s and topics %s.",
+                                                    failedBrokers, failedTopics), failure);
+    }
+  }
+
+  /**
+   * Removes the throttled replicas of every partition but the given ones from the given topic.
+   *
+   * @param topic Topic to remove the throttled replicas from.
+   * @param topicConfigs The current configs of the topic.
+   * @param partitionsToRetain Partitions whose throttled replicas are to be retained.
+   * @return {@code true} if any throttled replica was removed, {@code false} otherwise.
+   */
+  private boolean clearThrottledReplicasOfTopic(String topic, Config topicConfigs, Set<TopicPartition> partitionsToRetain)
+  throws ExecutionException, InterruptedException, TimeoutException {
+    List<AlterConfigOp> ops = new ArrayList<>();
+    Map<String, String> deletedValues = new HashMap<>();
+    for (String replicaThrottleConfigKey : Arrays.asList(LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG,
+                                                         FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG)) {
+      ConfigEntry currThrottledReplicas = topicConfigs.get(replicaThrottleConfigKey);
+      if (currThrottledReplicas == null || currThrottledReplicas.source() != ConfigEntry.ConfigSource.DYNAMIC_TOPIC_CONFIG
+          || currThrottledReplicas.value() == null || currThrottledReplicas.value().trim().isEmpty()) {
+        continue;
+      }
+      String value = currThrottledReplicas.value().trim();
+      List<String> retained = new ArrayList<>();
+      if (value.equals(WILDCARD_ASTERISK)) {
+        if (partitionsToRetain.stream().anyMatch(tp -> tp.topic().equals(topic))) {
+          continue;
+        }
+      } else {
+        for (String replica : value.split(",")) {
+          String partition = replica.trim().split(":")[0];
+          if (partitionsToRetain.contains(new TopicPartition(topic, Integer.parseInt(partition.trim())))) {
+            retained.add(replica.trim());
+          }
+        }
+        if (retained.size() == value.split(",").length) {
+          continue;
+        }
+      }
+      if (retained.isEmpty()) {
+        ops.add(new AlterConfigOp(new ConfigEntry(replicaThrottleConfigKey, null), AlterConfigOp.OpType.DELETE));
+        deletedValues.put(replicaThrottleConfigKey, currThrottledReplicas.value());
+      } else {
+        ops.add(new AlterConfigOp(new ConfigEntry(replicaThrottleConfigKey, String.join(",", retained)), AlterConfigOp.OpType.SET));
+      }
+    }
+    if (ops.isEmpty()) {
+      return false;
+    }
+    changeTopicConfigs(topic, ops, deletedValues);
+    return true;
   }
 
   /**
@@ -473,7 +597,13 @@ class ReplicationThrottleHelper {
     }
   }
 
-  private void removeThrottledRateFromBroker(Integer brokerId)
+  /**
+   * Removes the throttled rates set on the given broker, if any.
+   *
+   * @param brokerId Broker to remove the throttled rates from.
+   * @return {@code true} if a throttled rate was removed, {@code false} otherwise.
+   */
+  private boolean removeThrottledRateFromBroker(Integer brokerId)
   throws ExecutionException, InterruptedException, TimeoutException {
     Config brokerConfigs = getBrokerConfigs(brokerId);
     ConfigEntry currLeaderThrottle = brokerConfigs.get(LEADER_REPLICATION_THROTTLED_RATE_CONFIG);
@@ -498,9 +628,11 @@ class ReplicationThrottleHelper {
         deletedValues.put(FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, currFollowerThrottle.value());
       }
     }
-    if (!ops.isEmpty()) {
-      changeBrokerConfigs(brokerId, ops, deletedValues);
+    if (ops.isEmpty()) {
+      return false;
     }
+    changeBrokerConfigs(brokerId, ops, deletedValues);
+    return true;
   }
 
   // Retries until we can read the configs changes we just wrote
