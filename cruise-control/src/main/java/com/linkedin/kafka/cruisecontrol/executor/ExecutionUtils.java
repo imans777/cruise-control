@@ -668,32 +668,30 @@ public final class ExecutionUtils {
   }
 
   /**
-   * Get the brokers hosting a replica of an (At/Under)MinISR partition without offline replicas, whose replication throttles the
-   * concurrency adjuster decreases if {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG}
-   * is enabled. Partitions with offline replicas are excluded, since moving their replicas is often the very purpose of the execution.
+   * Get the brokers that are behind on an (At/Under)MinISR partition without offline replicas: the brokers whose replica of such a
+   * partition is out of sync, except the replicas being added by the given in-progress inter-broker replica movements, which are out
+   * of sync until they catch up. If {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG} is
+   * enabled, the concurrency adjuster decreases their replication throttles, and the executor starts no new inter-broker replica
+   * movement to or from them, until they are back in sync. Partitions with offline replicas are excluded, since moving their replicas
+   * is often the very purpose of the execution. A partition that is (At/Under)MinISR by its configuration (e.g. a replication factor
+   * of 1, or equal to its minISR) has no broker behind while its replicas are in sync.
    *
-   * <p>Only partitions that are (At/Under)MinISR because a replica is out of sync count. A partition whose replicas -- other than
-   * the replicas being added by the given in-progress inter-broker replica movements -- are all in sync is (At/Under)MinISR by
-   * its configuration (e.g. a topic with a replication factor of 1, or equal to its minISR), which replication traffic does not
-   * change, so it is excluded.</p>
-   *
-   * <p>The leader throttle of every broker hosting a replica of such a partition is decreased, and so is the follower throttle of the
-   * brokers hosting its in-sync replicas -- but not of the brokers whose replica of the partition is out of sync (fallen behind, or
-   * being added): their follower throttle is what that replica catches up with, so decreasing it would keep the partition
-   * (At/Under)MinISR -- the very thing the decrease is meant to end. What they fetch is already limited by the leader throttle.</p>
+   * <p>Only the brokers that are behind are slowed down, not the other brokers hosting the partition: a broker whose replicas fall
+   * behind is the one that struggles (e.g. its disks are saturated by the movements and its clients), and slowing down the healthy
+   * brokers would only slow the execution down. A replica that is behind catches up through the leader throttle of its leader, which
+   * keeps what it needs (see {@link #neededReplicationThrottles}), and through the follower throttle of its own broker if it is a
+   * follower throttled replica (see {@link #followerThrottled(ExecutionProposal, int)}), which keeps what it needs too.</p>
    *
    * @param cluster Kafka cluster.
    * @param minIsrWithTimeByTopic Value and capture time of {@link org.apache.kafka.common.config.TopicConfig#MIN_IN_SYNC_REPLICAS_CONFIG} by topic.
    * @param tasks Execution tasks, to exclude the replicas being added by in-progress inter-broker replica movements.
-   * @param leaderBrokers A set to populate with the brokers hosting a replica of an (At/Under)MinISR partition with an out-of-sync
-   *                      replica and without offline replicas.
-   * @param followerBrokers A set to populate with the brokers hosting an in-sync replica of such a partition.
+   * @param brokersBehind A set to populate with the brokers whose replica of an (At/Under)MinISR partition without offline replicas
+   *                      is out of sync.
    */
-  static void brokersHostingMinIsrPartitions(Cluster cluster,
-                                             Map<String, MinIsrWithTime> minIsrWithTimeByTopic,
-                                             Collection<ExecutionTask> tasks,
-                                             Set<Integer> leaderBrokers,
-                                             Set<Integer> followerBrokers) {
+  static void brokersBehindOnMinIsrPartitions(Cluster cluster,
+                                              Map<String, MinIsrWithTime> minIsrWithTimeByTopic,
+                                              Collection<ExecutionTask> tasks,
+                                              Set<Integer> brokersBehind) {
     Map<TopicPartition, Set<Integer>> replicasToAddByPartition = new HashMap<>();
     for (ExecutionTask task : tasks) {
       if (task.type() == ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION && task.state() == ExecutionTaskState.IN_PROGRESS) {
@@ -709,17 +707,11 @@ public final class ExecutionUtils {
       for (PartitionInfo partitionInfo : partitions) {
         Set<Integer> replicasToAdd = replicasToAddByPartition.getOrDefault(
             new TopicPartition(partitionInfo.topic(), partitionInfo.partition()), Collections.emptySet());
-        long numReplicasNotBeingAdded = Arrays.stream(partitionInfo.replicas()).filter(r -> !replicasToAdd.contains(r.id())).count();
-        if (partitionInfo.inSyncReplicas().length >= numReplicasNotBeingAdded) {
-          // (At/Under)MinISR by configuration, not because a replica is out of sync.
-          continue;
-        }
         Set<Integer> inSync = new HashSet<>();
         Arrays.stream(partitionInfo.inSyncReplicas()).forEach(node -> inSync.add(node.id()));
         for (Node replica : partitionInfo.replicas()) {
-          leaderBrokers.add(replica.id());
-          if (inSync.contains(replica.id())) {
-            followerBrokers.add(replica.id());
+          if (!inSync.contains(replica.id()) && !replicasToAdd.contains(replica.id())) {
+            brokersBehind.add(replica.id());
           }
         }
       }

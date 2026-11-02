@@ -543,7 +543,7 @@ public final class ExecutorConfig {
   public static final int DEFAULT_CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE = 2;
   public static final String CONCURRENCY_ADJUSTER_MULTIPLICATIVE_DECREASE_REPLICATION_THROTTLE_DOC = "The fixed number by which the "
       + "replication throttle of a broker will be divided by the concurrency adjuster (if enabled for replication throttle) when the "
-      + "broker hosts (At/Under)MinISR partitions with an out-of-sync replica (see "
+      + "broker is behind on (At/Under)MinISR partitions, i.e. its replica of one is out of sync (see "
       + "concurrency.adjuster.replication.throttle.min.isr.check.enabled), or violates any concurrency adjuster limit at two "
       + "consecutive metric-based checks. It is never divided below the throttle needed by the in-progress movements of the broker.";
 
@@ -580,12 +580,12 @@ public final class ExecutorConfig {
       = "concurrency.adjuster.replication.throttle.min.isr.check.enabled";
   public static final boolean DEFAULT_CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED = true;
   public static final String CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_DOC = "Enable the concurrency adjuster "
-      + "(if enabled for replication throttle) to divide the replication throttle of the brokers hosting a replica of an "
-      + "(At/Under)MinISR partition with an out-of-sync replica and without offline replicas by "
+      + "(if enabled for replication throttle) to slow down the brokers that are behind: a broker whose replica of an "
+      + "(At/Under)MinISR partition without offline replicas is out of sync gets its replication throttles divided by "
       + "concurrency.adjuster.multiplicative.decrease.replication.throttle at each check, i.e. every concurrency.adjuster.interval.ms "
-      + "/ concurrency.adjuster.num.min.isr.check. Partitions that are (At/Under)MinISR by their configuration -- all replicas in "
-      + "sync, e.g. a replication factor of 1 or equal to min.insync.replicas -- are ignored, as are the replicas being added by the "
-      + "execution. It only affects the brokers hosting such partitions, never stops the execution, and is independent of "
+      + "/ concurrency.adjuster.num.min.isr.check (never below what its movements need), and no new inter-broker replica movement "
+      + "to or from it starts, until it is back in sync. The other brokers hosting such a partition are not slowed down for it. The "
+      + "replicas being added by the execution are ignored. It never stops the execution, and is independent of "
       + "concurrency.adjuster.min.isr.check.enabled.";
 
   /**

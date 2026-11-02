@@ -993,7 +993,7 @@ public class ConcurrencyAdjusterTest {
   }
 
   @Test
-  public void testBrokersHostingMinIsrPartitions() {
+  public void testBrokersBehindOnMinIsrPartitions() {
     Node[] nodes = new Node[5];
     for (int brokerId = 0; brokerId < nodes.length; brokerId++) {
       nodes[brokerId] = new Node(brokerId, "host" + brokerId, 100);
@@ -1010,33 +1010,30 @@ public class ConcurrencyAdjusterTest {
                                                            new Node[]{nodes[3]}, new Node[]{nodes[4]})),
                                   Collections.emptySet(), Collections.emptySet());
 
-    // TP1 is AtMinISR with an out-of-sync replica: only its brokers are affected -- and the follower throttle of broker 1, whose
-    // replica is the one out of sync, is what that replica catches up with, so it is not decreased.
-    assertEquals(List.of(Set.of(0, 1), Set.of(0)), brokersToBrake(
+    // TP1 is AtMinISR because broker 1's replica is out of sync: only broker 1 is behind. Broker 0, its leader, is not slowed down.
+    assertEquals(Set.of(1), brokersBehind(
         cluster, Map.of(TOPIC1, new MinIsrWithTime((short) 1, MOCK_TIME_MS), TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS)),
         Collections.emptyList()));
-    // TP1 is UnderMinISR with an out-of-sync replica: its brokers are affected. TP2 is AtMinISR by its configuration (replication
-    // factor = minISR, all replicas in sync), and TP3 has an offline replica: both are excluded.
-    assertEquals(List.of(Set.of(0, 1), Set.of(0)), brokersToBrake(
+    // TP1 is UnderMinISR: broker 1 is behind. TP2 is AtMinISR by its configuration (replication factor = minISR, all replicas in
+    // sync), and TP3 has an offline replica: no broker is behind on them.
+    assertEquals(Set.of(1), brokersBehind(
         cluster, Map.of(TOPIC1, new MinIsrWithTime((short) 2, MOCK_TIME_MS), TOPIC2, new MinIsrWithTime((short) 2, MOCK_TIME_MS)),
         Collections.emptyList()));
     // Partitions of topics with unknown minISR are skipped.
-    assertEquals(List.of(Set.of(), Set.of()), brokersToBrake(cluster, Map.of(TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS)),
-                                                             Collections.emptyList()));
-    // Broker 1 is out of sync for TP1, but in sync for TP2 (AtMinISR because broker 2 is out of sync): its follower throttle is
-    // decreased for TP2.
+    assertEquals(Set.of(), brokersBehind(cluster, Map.of(TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS)), Collections.emptyList()));
+    // Broker 1 is behind on TP1, and broker 2 on TP2, which broker 1 leads.
     Cluster twoPartitions = new Cluster("id", Arrays.asList(nodes),
                                         Set.of(new PartitionInfo(TOPIC1, TP1.partition(), nodes[0], new Node[]{nodes[0], nodes[1]},
                                                                  new Node[]{nodes[0]}),
                                                new PartitionInfo(TOPIC2, TP2.partition(), nodes[1], new Node[]{nodes[1], nodes[2]},
                                                                  new Node[]{nodes[1]})),
                                         Collections.emptySet(), Collections.emptySet());
-    assertEquals(List.of(Set.of(0, 1, 2), Set.of(0, 1)), brokersToBrake(
+    assertEquals(Set.of(1, 2), brokersBehind(
         twoPartitions, Map.of(TOPIC1, new MinIsrWithTime((short) 1, MOCK_TIME_MS), TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS)),
         Collections.emptyList()));
 
-    // A partition with a single replica (TP1) is AtMinISR by its configuration: excluded. TP2 on brokers 0, 1 and 2 is AtMinISR
-    // (minISR 2), and its replica on broker 2 is out of sync.
+    // A partition with a single replica (TP1) is AtMinISR by its configuration: no broker behind. TP2 on brokers 0, 1 and 2 is AtMinISR
+    // (minISR 2) because its replica on broker 2 is out of sync.
     cluster = new Cluster("id", Arrays.asList(nodes),
                           Set.of(new PartitionInfo(TOPIC1, TP1.partition(), nodes[4], new Node[]{nodes[4]}, new Node[]{nodes[4]}),
                                  new PartitionInfo(TOPIC2, TP2.partition(), nodes[0], new Node[]{nodes[0], nodes[1], nodes[2]},
@@ -1044,24 +1041,23 @@ public class ConcurrencyAdjusterTest {
                           Collections.emptySet(), Collections.emptySet());
     Map<String, MinIsrWithTime> minIsrByTopic = Map.of(TOPIC1, new MinIsrWithTime((short) 1, MOCK_TIME_MS),
                                                        TOPIC2, new MinIsrWithTime((short) 2, MOCK_TIME_MS));
-    assertEquals(List.of(Set.of(0, 1, 2), Set.of(0, 1)), brokersToBrake(cluster, minIsrByTopic, Collections.emptyList()));
-    // The out-of-sync replica of TP2 is the new replica of an in-progress movement: excluded.
+    assertEquals(Set.of(2), brokersBehind(cluster, minIsrByTopic, Collections.emptyList()));
+    // The out-of-sync replica of TP2 is the new replica of an in-progress movement: it is catching up, not behind.
     ReplicaPlacementInfo[] r = new ReplicaPlacementInfo[]{new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1),
                                                           new ReplicaPlacementInfo(2)};
     ExecutionProposal proposal = new ExecutionProposal(TP2, 0, r[0], List.of(r[0], r[1]), List.of(r[0], r[1], r[2]));
-    assertEquals(List.of(Set.of(), Set.of()), brokersToBrake(
+    assertEquals(Set.of(), brokersBehind(
         cluster, minIsrByTopic, List.of(inProgressTask(0L, proposal, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION))));
-    // ... but not if its movement is not in progress yet.
-    assertEquals(List.of(Set.of(0, 1, 2), Set.of(0, 1)), brokersToBrake(
+    // ... but it is if its movement is not in progress yet.
+    assertEquals(Set.of(2), brokersBehind(
         cluster, minIsrByTopic, List.of(new ExecutionTask(0L, proposal, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, MOCK_TIME_MS))));
-    // TP2 [0, 1] -> [0, 2] in progress, with broker 1's replica (to remove) out of sync: AtMinISR (minISR 1) with an out-of-sync replica.
-    // Only broker 0 hosts an in-sync replica: the follower throttles of brokers 1 and 2 are what their replicas fetch through.
+    // TP2 [0, 1] -> [0, 2] in progress, with broker 1's replica (to remove) out of sync: broker 1 is behind, broker 2 is catching up.
     Cluster moving = new Cluster("id", Arrays.asList(nodes),
                                  Set.of(new PartitionInfo(TOPIC2, TP2.partition(), nodes[0], new Node[]{nodes[0], nodes[1], nodes[2]},
                                                           new Node[]{nodes[0]})),
                                  Collections.emptySet(), Collections.emptySet());
     ExecutionProposal moveOff1 = new ExecutionProposal(TP2, 0, r[0], List.of(r[0], r[1]), List.of(r[0], r[2]));
-    assertEquals(List.of(Set.of(0, 1, 2), Set.of(0)), brokersToBrake(
+    assertEquals(Set.of(1), brokersBehind(
         moving, Map.of(TOPIC2, new MinIsrWithTime((short) 1, MOCK_TIME_MS)),
         List.of(inProgressTask(1L, moveOff1, ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION))));
   }
@@ -1070,15 +1066,12 @@ public class ConcurrencyAdjusterTest {
    * @param cluster Kafka cluster.
    * @param minIsrByTopic MinISR by topic.
    * @param tasks Execution tasks.
-   * @return The brokers whose leader throttle, then those whose follower throttle, the MinISR brake decreases -- see
-   * {@link ExecutionUtils#brokersHostingMinIsrPartitions}.
+   * @return The brokers that are behind on (At/Under)MinISR partitions -- see {@link ExecutionUtils#brokersBehindOnMinIsrPartitions}.
    */
-  private static List<Set<Integer>> brokersToBrake(Cluster cluster, Map<String, MinIsrWithTime> minIsrByTopic,
-                                                   List<ExecutionTask> tasks) {
-    Set<Integer> leaderBrokers = new HashSet<>();
-    Set<Integer> followerBrokers = new HashSet<>();
-    ExecutionUtils.brokersHostingMinIsrPartitions(cluster, minIsrByTopic, tasks, leaderBrokers, followerBrokers);
-    return List.of(leaderBrokers, followerBrokers);
+  private static Set<Integer> brokersBehind(Cluster cluster, Map<String, MinIsrWithTime> minIsrByTopic, List<ExecutionTask> tasks) {
+    Set<Integer> brokersBehind = new HashSet<>();
+    ExecutionUtils.brokersBehindOnMinIsrPartitions(cluster, minIsrByTopic, tasks, brokersBehind);
+    return brokersBehind;
   }
 
   @Test

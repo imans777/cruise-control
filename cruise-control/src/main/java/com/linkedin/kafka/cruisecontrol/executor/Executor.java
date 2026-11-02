@@ -155,6 +155,8 @@ public class Executor {
   private volatile boolean _concurrencyAdjusterMinIsrCheckEnabled;
   private volatile boolean _replicationThrottleAdjusterEnabled;
   private final boolean _replicationThrottleMinIsrCheckEnabled;
+  // The brokers to or from which the ongoing execution starts no new inter-broker replica movement, as of its last check.
+  private volatile Set<Integer> _brokersNotToStartMovementsOn = Collections.emptySet();
   // The maximum age of the last valid broker metrics that replication throttle adjustment falls back to.
   private final long _brokerMetricsWindowMs;
   // The replication throttle helper of the ongoing inter-broker replica movements (if any).
@@ -730,17 +732,16 @@ public class Executor {
     }
 
     /**
-     * Get the brokers whose leader and follower replication throttles should be decreased because they host a replica of an
-     * (At/Under)MinISR partition with an out-of-sync replica and without offline replicas -- see
-     * {@link ExecutionUtils#brokersHostingMinIsrPartitions(Cluster, Map, Collection, Set, Set)}. This check is independent of
-     * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG}, and only affects the brokers hosting such
-     * partitions -- i.e. it never stops the execution. Nothing is populated if
+     * Get the brokers that are behind on an (At/Under)MinISR partition without offline replicas -- see
+     * {@link ExecutionUtils#brokersBehindOnMinIsrPartitions(Cluster, Map, Collection, Set)}: the concurrency adjuster decreases their
+     * replication throttles, and no new inter-broker replica movement to or from them starts, until they are back in sync. This check
+     * is independent of {@link ExecutorConfig#CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG}, and only affects the brokers that are
+     * behind -- i.e. it never stops the execution. Nothing is populated if
      * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG} is disabled.
      *
-     * @param leaderBrokers A set to populate with the brokers whose leader throttle should be decreased.
-     * @param followerBrokers A set to populate with the brokers whose follower throttle should be decreased.
+     * @param brokersBehind A set to populate with the brokers that are behind.
      */
-    private void brokersWithMinIsrPartitionsForThrottle(Set<Integer> leaderBrokers, Set<Integer> followerBrokers) {
+    void brokersBehindForThrottle(Set<Integer> brokersBehind) {
       if (!_replicationThrottleMinIsrCheckEnabled) {
         return;
       }
@@ -748,8 +749,7 @@ public class Executor {
       Set<String> topicsToCheck = new HashSet<>(cluster.topics());
       topicsToCheck.removeAll(_topicMinIsrCache.minIsrWithTimeByTopic().keySet());
       maybeRetrieveAndCacheTopicMinIsr(topicsToCheck);
-      brokersHostingMinIsrPartitions(cluster, _topicMinIsrCache.minIsrWithTimeByTopic(), inExecutionTasks(), leaderBrokers,
-                                     followerBrokers);
+      brokersBehindOnMinIsrPartitions(cluster, _topicMinIsrCache.minIsrWithTimeByTopic(), inExecutionTasks(), brokersBehind);
     }
 
     /**
@@ -1035,9 +1035,8 @@ public class Executor {
      * Adjust the leader and follower replication throttles of the brokers that are throttled by the ongoing inter-broker replica
      * movements. For each such broker:
      * <ul>
-     *   <li>Decrease its throttles multiplicatively if (1) it hosts a replica of an (At/Under)MinISR partition with an out-of-sync
-     *   replica and without offline replicas -- see {@link #brokersWithMinIsrPartitionsForThrottle(Set, Set)}, checked at each run,
-     *   except the follower throttle of a broker whose replica is the one out of sync, or (2) its metrics violate any concurrency
+     *   <li>Decrease its throttles multiplicatively if (1) its replica of an (At/Under)MinISR partition without offline replicas is
+     *   out of sync -- see {@link #brokersBehindForThrottle(Set)}, checked at each run -- or (2) its metrics violate any concurrency
      *   adjuster limit at two consecutive metric-based checks -- the log flush time only while it rises, see
      *   {@link ExecutionUtils#withinReplicationThrottleAdjusterLimit(int, ValuesAndExtrapolations, Map, Map)}.</li>
      *   <li>Leave its throttles unchanged if its metrics or capacity are unavailable -- i.e. neither the current metric window nor
@@ -1067,9 +1066,8 @@ public class Executor {
         return;
       }
 
-      Set<Integer> leaderBrakeBrokers = new HashSet<>();
-      Set<Integer> followerBrakeBrokers = new HashSet<>();
-      brokersWithMinIsrPartitionsForThrottle(leaderBrakeBrokers, followerBrakeBrokers);
+      Set<Integer> brokersBehind = new HashSet<>();
+      brokersBehindForThrottle(brokersBehind);
       ClusterModel clusterCapacity = clusterCapacity(throttledBrokers);
       Map<Integer, ValuesAndExtrapolations> metricsByBrokerId = brokerMetricsForReplicationThrottle();
       Map<TopicPartition, Double> writeRateKBpsByPartition = partitionWriteRatesKBps(_loadMonitor.currentPartitionMetricValues(),
@@ -1173,22 +1171,12 @@ public class Executor {
                                  overLimit ? " (first check over a concurrency adjuster limit)" : "", (long) leaderUse,
                                  (long) followerUse, neededLeaderThrottle, neededFollowerThrottle);
         }
-        // The MinISR brake applies to each direction separately: the follower throttle of a broker whose replica is the one out of
-        // sync is what that replica catches up with -- see ExecutionUtils#brokersHostingMinIsrPartitions.
-        boolean leaderBraked = leaderBrakeBrokers.contains(brokerId);
-        boolean followerBraked = followerBrakeBrokers.contains(brokerId);
-        if (leaderBraked) {
+        // The MinISR brake slows down the broker that is behind, in both directions, never below what its movements need -- see
+        // ExecutionUtils#brokersBehindOnMinIsrPartitions. The other brokers hosting its partitions are not slowed down for it.
+        if (brokersBehind.contains(brokerId)) {
           newLeaderThrottle = decreasedReplicationThrottle(leaderThrottle, neededLeaderThrottle);
-        }
-        if (followerBraked) {
           newFollowerThrottle = decreasedReplicationThrottle(followerThrottle, neededFollowerThrottle);
-        }
-        if (leaderBraked && followerBraked) {
-          reason = "(At/Under)MinISR partitions";
-        } else if (leaderBraked) {
-          reason = String.format("(At/Under)MinISR partitions for the leader throttle, and %s for the follower throttle", reason);
-        } else if (followerBraked) {
-          reason = String.format("(At/Under)MinISR partitions for the follower throttle, and %s for the leader throttle", reason);
+          reason = "its replicas of (At/Under)MinISR partitions being out of sync";
         }
         // Slow start ends at the first sign of stress: a decrease, or a check over a concurrency adjuster limit.
         if (overLimit || newLeaderThrottle < leaderThrottle) {
@@ -1898,6 +1886,37 @@ public class Executor {
    * Note that once the thread for {@link ProposalExecutionRunnable} is submitted for running, the variable
    * _executionTaskManager can only be written within this inner class, but not from the outer Executor class.
    */
+  /**
+   * The brokers to or from which no new inter-broker replica movement starts: while replication throttle adjustment is enabled, the
+   * brokers that are behind on an (At/Under)MinISR partition -- see {@link ConcurrencyAdjuster#brokersBehindForThrottle(Set)} -- so that
+   * a broker whose replicas fall behind gets no more movements until it is back in sync. Their movements stay pending, and start once
+   * they are. A change of these brokers is logged.
+   *
+   * @return The brokers to or from which no new inter-broker replica movement starts.
+   */
+  private Set<Integer> brokersNotToStartMovementsOn() {
+    Set<Integer> brokersBehind = new TreeSet<>();
+    if (_replicationThrottleAdjusterEnabled) {
+      try {
+        _concurrencyAdjuster.brokersBehindForThrottle(brokersBehind);
+      } catch (RuntimeException e) {
+        LOG.warn("Failed to check which brokers are behind on (At/Under)MinISR partitions; not holding back any movement.", e);
+        brokersBehind.clear();
+      }
+    }
+    if (!brokersBehind.equals(_brokersNotToStartMovementsOn)) {
+      if (brokersBehind.isEmpty()) {
+        LOG.info("User task {}: no broker is behind on (At/Under)MinISR partitions anymore; inter-broker replica movements to and from "
+                 + "brokers {} can start again.", _uuid, _brokersNotToStartMovementsOn);
+      } else {
+        LOG.info("User task {}: starting no new inter-broker replica movement to or from brokers {} while their replicas of "
+                 + "(At/Under)MinISR partitions are out of sync.", _uuid, brokersBehind);
+      }
+      _brokersNotToStartMovementsOn = brokersBehind;
+    }
+    return brokersBehind;
+  }
+
   private class ProposalExecutionRunnable implements Runnable {
     private final LoadMonitor _loadMonitor;
     private final Set<Integer> _recentlyDemotedBrokers;
@@ -2149,6 +2168,7 @@ public class Executor {
       // Ensure that sampling mode is adjusted properly to continue collecting partition metrics after execution.
       _loadMonitor.setSamplingMode(ALL);
       _concurrencyAdjuster.clearAdjustment();
+      _brokersNotToStartMovementsOn = Collections.emptySet();
     }
 
     private void updateOngoingExecutionState() {
@@ -2267,7 +2287,7 @@ public class Executor {
       // Exhaust all the pending partition movements.
       while ((partitionsToMove > 0 || !inExecutionTasks().isEmpty()) && _stopSignal.get() == NO_STOP_EXECUTION) {
         // Get tasks to execute.
-        List<ExecutionTask> tasksToExecute = _executionTaskManager.getInterBrokerReplicaMovementTasks();
+        List<ExecutionTask> tasksToExecute = _executionTaskManager.getInterBrokerReplicaMovementTasks(brokersNotToStartMovementsOn());
         LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
 
         AlterPartitionReassignmentsResult result = null;
