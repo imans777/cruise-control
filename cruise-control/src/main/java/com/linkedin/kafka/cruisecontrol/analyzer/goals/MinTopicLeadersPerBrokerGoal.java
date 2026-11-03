@@ -66,6 +66,12 @@ import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.replicaS
  * Neither fails the optimization nor marks this goal as violated: the shortfalls this goal cannot reach are only logged, the
  * same way {@link RackAwareGoal} does not check excluded topics.
  * </p>
+ *
+ * <p>
+ * If {@link BrokerSetAwareGoal} was optimized before this goal (the default order), a topic that it binds to a broker set needs its
+ * minimum only on the eligible brokers of that broker set, and the minimum computed for {@code min.topic.leaders.per.broker=0} is
+ * the topic's leaders divided by the number of those brokers.
+ * </p>
  */
 public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
   private static final Logger LOG = LoggerFactory.getLogger(MinTopicLeadersPerBrokerGoal.class);
@@ -80,6 +86,10 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
   private Set<String> _topicsToEnforce;
   // Topics with a minimum, which this optimization cannot move: not enforced, but never made worse.
   private Set<String> _topicsToHold;
+  // BrokerSetAwareGoal, if it was optimized before this goal in the ongoing optimization, or null.
+  private BrokerSetAwareGoal _brokerSetAwareGoal;
+  // The brokers of the broker set that each topic with a minimum is bound to by BrokerSetAwareGoal (unbound topics are absent).
+  private Map<String, Set<Integer>> _brokerSetByTopic;
 
   public MinTopicLeadersPerBrokerGoal() {
 
@@ -105,6 +115,14 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
   @Override
   public boolean isHardGoal() {
     return true;
+  }
+
+  @Override
+  public boolean optimize(ClusterModel clusterModel, Set<Goal> optimizedGoals, OptimizationOptions optimizationOptions)
+      throws OptimizationFailureException {
+    _brokerSetAwareGoal = optimizedGoals.stream().filter(BrokerSetAwareGoal.class::isInstance).map(BrokerSetAwareGoal.class::cast)
+                                        .findFirst().orElse(null);
+    return super.optimize(clusterModel, optimizedGoals, optimizationOptions);
   }
 
   /**
@@ -171,6 +189,10 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
       // Moving a replica from a non-applicable topic does not violate/affect this goal
       return false;
     }
+    if (!isInBrokerSetOf(topic, replicaToBeRemoved.broker())) {
+      // The broker is outside the broker set of the topic, so it does not need leaders of the topic.
+      return false;
+    }
     int topicLeaderCountOnSourceBroker = replicaToBeRemoved.broker().numLeadersFor(topic);
     return topicLeaderCountOnSourceBroker <= minTopicLeadersPerBroker(topic);
   }
@@ -192,17 +214,22 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
     _mustHaveTopicMinLeadersPerBroker = new HashMap<>();
     _topicsToEnforce = Collections.emptySet();
     _topicsToHold = Collections.emptySet();
+    _brokerSetByTopic = Collections.emptyMap();
     if (mustHaveTopicLeadersPerBroker.isEmpty()) {
       return;
+    }
+    if (_brokerSetAwareGoal != null) {
+      _brokerSetByTopic = _brokerSetAwareGoal.brokersByBoundTopic(mustHaveTopicLeadersPerBroker, clusterModel);
     }
     Map<String, Integer> numLeadersByTopicNames = clusterModel.numLeadersPerTopic(mustHaveTopicLeadersPerBroker);
     Set<Broker> eligibleBrokersForLeadership = eligibleBrokersForLeadership(clusterModel, optimizationOptions);
 
     for (String topicName : mustHaveTopicLeadersPerBroker) {
       int topicNumLeaders = numLeadersByTopicNames.get(topicName);
+      long numEligibleBrokers = eligibleBrokersForLeadership.stream().filter(b -> isInBrokerSetOf(topicName, b)).count();
       _mustHaveTopicMinLeadersPerBroker.put(topicName,
               _balancingConstraint.minTopicLeadersPerBroker() == 0
-                      ? eligibleBrokersForLeadership.isEmpty() ? 0 : topicNumLeaders / eligibleBrokersForLeadership.size()
+                      ? numEligibleBrokers == 0 ? 0 : (int) (topicNumLeaders / numEligibleBrokers)
                       : _balancingConstraint.minTopicLeadersPerBroker());
     }
     _topicsToHold = Collections.unmodifiableSet(topicsToHold(mustHaveTopicLeadersPerBroker, clusterModel, optimizationOptions));
@@ -267,13 +294,14 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
   private void validateEnoughLeaderToDistribute(Map<String, Integer> numLeadersByTopicNames, Set<Broker> eligibleBrokersForLeadership)
       throws OptimizationFailureException {
     for (Map.Entry<String, Integer> numLeadersPerTopic : numLeadersByTopicNames.entrySet()) {
-      int totalMinimumLeaderCount = eligibleBrokersForLeadership.size() * minTopicLeadersPerBroker(numLeadersPerTopic.getKey());
+      int numEligibleBrokers = (int) eligibleBrokersForLeadership.stream().filter(b -> isInBrokerSetOf(numLeadersPerTopic.getKey(), b)).count();
+      int totalMinimumLeaderCount = numEligibleBrokers * minTopicLeadersPerBroker(numLeadersPerTopic.getKey());
       if (numLeadersPerTopic.getValue() < totalMinimumLeaderCount) {
         ProvisionRecommendation recommendation = new ProvisionRecommendation.Builder(ProvisionStatus.UNDER_PROVISIONED)
             .numPartitions(totalMinimumLeaderCount).topicPattern(Pattern.compile(numLeadersPerTopic.getKey())).build();
         throw new OptimizationFailureException(
             String.format("[%s] Cannot distribute %d leaders over %d broker(s) with minimum required per broker leader count %d for topic %s.",
-                          name(), numLeadersPerTopic.getValue(), eligibleBrokersForLeadership.size(),
+                          name(), numLeadersPerTopic.getValue(), numEligibleBrokers,
                           minTopicLeadersPerBroker(numLeadersPerTopic.getKey()), numLeadersPerTopic.getKey()), recommendation);
       }
     }
@@ -351,7 +379,7 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
     for (String topic : _mustHaveTopicMinLeadersPerBroker.keySet()) {
       boolean isHeld = _topicsToHold.contains(topic);
       for (Broker broker : clusterModel.aliveBrokers()) {
-        if (isEligibleToHaveLeaders(broker, optimizationOptions)
+        if (isEligibleToHaveLeaders(broker, optimizationOptions) && isInBrokerSetOf(topic, broker)
             && (isHeld || !canReceiveReplicas(broker, optimizationOptions))
             && broker.numLeadersFor(topic) < minTopicLeadersPerBroker(topic)) {
           brokersBelowMinimumByTopic.computeIfAbsent(topic, t -> new TreeSet<>()).add(broker.id());
@@ -380,6 +408,9 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
         continue;
       }
       for (String mustHaveLeaderPerBrokerTopicName : _topicsToEnforce) {
+        if (!isInBrokerSetOf(mustHaveLeaderPerBrokerTopicName, broker)) {
+          continue;
+        }
         int leaderCount = broker.numLeadersFor(mustHaveLeaderPerBrokerTopicName);
         if (leaderCount < minTopicLeadersPerBroker(mustHaveLeaderPerBrokerTopicName)) {
           throw new OptimizationFailureException(String.format("[%s] Broker %d has insufficient per-broker leaders for topic %s (required: %d "
@@ -412,6 +443,9 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
       return;
     }
     for (String topicMustHaveLeaderPerBroker : _topicsToEnforce) {
+      if (!isInBrokerSetOf(topicMustHaveLeaderPerBroker, broker)) {
+        continue;
+      }
       maybeMoveLeaderOfTopicToBroker(topicMustHaveLeaderPerBroker, broker, clusterModel, optimizedGoals, optimizationOptions);
     }
   }
@@ -520,6 +554,16 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
                        .stream()
                        .filter(broker -> isEligibleToHaveLeaders(broker, optimizationOptions))
                        .collect(Collectors.toSet());
+  }
+
+  /**
+   * @param topic A topic with a minimum number of leaders per broker.
+   * @param broker A broker.
+   * @return {@code true} if the topic is not bound to a broker set by {@link BrokerSetAwareGoal}, or the broker is in that broker set.
+   */
+  private boolean isInBrokerSetOf(String topic, Broker broker) {
+    Set<Integer> brokerSet = _brokerSetByTopic.get(topic);
+    return brokerSet == null || brokerSet.contains(broker.id());
   }
 
   private static boolean isEligibleToHaveLeaders(Broker broker, OptimizationOptions optimizationOptions) {

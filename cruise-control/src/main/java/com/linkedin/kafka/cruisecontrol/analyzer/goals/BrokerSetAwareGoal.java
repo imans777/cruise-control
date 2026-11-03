@@ -11,6 +11,7 @@ import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
 import com.linkedin.kafka.cruisecontrol.exception.BrokerSetResolutionException;
 import com.linkedin.kafka.cruisecontrol.exception.ReplicaToBrokerSetMappingException;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -76,6 +77,12 @@ import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.replicaS
  * {@link com.linkedin.kafka.cruisecontrol.config.TopicPatternBrokerSetMappingPolicy} pin only selected topics to broker sets.
  * </p>
  * <p>
+ * Topics that must have a minimum number of leaders per broker ({@link AnalyzerConfig#TOPICS_WITH_MIN_LEADERS_PER_BROKER_CONFIG})
+ * are kept in their broker set like any other topic when this goal is optimized before {@link MinTopicLeadersPerBrokerGoal}
+ * (the default order): that goal then counts only the brokers of their broker set. If {@link MinTopicLeadersPerBrokerGoal} is
+ * optimized first, it may already have spread their leaders over all brokers, so this goal skips them.
+ * </p>
+ * <p>
  * Supported Optimization Options are:
  * </p>
  * <pre>
@@ -92,6 +99,8 @@ public class BrokerSetAwareGoal extends AbstractGoal {
   private ReplicaToBrokerSetMappingPolicy _replicaToBrokerSetMappingPolicy;
   private Set<String> _excludedTopics;
   private Set<String> _mustHaveTopicLeadersPerBroker;
+  // Whether MinTopicLeadersPerBrokerGoal was optimized before this goal in the ongoing optimization.
+  private boolean _isMinTopicLeadersPerBrokerGoalOptimized;
 
   /**
    * Constructor for Broker Set Aware Goal.
@@ -125,6 +134,13 @@ public class BrokerSetAwareGoal extends AbstractGoal {
    * @param optimizationOptions Options to take into account during optimization.
    */
   @Override
+  public boolean optimize(ClusterModel clusterModel, Set<Goal> optimizedGoals, OptimizationOptions optimizationOptions)
+      throws OptimizationFailureException {
+    _isMinTopicLeadersPerBrokerGoalOptimized = optimizedGoals.stream().anyMatch(MinTopicLeadersPerBrokerGoal.class::isInstance);
+    return super.optimize(clusterModel, optimizedGoals, optimizationOptions);
+  }
+
+  @Override
   protected void initGoalState(ClusterModel clusterModel, OptimizationOptions optimizationOptions) throws OptimizationFailureException {
     // This is used to identify brokers not excluded for replica moves.
     final HashSet<Integer> brokersAllowedReplicaMove = GoalUtils.aliveBrokersNotExcludedForReplicaMove(clusterModel, optimizationOptions);
@@ -141,7 +157,8 @@ public class BrokerSetAwareGoal extends AbstractGoal {
     // Whether the {@link com.linkedin.kafka.cruisecontrol.model.SortedReplicas} tracks only leader replicas or all replicas.
     boolean tracksOnlyLeaderReplicas = false;
 
-    _mustHaveTopicLeadersPerBroker = Collections.unmodifiableSet(
+    // Topics with a minimum number of leaders per broker are skipped only if MinTopicLeadersPerBrokerGoal was optimized first.
+    _mustHaveTopicLeadersPerBroker = !_isMinTopicLeadersPerBrokerGoalOptimized ? Collections.emptySet() : Collections.unmodifiableSet(
         Utils.getTopicNamesMatchedWithPattern(_balancingConstraint.topicsWithMinLeadersPerBrokerPattern(), clusterModel::topics));
     _excludedTopics = Stream.of(
         _mustHaveTopicLeadersPerBroker, optimizationOptions.excludedTopics()).flatMap(Set::stream).collect(Collectors.toUnmodifiableSet());
@@ -168,8 +185,47 @@ public class BrokerSetAwareGoal extends AbstractGoal {
   }
 
   /**
-   * Topics that must have a minimum number of leaders per broker are excluded from this goal. Warn once per optimization if
-   * the mapping policy binds any of these topics to a broker set, since that binding is not enforced.
+   * The brokers that each of the given topics is bound to by the last optimization of this goal: the brokers of the broker set that
+   * every replica of the topic maps to. A topic that this goal skipped (e.g. an excluded topic), whose replicas are unbound, or whose
+   * replicas map to different broker sets, is left out. Used by {@link MinTopicLeadersPerBrokerGoal} when this goal was optimized
+   * before it.
+   *
+   * @param topics Topics to look up.
+   * @param clusterModel The state of the cluster.
+   * @return Broker ids of the broker set by bound topic.
+   */
+  Map<String, Set<Integer>> brokersByBoundTopic(Set<String> topics, ClusterModel clusterModel) {
+    Map<String, Set<Integer>> brokersByBoundTopic = new HashMap<>();
+    if (_excludedTopics == null || _brokersByBrokerSet == null) {
+      return brokersByBoundTopic;
+    }
+    for (Map.Entry<String, List<Partition>> partitionsByTopic : clusterModel.getPartitionsByTopic().entrySet()) {
+      String topic = partitionsByTopic.getKey();
+      if (!topics.contains(topic) || _excludedTopics.contains(topic)) {
+        continue;
+      }
+      Set<String> brokerSetIds = new HashSet<>();
+      try {
+        for (Partition partition : partitionsByTopic.getValue()) {
+          for (Replica replica : partition.replicas()) {
+            brokerSetIds.add(_replicaToBrokerSetMappingPolicy.brokerSetIdForReplica(replica, clusterModel, _brokerSetResolutionHelper));
+          }
+        }
+      } catch (BrokerSetResolutionException | ReplicaToBrokerSetMappingException e) {
+        LOG.debug("[{}] Failed to map topic {} to a broker set.", name(), topic, e);
+        continue;
+      }
+      if (brokerSetIds.size() == 1 && !brokerSetIds.contains(null) && _brokersByBrokerSet.containsKey(brokerSetIds.iterator().next())) {
+        brokersByBoundTopic.put(topic, Collections.unmodifiableSet(_brokersByBrokerSet.get(brokerSetIds.iterator().next())));
+      }
+    }
+    return brokersByBoundTopic;
+  }
+
+  /**
+   * If {@link MinTopicLeadersPerBrokerGoal} was optimized before this goal, topics that must have a minimum number of leaders per
+   * broker are excluded from this goal. Warn once per optimization if the mapping policy binds any of these topics to a broker set,
+   * since that binding is not enforced.
    *
    * @param clusterModel The state of the cluster.
    */
@@ -194,8 +250,9 @@ public class BrokerSetAwareGoal extends AbstractGoal {
       }
     }
     if (!pinnedTopics.isEmpty()) {
-      LOG.warn("[{}] Topics {} are mapped to a broker set but are excluded from this goal because they match {}.", name(), pinnedTopics,
-               AnalyzerConfig.TOPICS_WITH_MIN_LEADERS_PER_BROKER_CONFIG);
+      LOG.warn("[{}] Topics {} are mapped to a broker set but are excluded from this goal because they match {} and {} is optimized"
+               + " before this goal. Put this goal first to keep them in their broker set.", name(), pinnedTopics,
+               AnalyzerConfig.TOPICS_WITH_MIN_LEADERS_PER_BROKER_CONFIG, MinTopicLeadersPerBrokerGoal.class.getSimpleName());
     }
   }
 
@@ -350,9 +407,8 @@ public class BrokerSetAwareGoal extends AbstractGoal {
    */
   @Override
   public ActionAcceptance actionAcceptance(BalancingAction action, ClusterModel clusterModel) {
-    // This block is introduced to accept any offline replicas moved by MinTopicLeadersPerBrokerGoal.
-    // If MinTopicLeadersPerBrokerGoal used with BrokerSetAwareGoal, the topics that are required to have a minimum leader per broker by
-    // MinTopicLeadersPerBrokerGoal, should be excluded from BrokerSetAwareGoal.
+    // If MinTopicLeadersPerBrokerGoal was optimized before this goal, it may have spread the leaders of the topics that are required to
+    // have a minimum number of leaders per broker over all brokers, so this goal accepts any action on them.
     if (_mustHaveTopicLeadersPerBroker.contains(action.topic())) {
       return ACCEPT;
     }

@@ -170,18 +170,61 @@ public class BrokerSetAwareGoalTest {
   }
 
   /**
-   * A pinned topic that must have a minimum number of leaders per broker is neither moved nor checked.
+   * A pinned topic that must have a minimum number of leaders per broker is kept in its broker set when this goal comes first.
    */
   @Test
   public void testPinnedTopicWithMinLeadersPerBroker() throws Exception {
     ClusterModel clusterModel = DeterministicCluster.brokerSetTopicPatternSatisfiable();
-    Map<TopicPartition, List<ReplicaPlacementInfo>> hotDistribution = distribution(clusterModel, TOPIC_HOT);
     Properties props = new Properties();
     props.setProperty(AnalyzerConfig.TOPICS_WITH_MIN_LEADERS_PER_BROKER_CONFIG, TOPIC_HOT);
 
     assertTrue(optimize(clusterModel, NO_OPTIONS, new BrokerSetAwareGoal(constraint(props))));
 
+    for (TopicPartition tp : distribution(clusterModel, TOPIC_HOT).keySet()) {
+      assertTrue(FAST_BROKERS.containsAll(partitionBrokerIds(clusterModel, tp)));
+    }
+  }
+
+  /**
+   * A pinned topic that must have a minimum number of leaders per broker is neither moved nor checked if
+   * MinTopicLeadersPerBrokerGoal was optimized first: it may have spread the topic's leaders over all brokers.
+   */
+  @Test
+  public void testPinnedTopicWithMinLeadersPerBrokerAfterMinTopicLeadersGoal() throws Exception {
+    ClusterModel clusterModel = DeterministicCluster.brokerSetTopicPatternSatisfiable();
+    Map<TopicPartition, List<ReplicaPlacementInfo>> hotDistribution = distribution(clusterModel, TOPIC_HOT);
+    Properties props = new Properties();
+    props.setProperty(AnalyzerConfig.TOPICS_WITH_MIN_LEADERS_PER_BROKER_CONFIG, TOPIC_HOT);
+    props.setProperty(AnalyzerConfig.MIN_TOPIC_LEADERS_PER_BROKER_CONFIG, "0");
+    MinTopicLeadersPerBrokerGoal minTopicLeadersGoal = new MinTopicLeadersPerBrokerGoal(constraint(props));
+    Set<Goal> optimizedGoals = new HashSet<>(Set.of(minTopicLeadersGoal));
+
+    assertTrue(new BrokerSetAwareGoal(constraint(props)).optimize(clusterModel, optimizedGoals, NO_OPTIONS));
+
     assertEquals(hotDistribution, distribution(clusterModel, TOPIC_HOT));
+  }
+
+  /**
+   * With this goal first, MinTopicLeadersPerBrokerGoal counts only the brokers of the pinned topic's broker set: "hot" needs
+   * 4 leaders / 3 brokers = 1 leader on each of brokers 1, 2 and 3, and none on the unlisted broker 0. Counting all four brokers,
+   * broker 0 would need a leader that this goal never lets it have, and the optimization would fail.
+   */
+  @Test
+  public void testMinTopicLeadersCountsOnlyThePinnedBrokerSet() throws Exception {
+    ClusterModel clusterModel = DeterministicCluster.brokerSetTopicPatternSatisfiable();
+    Properties props = new Properties();
+    props.setProperty(AnalyzerConfig.TOPICS_WITH_MIN_LEADERS_PER_BROKER_CONFIG, TOPIC_HOT);
+    props.setProperty(AnalyzerConfig.MIN_TOPIC_LEADERS_PER_BROKER_CONFIG, "0");
+
+    assertTrue(optimize(clusterModel, NO_OPTIONS, new BrokerSetAwareGoal(constraint(props)), new MinTopicLeadersPerBrokerGoal(constraint(props))));
+
+    for (TopicPartition tp : distribution(clusterModel, TOPIC_HOT).keySet()) {
+      assertTrue(FAST_BROKERS.containsAll(partitionBrokerIds(clusterModel, tp)));
+    }
+    for (int brokerId : FAST_BROKERS) {
+      assertTrue("broker " + brokerId, clusterModel.broker(brokerId).numLeadersFor(TOPIC_HOT) >= 1);
+    }
+    assertEquals(0, clusterModel.broker(0).numLeadersFor(TOPIC_HOT));
   }
 
   /**
