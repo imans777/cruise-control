@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
+import java.util.function.Predicate;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.utils.Time;
@@ -106,12 +107,24 @@ public class ExecutionTaskManager {
    * @return A list of execution tasks that move the replicas cross brokers, none of which moves a replica to or from the given brokers.
    */
   synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks(ReplicationThrottleBudget budget, Set<Integer> brokersToHoldBack) {
+    return getInterBrokerReplicaMovementTasks(budget, brokersToHoldBack, task -> true);
+  }
+
+  /**
+   * @param budget The replication throttle budget of brokers, or {@code null} to ignore the replication throttle.
+   * @param brokersToHoldBack Brokers to or from which no new replica movement is to start, e.g. because their replicas fall behind.
+   * @param canStart Whether a movement that complies with the other constraints can start, see
+   * {@link ExecutionTaskPlanner#getInterBrokerReplicaMovementTasks(Map, Set, int, ReplicationThrottleBudget, Predicate)}.
+   * @return A list of execution tasks that move the replicas cross brokers, none of which moves a replica to or from the given brokers.
+   */
+  synchronized List<ExecutionTask> getInterBrokerReplicaMovementTasks(ReplicationThrottleBudget budget, Set<Integer> brokersToHoldBack,
+                                                                      Predicate<ExecutionTask> canStart) {
     Map<Integer, Integer> brokersReadyForReplicaMovement = brokersReadyForReplicaMovement(_inProgressInterBrokerReplicaMovementsByBrokerId,
                                                                                           ConcurrencyType.INTER_BROKER_REPLICA);
     brokersToHoldBack.forEach(brokerId -> brokersReadyForReplicaMovement.replace(brokerId, 0));
     return _executionTaskPlanner.getInterBrokerReplicaMovementTasks(
         brokersReadyForReplicaMovement, _inProgressPartitionsForInterBrokerMovement,
-        _executionConcurrencyManager.maxClusterInterBrokerPartitionMovements(), budget);
+        _executionConcurrencyManager.maxClusterInterBrokerPartitionMovements(), budget, canStart);
   }
 
   /**
@@ -130,6 +143,15 @@ public class ExecutionTaskManager {
    * @return A list of execution tasks that move the replicas cross disks of the same broker.
    */
   public synchronized List<ExecutionTask> getIntraBrokerReplicaMovementTasks() {
+    return getIntraBrokerReplicaMovementTasks(task -> true);
+  }
+
+  /**
+   * @param canStart Whether a movement that complies with the concurrency constraint can start, see
+   * {@link ExecutionTaskPlanner#getIntraBrokerReplicaMovementTasks(Map, Predicate)}.
+   * @return A list of execution tasks that move the replicas cross disks of the same broker.
+   */
+  public synchronized List<ExecutionTask> getIntraBrokerReplicaMovementTasks(Predicate<ExecutionTask> canStart) {
     Map<Integer, Integer> brokersReadyForReplicaMovement = brokersReadyForReplicaMovement(_inProgressIntraBrokerReplicaMovementsByBrokerId,
                                                                                           ConcurrencyType.INTRA_BROKER_REPLICA);
     if (_intraBrokerMovementsBrokerByBroker) {
@@ -137,7 +159,7 @@ public class ExecutionTaskManager {
       brokersReadyForReplicaMovement.keySet().retainAll(activeBroker == null ? Collections.emptySet()
                                                                              : Collections.singleton(activeBroker));
     }
-    return _executionTaskPlanner.getIntraBrokerReplicaMovementTasks(brokersReadyForReplicaMovement);
+    return _executionTaskPlanner.getIntraBrokerReplicaMovementTasks(brokersReadyForReplicaMovement, canStart);
   }
 
   /**
@@ -195,6 +217,20 @@ public class ExecutionTaskManager {
     });
 
     return readyBrokers;
+  }
+
+  /**
+   * @return Inter-broker replica movement tasks that are yet to start.
+   */
+  public synchronized Set<ExecutionTask> remainingInterBrokerReplicaMovements() {
+    return new HashSet<>(_executionTaskPlanner.remainingInterBrokerReplicaMovements());
+  }
+
+  /**
+   * @return Intra-broker replica movement tasks that are yet to start.
+   */
+  public synchronized Set<ExecutionTask> remainingIntraBrokerReplicaMovements() {
+    return new HashSet<>(_executionTaskPlanner.remainingIntraBrokerReplicaMovements());
   }
 
   /**
