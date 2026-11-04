@@ -14,10 +14,14 @@ import com.linkedin.kafka.cruisecontrol.common.TestConstants;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutorState;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.DemoteBrokerParameters;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.easymock.EasyMock;
 import org.junit.Test;
@@ -56,14 +60,32 @@ public class DemoteBrokerRunnableTest {
     assertEquals(FOLLOWER_BROKER_ID, clusterModel.partition(T1P0).leader().broker().id());
   }
 
+  @Test
+  public void testDemoteKeepsLeadershipWithoutInSyncFollower() throws Exception {
+    // The follower of T1-0 is not in sync, so Kafka cannot elect it: the leadership of T1-0 is expected to stay on the demoted
+    // broker even though skip_urp_demotion is false. T2-0 is in sync and is expected to be demoted.
+    ClusterModel clusterModel = demote(null, Collections.emptySet(), Collections.singleton(T1P0));
+
+    assertEquals(DEMOTED_BROKER_ID, clusterModel.partition(T1P0).leader().broker().id());
+    assertEquals(FOLLOWER_BROKER_ID, clusterModel.partition(T2P0).leader().broker().id());
+  }
+
+  private static ClusterModel demote(Pattern requestedExcludedTopics, Set<String> resolvedExcludedTopics) throws Exception {
+    return demote(requestedExcludedTopics, resolvedExcludedTopics, Collections.emptySet());
+  }
+
   /**
-   * Run a dry-run demotion of {@link #DEMOTED_BROKER_ID} for a user request with the given excluded topics.
+   * Run a dry-run demotion of {@link #DEMOTED_BROKER_ID} with skip_urp_demotion=false for a user request with the given
+   * excluded topics.
    *
    * @param requestedExcludedTopics The excluded_topics pattern in the request, or {@code null} if the request does not specify it.
    * @param resolvedExcludedTopics The excluded topics that Cruise Control resolves for the given pattern.
+   * @param partitionsWithLaggingFollower Partitions whose follower on {@link #FOLLOWER_BROKER_ID} is not in sync.
    * @return The cluster model after the demotion.
    */
-  private static ClusterModel demote(Pattern requestedExcludedTopics, Set<String> resolvedExcludedTopics) throws Exception {
+  private static ClusterModel demote(Pattern requestedExcludedTopics,
+                                     Set<String> resolvedExcludedTopics,
+                                     Set<TopicPartition> partitionsWithLaggingFollower) throws Exception {
     ClusterModel clusterModel = clusterModel();
 
     DemoteBrokerParameters parameters = EasyMock.niceMock(DemoteBrokerParameters.class);
@@ -71,9 +93,11 @@ public class DemoteBrokerRunnableTest {
     EasyMock.expect(parameters.brokerIds()).andReturn(Collections.singleton(DEMOTED_BROKER_ID)).anyTimes();
     EasyMock.expect(parameters.brokerIdAndLogdirs()).andReturn(Collections.emptyMap()).anyTimes();
     EasyMock.expect(parameters.excludedTopics()).andReturn(requestedExcludedTopics).anyTimes();
+    EasyMock.expect(parameters.skipUrpDemotion()).andReturn(false).anyTimes();
 
     KafkaCruiseControl kafkaCruiseControl = EasyMock.mock(KafkaCruiseControl.class);
     kafkaCruiseControl.sanityCheckDryRun(true, false);
+    EasyMock.expect(kafkaCruiseControl.kafkaCluster()).andReturn(cluster(partitionsWithLaggingFollower));
     EasyMock.expect(kafkaCruiseControl.acquireForModelGeneration(EasyMock.anyObject())).andReturn(null);
     kafkaCruiseControl.sanityCheckBrokerPresence(Collections.singleton(DEMOTED_BROKER_ID));
     EasyMock.expect(kafkaCruiseControl.clusterModel(EasyMock.anyObject(), EasyMock.eq(false), EasyMock.anyObject()))
@@ -102,6 +126,22 @@ public class DemoteBrokerRunnableTest {
 
     EasyMock.verify(parameters, kafkaCruiseControl, optimizerResult);
     return clusterModel;
+  }
+
+  /**
+   * @param partitionsWithLaggingFollower Partitions whose follower on {@link #FOLLOWER_BROKER_ID} is not in sync.
+   * @return The Kafka cluster of {@link #clusterModel()}: T1-0 and T2-0 led by {@link #DEMOTED_BROKER_ID}, with a follower
+   * on {@link #FOLLOWER_BROKER_ID}.
+   */
+  private static Cluster cluster(Set<TopicPartition> partitionsWithLaggingFollower) {
+    Node leader = new Node(DEMOTED_BROKER_ID, "h" + DEMOTED_BROKER_ID, 100);
+    Node follower = new Node(FOLLOWER_BROKER_ID, "h" + FOLLOWER_BROKER_ID, 100);
+    List<PartitionInfo> partitions = new ArrayList<>();
+    for (TopicPartition tp : List.of(T1P0, T2P0)) {
+      Node[] isr = partitionsWithLaggingFollower.contains(tp) ? new Node[]{leader} : new Node[]{leader, follower};
+      partitions.add(new PartitionInfo(tp.topic(), tp.partition(), leader, new Node[]{leader, follower}, isr));
+    }
+    return new Cluster("id", List.of(leader, follower), partitions, Collections.emptySet(), Collections.emptySet());
   }
 
   /**

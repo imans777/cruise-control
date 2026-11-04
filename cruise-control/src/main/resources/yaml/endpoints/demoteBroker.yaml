@@ -48,7 +48,7 @@ DemoteBrokerEndpoint:
           default: false
       - name: skip_urp_demotion
         in: query
-        description: Whether to operate on partitions which are currently under-replicated.
+        description: Whether to skip partitions which are currently under-replicated. If false, the leadership of such a partition moves only to an in-sync replica, and a partition without one is skipped.
         schema:
           type: boolean
           default: true

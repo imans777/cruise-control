@@ -123,10 +123,11 @@ public class DemoteBrokerRunnable extends GoalBasedOperationRunnable {
     _kafkaCruiseControl.sanityCheckDryRun(_dryRun, _stopOngoingExecution);
     _goalsByPriority = new ArrayList<>(1);
     // Honor the excluded topics only if they are explicitly requested. Otherwise, all topics are demoted -- i.e. the topics
-    // excluded from partition movement by config are not excluded from demotion.
+    // excluded from partition movement by config are not excluded from demotion. The Kafka cluster is always provided, so
+    // that the leadership of a demoted partition moves only to an in-sync replica.
     _goalsByPriority.add(new PreferredLeaderElectionGoal(_skipUrpDemotion,
                                                          _excludeFollowerDemotion,
-                                                         _skipUrpDemotion ? _kafkaCruiseControl.kafkaCluster() : null,
+                                                         _kafkaCruiseControl.kafkaCluster(),
                                                          _excludedTopics != null));
 
     _operationProgress = _future.operationProgress();
