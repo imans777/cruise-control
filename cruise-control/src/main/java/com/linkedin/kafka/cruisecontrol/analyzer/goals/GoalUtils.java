@@ -21,6 +21,7 @@ import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
 import com.linkedin.kafka.cruisecontrol.model.Disk;
 import com.linkedin.kafka.cruisecontrol.model.Replica;
+import com.linkedin.kafka.cruisecontrol.model.ReplicaSortFunctionFactory;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -415,6 +416,38 @@ public final class GoalUtils {
       diskIORate += replicaDiskIORate(replica, readWeight);
     }
     return diskIORate;
+  }
+
+  /**
+   * @param disk Disk to check.
+   * @return {@code true} if replicas may stay on and be moved to the disk, i.e. the disk is alive and not marked for removal
+   * (see {@link Disk#isMarkedForRemoval()}), {@code false} otherwise.
+   */
+  public static boolean isAliveAndNotMarkedForRemoval(Disk disk) {
+    return disk.isAlive() && !disk.isMarkedForRemoval();
+  }
+
+  /**
+   * @param clusterModel The state of the cluster.
+   * @return The alive brokers that have a disk marked for removal (see {@link Disk#isMarkedForRemoval()}).
+   */
+  public static SortedSet<Broker> brokersWithDisksToRemove(ClusterModel clusterModel) {
+    SortedSet<Broker> brokers = new TreeSet<>(clusterModel.aliveBrokers());
+    brokers.removeIf(broker -> broker.disks().stream().noneMatch(Disk::isMarkedForRemoval));
+    return brokers;
+  }
+
+  /**
+   * Check whether the optimization is a disk removal, i.e. some disks are marked for removal (see {@link Disk#isMarkedForRemoval()}).
+   * A disk removal only moves the replicas of the disks to remove, to the other disks of their brokers: once these disks are emptied,
+   * the other intra-broker goals only move those replicas again (see {@link ReplicaSortFunctionFactory#selectReplicasOfDisksToRemove()}),
+   * and only balance their brokers.
+   *
+   * @param clusterModel The state of the cluster.
+   * @return {@code true} if the cluster has a disk marked for removal, {@code false} otherwise.
+   */
+  public static boolean isRemovingDisks(ClusterModel clusterModel) {
+    return !brokersWithDisksToRemove(clusterModel).isEmpty();
   }
 
   /**
