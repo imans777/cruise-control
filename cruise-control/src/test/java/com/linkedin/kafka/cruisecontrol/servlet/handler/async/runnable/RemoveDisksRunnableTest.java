@@ -13,6 +13,7 @@ import com.linkedin.kafka.cruisecontrol.analyzer.GoalOptimizer;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizerResult;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.Goal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskCapacityGoal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskIORateDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.IntraBrokerDiskUsageDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.common.TestConstants;
@@ -233,6 +234,35 @@ public class RemoveDisksRunnableTest {
     result.goalProposals().forEach(proposal -> logdirByReplica.put(proposal.topicPartition(),
                                                                    proposal.replicasToMoveBetweenDisksByBroker().get(0).logdir()));
     assertEquals(Map.of(largest, LOGDIR2, medium, LOGDIR1, smallest, LOGDIR1), logdirByReplica);
+  }
+
+  @Test
+  public void testPlacesTheReplicasOfTheRemovedDisksByDiskIORate() throws Exception {
+    Properties props = KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties();
+    props.setProperty(AnalyzerConfig.INTRA_BROKER_GOALS_CONFIG, IntraBrokerDiskCapacityGoal.class.getName() + ","
+                                                                + IntraBrokerDiskIORateDistributionGoal.class.getName());
+    KafkaCruiseControlConfig config = new KafkaCruiseControlConfig(props);
+    // The disk to remove has two large replicas with little traffic and two small hot ones. By room alone, both hot replicas go to
+    // the same remaining disk: the largest goes to one disk, then the other three to the other disk, which has more room left.
+    ClusterModel clusterModel = new ClusterModel(new ModelGeneration(0, 0L), 1.0);
+    createBroker(clusterModel, 0, brokerCapacity(Map.of(LOGDIR0, DISK_CAPACITY, LOGDIR1, DISK_CAPACITY, LOGDIR2, DISK_CAPACITY)));
+    createReplica(clusterModel, 0, new TopicPartition("cold", 0), LOGDIR0, 1.0, 0.3 * DISK_CAPACITY);
+    createReplica(clusterModel, 0, new TopicPartition("cold", 1), LOGDIR0, 1.0, 0.25 * DISK_CAPACITY);
+    Set<TopicPartition> hotReplicas = Set.of(new TopicPartition("hot", 0), new TopicPartition("hot", 1));
+    createReplica(clusterModel, 0, new TopicPartition("hot", 0), LOGDIR0, 100.0, 0.04 * DISK_CAPACITY);
+    createReplica(clusterModel, 0, new TopicPartition("hot", 1), LOGDIR0, 100.0, 0.03 * DISK_CAPACITY);
+
+    OptimizerResult result = removeDisks(config, clusterModel, Collections.singletonMap(0, Collections.singleton(LOGDIR0)),
+                                         Collections.emptySet());
+
+    // IntraBrokerDiskIORateDistributionGoal moves one hot replica on to the other disk. The removed disk, with no replica left, does not
+    // count in the average disk I/O rate of the broker, so the remaining disks are balanced.
+    assertEquals(4, result.goalProposals().size());
+    Map<String, Integer> numHotReplicasByLogdir = new HashMap<>();
+    result.goalProposals().stream().filter(proposal -> hotReplicas.contains(proposal.topicPartition()))
+          .forEach(proposal -> numHotReplicasByLogdir.merge(proposal.replicasToMoveBetweenDisksByBroker().get(0).logdir(), 1, Integer::sum));
+    assertEquals(Map.of(LOGDIR1, 1, LOGDIR2, 1), numHotReplicasByLogdir);
+    assertEquals(Collections.emptySet(), result.violatedGoalsAfterOptimization());
   }
 
   @Test
@@ -488,6 +518,13 @@ public class RemoveDisksRunnableTest {
     String rack = Integer.toString(brokerId);
     clusterModel.createRack(rack);
     clusterModel.createBroker(rack, rack, brokerId, capacity, true);
+  }
+
+  private static void createReplica(ClusterModel clusterModel, int brokerId, TopicPartition tp, String logdir, double nwIn,
+                                    double diskMB) {
+    String rack = Integer.toString(brokerId);
+    clusterModel.createReplica(rack, brokerId, tp, 0, true, false, logdir, false);
+    clusterModel.setReplicaLoad(rack, brokerId, tp, getAggregatedMetricValues(1.0, nwIn, 0.0, diskMB), Collections.singletonList(1L));
   }
 
   private static void createReplica(ClusterModel clusterModel, int brokerId, TopicPartition tp, String logdir, double diskMB) {
