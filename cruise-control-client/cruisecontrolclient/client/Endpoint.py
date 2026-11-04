@@ -242,6 +242,7 @@ class DemoteBrokerEndpoint(AbstractEndpoint):
         CCParameter.ExcludeFollowerDemotionParameter,
         CCParameter.ExcludeRecentlyDemotedBrokersParameter,
         CCParameter.ExcludedTopicsParameter,
+        CCParameter.IncludedTopicsParameter,
         CCParameter.JSONParameter,
         CCParameter.ReasonParameter,
         CCParameter.ReplicaMovementStrategiesParameter,

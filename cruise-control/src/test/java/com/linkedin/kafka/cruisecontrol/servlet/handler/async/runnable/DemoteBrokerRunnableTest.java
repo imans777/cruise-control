@@ -61,6 +61,15 @@ public class DemoteBrokerRunnableTest {
   }
 
   @Test
+  public void testDemoteWithIncludedTopics() throws Exception {
+    // With included_topics, the topics that do not match it are excluded: T2 is expected to stay on the demoted broker.
+    ClusterModel clusterModel = demote(null, Pattern.compile(T1), Collections.singleton(T2), Collections.emptySet());
+
+    assertEquals(DEMOTED_BROKER_ID, clusterModel.partition(T2P0).leader().broker().id());
+    assertEquals(FOLLOWER_BROKER_ID, clusterModel.partition(T1P0).leader().broker().id());
+  }
+
+  @Test
   public void testDemoteKeepsLeadershipWithoutInSyncFollower() throws Exception {
     // The follower of T1-0 is not in sync, so Kafka cannot elect it: the leadership of T1-0 is expected to stay on the demoted
     // broker even though skip_urp_demotion is false. T2-0 is in sync and is expected to be demoted.
@@ -71,7 +80,13 @@ public class DemoteBrokerRunnableTest {
   }
 
   private static ClusterModel demote(Pattern requestedExcludedTopics, Set<String> resolvedExcludedTopics) throws Exception {
-    return demote(requestedExcludedTopics, resolvedExcludedTopics, Collections.emptySet());
+    return demote(requestedExcludedTopics, null, resolvedExcludedTopics, Collections.emptySet());
+  }
+
+  private static ClusterModel demote(Pattern requestedExcludedTopics,
+                                     Set<String> resolvedExcludedTopics,
+                                     Set<TopicPartition> partitionsWithLaggingFollower) throws Exception {
+    return demote(requestedExcludedTopics, null, resolvedExcludedTopics, partitionsWithLaggingFollower);
   }
 
   /**
@@ -79,11 +94,13 @@ public class DemoteBrokerRunnableTest {
    * excluded topics.
    *
    * @param requestedExcludedTopics The excluded_topics pattern in the request, or {@code null} if the request does not specify it.
-   * @param resolvedExcludedTopics The excluded topics that Cruise Control resolves for the given pattern.
+   * @param requestedIncludedTopics The included_topics pattern in the request, or {@code null} if the request does not specify it.
+   * @param resolvedExcludedTopics The excluded topics that Cruise Control resolves for the given patterns.
    * @param partitionsWithLaggingFollower Partitions whose follower on {@link #FOLLOWER_BROKER_ID} is not in sync.
    * @return The cluster model after the demotion.
    */
   private static ClusterModel demote(Pattern requestedExcludedTopics,
+                                     Pattern requestedIncludedTopics,
                                      Set<String> resolvedExcludedTopics,
                                      Set<TopicPartition> partitionsWithLaggingFollower) throws Exception {
     ClusterModel clusterModel = clusterModel();
@@ -93,6 +110,7 @@ public class DemoteBrokerRunnableTest {
     EasyMock.expect(parameters.brokerIds()).andReturn(Collections.singleton(DEMOTED_BROKER_ID)).anyTimes();
     EasyMock.expect(parameters.brokerIdAndLogdirs()).andReturn(Collections.emptyMap()).anyTimes();
     EasyMock.expect(parameters.excludedTopics()).andReturn(requestedExcludedTopics).anyTimes();
+    EasyMock.expect(parameters.includedTopics()).andReturn(requestedIncludedTopics).anyTimes();
     EasyMock.expect(parameters.skipUrpDemotion()).andReturn(false).anyTimes();
 
     KafkaCruiseControl kafkaCruiseControl = EasyMock.mock(KafkaCruiseControl.class);
@@ -104,8 +122,11 @@ public class DemoteBrokerRunnableTest {
             .andReturn(clusterModel);
     EasyMock.expect(kafkaCruiseControl.executorState())
             .andReturn(ExecutorState.noTaskInProgress(Collections.emptySet(), Collections.emptySet()));
-    EasyMock.expect(kafkaCruiseControl.excludedTopics(EasyMock.eq(clusterModel), EasyMock.eq(requestedExcludedTopics)))
-            .andReturn(resolvedExcludedTopics);
+    if (requestedIncludedTopics == null) {
+      // With included_topics, the excluded topics are the topics of the cluster model that do not match it.
+      EasyMock.expect(kafkaCruiseControl.excludedTopics(EasyMock.eq(clusterModel), EasyMock.eq(requestedExcludedTopics)))
+              .andReturn(resolvedExcludedTopics);
+    }
     OptimizerResult optimizerResult = EasyMock.niceMock(OptimizerResult.class);
     // Apply the goals of the demotion to the cluster model.
     EasyMock.expect(kafkaCruiseControl.optimizations(EasyMock.eq(clusterModel), EasyMock.anyObject(), EasyMock.anyObject(),

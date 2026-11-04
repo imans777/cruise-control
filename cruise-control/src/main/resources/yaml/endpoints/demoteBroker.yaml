@@ -65,6 +65,14 @@ DemoteBrokerEndpoint:
           type: string # topics regex
           default: null
           example: "__CruiseControl.%2A"
+      - name: included_topics
+        in: query
+        description: Specify the only topics whose partitions are demoted. The leadership and replica order of the other topics stay
+          unchanged. Mutually exclusive with excluded_topics.
+        schema:
+          type: string # topics regex
+          default: null
+          example: "topic1|topic2"
       - name: verbose
         in: query
         description: Return detailed state information.
