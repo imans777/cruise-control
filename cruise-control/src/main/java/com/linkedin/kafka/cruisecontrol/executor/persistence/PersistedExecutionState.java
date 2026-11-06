@@ -65,6 +65,7 @@ public final class PersistedExecutionState {
   private final Long _replicationThrottle;
   private final boolean _kafkaAssignerMode;
   private final boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+  private final PersistedUserTask _userTask;
   private final boolean _cleanupOnly;
   private final ReplicaPlacementFingerprint _outsideExecutionFingerprint;
   private final Map<Integer, Long> _logDirFingerprintByBroker;
@@ -94,6 +95,7 @@ public final class PersistedExecutionState {
     _replicationThrottle = builder._replicationThrottle;
     _kafkaAssignerMode = builder._kafkaAssignerMode;
     _skipInterBrokerReplicaConcurrencyAdjustment = builder._skipInterBrokerReplicaConcurrencyAdjustment;
+    _userTask = builder._userTask;
     _cleanupOnly = builder._cleanupOnly;
     _outsideExecutionFingerprint = builder._outsideExecutionFingerprint;
     _logDirFingerprintByBroker = builder._logDirFingerprintByBroker == null
@@ -136,6 +138,7 @@ public final class PersistedExecutionState {
         .replicationThrottle(_replicationThrottle)
         .kafkaAssignerMode(_kafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(_skipInterBrokerReplicaConcurrencyAdjustment)
+        .userTask(_userTask)
         .cleanupOnly(_cleanupOnly)
         .outsideExecutionFingerprint(_outsideExecutionFingerprint)
         .logDirFingerprintByBroker(_logDirFingerprintByBroker)
@@ -242,6 +245,14 @@ public final class PersistedExecutionState {
   }
 
   /**
+   * @return The user task that started the execution, to report the resumed execution under it, or {@code null} if the execution was
+   * not started by a user request (or it is not known).
+   */
+  public PersistedUserTask userTask() {
+    return _userTask;
+  }
+
+  /**
    * @return {@code true} if a Cruise Control restart has already decided not to resume this execution -- i.e. later restarts
    * must only clean it up, {@code false} otherwise.
    */
@@ -259,7 +270,7 @@ public final class PersistedExecutionState {
 
   /**
    * @return For each broker with intra-broker replica movements, the fingerprint of the logdirs of its replicas that the
-   * execution does not move, as of the start of the execution, or {@code null} if the execution has no intra-broker replica
+   * execution does not move, as of the latest checkpoint, or {@code null} if the execution has no intra-broker replica
    * movements or the fingerprint is unknown.
    */
   public Map<Integer, Long> logDirFingerprintByBroker() {
@@ -312,6 +323,7 @@ public final class PersistedExecutionState {
     private Long _replicationThrottle;
     private boolean _kafkaAssignerMode;
     private boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+    private PersistedUserTask _userTask;
     private boolean _cleanupOnly;
     private ReplicaPlacementFingerprint _outsideExecutionFingerprint;
     private Map<Integer, Long> _logDirFingerprintByBroker;
@@ -500,6 +512,15 @@ public final class PersistedExecutionState {
      */
     public Builder skipInterBrokerReplicaConcurrencyAdjustment(boolean skip) {
       _skipInterBrokerReplicaConcurrencyAdjustment = skip;
+      return this;
+    }
+
+    /**
+     * @param userTask The user task that started the execution, or {@code null} if none.
+     * @return This builder.
+     */
+    public Builder userTask(PersistedUserTask userTask) {
+      _userTask = userTask;
       return this;
     }
 

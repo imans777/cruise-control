@@ -33,6 +33,7 @@ import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import com.linkedin.kafka.cruisecontrol.monitor.LoadMonitor;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.NoopSampler;
 import com.linkedin.kafka.cruisecontrol.monitor.task.LoadMonitorTaskRunner;
+import com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint;
 import com.linkedin.kafka.cruisecontrol.servlet.UserTaskManager;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -719,6 +720,11 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
     UserTaskManager.UserTaskInfo mockUserTaskInfo = EasyMock.mock(UserTaskManager.UserTaskInfo.class);
     // Run it any times to enable consecutive executions in tests.
     EasyMock.expect(mockUserTaskInfo.requestUrl()).andReturn("mock-request").anyTimes();
+    // Persisted with the execution state, so that an execution resumed after a restart is reported under the same user task.
+    EasyMock.expect(mockUserTaskInfo.endPoint()).andReturn(CruiseControlEndPoint.REBALANCE).anyTimes();
+    EasyMock.expect(mockUserTaskInfo.requestWithParams()).andReturn("mock-request").anyTimes();
+    EasyMock.expect(mockUserTaskInfo.clientIdentity()).andReturn("mock-client").anyTimes();
+    EasyMock.expect(mockUserTaskInfo.startMs()).andReturn(0L).anyTimes();
     return mockUserTaskInfo;
   }
 

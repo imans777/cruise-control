@@ -224,6 +224,28 @@ public class ExecutionTaskTracker {
   }
 
   /**
+   * Add tasks that are already finished -- i.e. that an execution interrupted by a restart finished before the restart -- so
+   * that the progress of the resumed execution counts them. Their data movement counts as finished, but is not metered again.
+   *
+   * @param tasks Tasks in their final state (i.e. completed, dead, or aborted).
+   */
+  public void addFinishedTasksToTrace(Collection<ExecutionTask> tasks) {
+    for (ExecutionTask task : tasks) {
+      if (task.state() != ExecutionTaskState.COMPLETED && task.state() != ExecutionTaskState.DEAD
+          && task.state() != ExecutionTaskState.ABORTED) {
+        throw new IllegalArgumentException(String.format("Task %s is not finished.", task));
+      }
+      _taskStateVersion++;
+      _tasksByType.get(task.type()).get(task.state()).add(task);
+      if (task.type() == TaskType.INTER_BROKER_REPLICA_ACTION) {
+        _finishedInterBrokerDataMovementInMB += task.proposal().interBrokerDataToMoveInMB();
+      } else if (task.type() == TaskType.INTRA_BROKER_REPLICA_ACTION) {
+        _finishedIntraBrokerDataMovementInMB += task.proposal().intraBrokerDataToMoveInMB();
+      }
+    }
+  }
+
+  /**
    * Set the execution mode of the tasks to keep track of the ongoing execution mode via sensors.
    *
    * @param isKafkaAssignerMode {@code true} if kafka assigner mode, {@code false} otherwise.

@@ -26,7 +26,9 @@ import com.linkedin.kafka.cruisecontrol.monitor.sampling.NoopSampler;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -542,13 +544,20 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     assertEquals(List.of(0, 2), currentReplicas(0));
     assertEquals(List.of(2, 1), currentReplicas(1));
     assertNull(_store.state());
-    // The resumed execution keeps the UUID of the interrupted execution, and only contains the remaining task.
+    // The resumed execution keeps the UUID of the interrupted execution: its remaining task, and the task completed in the meantime,
+    // which its progress counts.
     PersistedExecutionState resumedState = _store.savedStates().get(numSavedStatesBeforeResume);
     assertEquals(UUID, resumedState.uuid());
     assertEquals(REASON, resumedState.reason());
     assertEquals(1, resumedState.resumeCount());
-    assertEquals(TP0, onlyTask(resumedState).topicPartition());
-    assertEquals(ExecutionTaskState.PENDING, onlyTask(resumedState).state());
+    assertEquals(2, resumedState.tasks().size());
+    PersistedTask remainingTask = resumedState.tasks().stream().filter(t -> t.topicPartition().equals(TP0)).findFirst().orElseThrow();
+    assertEquals(ExecutionTaskState.PENDING, remainingTask.state());
+    PersistedTask completedTask = resumedState.tasks().stream().filter(t -> t.topicPartition().equals(TP1)).findFirst().orElseThrow();
+    assertEquals(ExecutionTaskState.COMPLETED, completedTask.state());
+    // Once the resumed execution completes its task, it has made progress: its resume count starts over.
+    assertTrue(_store.savedStates().stream().skip(numSavedStatesBeforeResume)
+                     .anyMatch(s -> s.resumeCount() == 0 && s.tasks().stream().filter(t -> t.state() == ExecutionTaskState.COMPLETED).count() == 2));
     assertTrue(notifier.anyMessageContains("resumed execution is finished"));
     // The resumed execution is not reported to the anomaly detector as a finished self-healing.
     EasyMock.verify(anomalyDetectorManager);
@@ -781,5 +790,148 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     assertEquals(List.of(0, 1), currentReplicas(0));
     assertNull(_store.state());
     assertTrue(String.valueOf(recovery(executor).get("reasonNotResumed")).contains("already decided not to resume"));
+  }
+
+  /**
+   * @return A metadata client whose stale metadata keeps the movement of {@link #TP0} from [0, 1] in progress for the executor, so that
+   * an execution lasts until it is stopped.
+   */
+  private static MetadataAdminClient staleMetadataClient() {
+    Node[] nodes = {new Node(0, "h0", 9092), new Node(1, "h1", 9092), new Node(2, "h2", 9092)};
+    Cluster staleCluster = new Cluster("cluster", Arrays.asList(nodes),
+                                       Collections.singleton(new PartitionInfo(TOPIC, 0, nodes[0], new Node[]{nodes[0], nodes[1]},
+                                                                               new Node[]{nodes[0], nodes[1]})),
+                                       Collections.emptySet(), Collections.emptySet());
+    MetadataAdminClient staleMetadataClient = EasyMock.mock(MetadataAdminClient.class);
+    EasyMock.expect(staleMetadataClient.cluster()).andReturn(staleCluster).anyTimes();
+    EasyMock.replay(staleMetadataClient);
+    return staleMetadataClient;
+  }
+
+  /**
+   * Let the in-flight reassignment of {@link #TP0} complete by removing its throttles (an execution re-applies them as it moves
+   * replicas), and wait for the given executor to finish its execution.
+   *
+   * @param executor The executor of the execution.
+   */
+  private void letReassignmentCompleteAndWait(Executor executor) {
+    waitUntilTrue(() -> {
+      try {
+        removeAllThrottles();
+      } catch (Exception e) {
+        // Retry.
+      }
+      return !executor.hasOngoingExecution();
+    }, "The execution did not finish", WAIT_TIME_MS * 3, 500L);
+  }
+
+  /**
+   * Remove the throttled rates of every broker and the throttled replicas of {@link #TOPIC}, whatever their values.
+   */
+  private void removeAllThrottles() throws Exception {
+    Map<ConfigResource, Collection<AlterConfigOp>> ops = new HashMap<>();
+    for (int broker = 0; broker < clusterSize(); broker++) {
+      ops.put(new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(broker)),
+              List.of(new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG, ""),
+                                        AlterConfigOp.OpType.DELETE),
+                      new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, ""),
+                                        AlterConfigOp.OpType.DELETE)));
+    }
+    ops.put(new ConfigResource(ConfigResource.Type.TOPIC, TOPIC),
+            List.of(new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG, ""),
+                                      AlterConfigOp.OpType.DELETE),
+                    new AlterConfigOp(new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG, ""),
+                                      AlterConfigOp.OpType.DELETE)));
+    _adminClient.incrementalAlterConfigs(ops).all().get();
+  }
+
+  @Test
+  public void testExecutionIsCheckpointedWhileNothingChanges() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    Properties overrides = new Properties();
+    overrides.setProperty(ExecutorConfig.EXECUTOR_STATE_CHECKPOINT_INTERVAL_MS_CONFIG, "500");
+    Executor executor = newExecutor(false, staleMetadataClient(), new RecordingNotifier(), mockAnomalyDetectorManager(true), overrides);
+    executor.setGeneratingProposalsForExecution(UUID, () -> REASON, false);
+    executor.executeProposals(List.of(proposal(TP0, List.of(0, 1), List.of(0, 2))), Collections.emptySet(), null, mockLoadMonitor(),
+                              null, null, null, null, null, null, null, 100_000L, false, UUID, false, false);
+    waitUntilTrue(() -> _store.state() != null && onlyTask(_store.state()).state() == ExecutionTaskState.IN_PROGRESS,
+                  "The task is not persisted as in progress", WAIT_TIME_MS, 100L);
+    long lastUpdateTimeMs = _store.state().lastUpdateTimeMs();
+    // The task stays in progress, and the execution is checkpointed all the same: the time of the last checkpoint is when Cruise Control
+    // was last known to run the execution, which the max age of a resume is measured from.
+    waitUntilTrue(() -> _store.state().lastUpdateTimeMs() >= lastUpdateTimeMs + 1000L, "The execution is not checkpointed periodically",
+                  WAIT_TIME_MS, 100L);
+    assertEquals(ExecutionTaskState.IN_PROGRESS, onlyTask(_store.state()).state());
+    executor.userTriggeredStopExecution(false);
+    waitForExecutionToFinish(executor);
+  }
+
+  @Test
+  public void testRuntimeConcurrencyChangesArePersisted() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    Executor executor = newExecutor(false, staleMetadataClient(), new RecordingNotifier(), mockAnomalyDetectorManager(true));
+    executor.setGeneratingProposalsForExecution(UUID, () -> REASON, false);
+    executor.executeProposals(List.of(proposal(TP0, List.of(0, 1), List.of(0, 2))), Collections.emptySet(), null, mockLoadMonitor(),
+                              5, null, null, null, null, null, null, 100_000L, false, UUID, false, false);
+    waitUntilTrue(() -> _store.state() != null && onlyTask(_store.state()).state() == ExecutionTaskState.IN_PROGRESS,
+                  "The task is not persisted as in progress", WAIT_TIME_MS, 100L);
+    assertEquals(Integer.valueOf(5), _store.state().interBrokerPartitionMovementConcurrency());
+    // Concurrency changed by an admin request is what a resumed execution uses.
+    executor.setExecutionConcurrencyForAllBrokersOrCluster(2, ConcurrencyType.INTER_BROKER_REPLICA);
+    executor.setExecutionConcurrencyForAllBrokersOrCluster(3, ConcurrencyType.INTRA_BROKER_REPLICA);
+    executor.setExecutionConcurrencyForAllBrokersOrCluster(40, ConcurrencyType.LEADERSHIP_CLUSTER);
+    executor.setExecutionConcurrencyForAllBrokersOrCluster(4, ConcurrencyType.LEADERSHIP_BROKER);
+    executor.setRequestedMaxInterBrokerPartitionMovements(20);
+    executor.setRequestedExecutionProgressCheckIntervalMs(5_000L);
+    PersistedExecutionState state = _store.state();
+    assertEquals(Integer.valueOf(2), state.interBrokerPartitionMovementConcurrency());
+    assertEquals(Integer.valueOf(3), state.intraBrokerPartitionMovementConcurrency());
+    assertEquals(Integer.valueOf(40), state.clusterLeadershipMovementConcurrency());
+    assertEquals(Integer.valueOf(4), state.brokerLeadershipMovementConcurrency());
+    assertEquals(Integer.valueOf(20), state.maxInterBrokerPartitionMovements());
+    assertEquals(Long.valueOf(5_000L), state.executionProgressCheckIntervalMs());
+    executor.setRequestedExecutionProgressCheckIntervalMs(null);
+    executor.userTriggeredStopExecution(false);
+    waitForExecutionToFinish(executor);
+  }
+
+  @Test
+  public void testResumeKeepsExecutionIdsStartTimesAndFinishedTasks() throws Exception {
+    long throttle = 10_000L;
+    createTopic(Map.of(0, List.of(0, 1), 1, List.of(2, 0)));
+    produceToPartition0();
+    ExecutionProposal adopted = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    new ReplicationThrottleHelper(_adminClient, throttle).setThrottles(List.of(adopted));
+    _adminClient.alterPartitionReassignments(Map.of(TP0, Optional.of(new NewPartitionReassignment(List.of(0, 2))))).all().get();
+    ExecutionProposal completed = proposal(TP1, List.of(2, 1), List.of(2, 0));
+    long startTimeMs = System.currentTimeMillis() - TimeUnit.MINUTES.toMillis(10);
+    _store.save(interruptedExecutionState(throttle, List.of(adopted, completed)).toBuilder()
+        .tasks(List.of(new PersistedTask(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, TP0, PersistedTask.NO_BROKER_ID,
+                                         ExecutionTaskState.IN_PROGRESS, startTimeMs, -1L, 41L),
+                       new PersistedTask(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, TP1, PersistedTask.NO_BROKER_ID,
+                                         ExecutionTaskState.COMPLETED, startTimeMs - 5L, startTimeMs - 1L, 40L)))
+        .build());
+    int numSavedStatesBeforeResume = _store.savedStates().size();
+    Executor executor = newExecutor(true, null, new RecordingNotifier(), mockAnomalyDetectorManager(null));
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitUntilTrue(() -> executor.state().state() == ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS
+                        && executor.state().executionTasksSummary() != null, "The resumed execution did not start moving replicas",
+                  WAIT_TIME_MS, 100L);
+    // The progress counts the task completed before the restart: 1 of 2 done, 1 in progress.
+    Map<ExecutionTaskState, Integer> interBrokerTasks = executor.state().executionTasksSummary().taskStat()
+                                                                .get(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION);
+    assertEquals(Integer.valueOf(1), interBrokerTasks.get(ExecutionTaskState.COMPLETED));
+    assertEquals(Integer.valueOf(1), interBrokerTasks.get(ExecutionTaskState.IN_PROGRESS));
+    // The tasks keep their execution ids, and the adopted one its start time.
+    PersistedExecutionState resumedState = _store.savedStates().get(numSavedStatesBeforeResume);
+    Map<TopicPartition, PersistedTask> taskByPartition = resumedState.tasks().stream()
+                                                                     .collect(Collectors.toMap(PersistedTask::topicPartition, t -> t));
+    assertEquals(41L, taskByPartition.get(TP0).executionId());
+    assertEquals(startTimeMs, taskByPartition.get(TP0).startTimeMs());
+    assertEquals(ExecutionTaskState.IN_PROGRESS, taskByPartition.get(TP0).state());
+    assertEquals(40L, taskByPartition.get(TP1).executionId());
+    assertEquals(ExecutionTaskState.COMPLETED, taskByPartition.get(TP1).state());
+    letReassignmentCompleteAndWait(executor);
+    assertNull(_store.state());
   }
 }

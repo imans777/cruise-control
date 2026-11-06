@@ -11,6 +11,7 @@ import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrateg
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -200,10 +201,56 @@ public class ExecutionTaskManager {
    */
   public synchronized List<ExecutionTask> adoptInProgressTasks(Set<TopicPartition> interBrokerPartitions,
                                                                Set<TopicPartitionReplica> intraBrokerReplicas) {
+    return adoptInProgressTasks(interBrokerPartitions, intraBrokerReplicas, Collections.emptyMap());
+  }
+
+  /**
+   * Adopt the in-progress tasks as {@link #adoptInProgressTasks(Set, Set)} does, keeping the time each of them started before the restart.
+   *
+   * @param interBrokerPartitions Partitions whose inter-broker replica reassignment is still ongoing.
+   * @param intraBrokerReplicas Replicas whose intra-broker movement is still ongoing.
+   * @param startTimeByTask The time each task started before the restart, by task key (see {@link ExecutionTaskPlanner#taskKey}).
+   * @return The adopted tasks.
+   */
+  public synchronized List<ExecutionTask> adoptInProgressTasks(Set<TopicPartition> interBrokerPartitions,
+                                                               Set<TopicPartitionReplica> intraBrokerReplicas,
+                                                               Map<String, Long> startTimeByTask) {
     List<ExecutionTask> adoptedTasks = new ArrayList<>(_executionTaskPlanner.removeInterBrokerReplicaMovementTasks(interBrokerPartitions));
     adoptedTasks.addAll(_executionTaskPlanner.removeIntraBrokerReplicaMovementTasks(intraBrokerReplicas));
     markTasksInProgress(adoptedTasks);
+    for (ExecutionTask task : adoptedTasks) {
+      Long startTimeMs = startTimeByTask.get(ExecutionTaskPlanner.taskKey(task.type(), task.proposal().topicPartition(), task.brokerId()));
+      if (startTimeMs != null) {
+        task.keepStartTimeOfAdoptedTask(startTimeMs);
+      }
+    }
     return adoptedTasks;
+  }
+
+  /**
+   * Make the tasks added next keep the given execution ids -- see {@link ExecutionTaskPlanner#keepExecutionIds(Map, long)}.
+   *
+   * @param executionIdByTask Execution id to keep for each task, by task key.
+   * @param nextExecutionId The execution id to give the next task without a kept id (at least).
+   */
+  public synchronized void keepExecutionIds(Map<String, Long> executionIdByTask, long nextExecutionId) {
+    _executionTaskPlanner.keepExecutionIds(executionIdByTask, nextExecutionId);
+  }
+
+  /**
+   * @return A new execution id, not given to any task yet.
+   */
+  public synchronized long newExecutionId() {
+    return _executionTaskPlanner.newExecutionId();
+  }
+
+  /**
+   * Count the tasks that an execution interrupted by a restart finished before the restart in the progress of the resumed execution.
+   *
+   * @param finishedTasks Tasks in their final state (i.e. completed, dead, or aborted), which are not executed again.
+   */
+  public synchronized void restoreFinishedTasks(Collection<ExecutionTask> finishedTasks) {
+    _executionTaskTracker.addFinishedTasksToTrace(finishedTasks);
   }
 
   /**

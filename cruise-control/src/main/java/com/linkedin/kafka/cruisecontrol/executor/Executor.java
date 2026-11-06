@@ -35,6 +35,7 @@ import com.linkedin.kafka.cruisecontrol.executor.concurrency.ExecutionConcurrenc
 import com.linkedin.kafka.cruisecontrol.executor.persistence.ExecutionStateStore;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedExecutionState;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedTask;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedUserTask;
 import com.linkedin.kafka.cruisecontrol.executor.persistence.ReplicaPlacementFingerprint;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
@@ -64,6 +65,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.Admin;
@@ -195,6 +197,14 @@ public class Executor {
   private long _lastPersistedTaskStateVersion;
   private ExecutorState.State _lastPersistedExecutorState;
   private boolean _executionStatePersistenceFailureReported;
+  // The time the state of the ongoing execution was last persisted. Guarded by _executionStateStoreLock.
+  private long _lastCheckpointTimeMs;
+  // The ongoing execution is checkpointed at least this often, even if nothing has changed -- see
+  // ExecutorConfig#EXECUTOR_STATE_CHECKPOINT_INTERVAL_MS_CONFIG.
+  private final long _executionStateCheckpointIntervalMs;
+  // The number of completed tasks of the ongoing execution when it started: a resumed execution that completes a task after it resumed
+  // has made progress, so its resume count starts over.
+  private volatile int _numCompletedTasksAtStart;
   // The recovery plan of the interrupted execution that is being resumed, or null if no execution is being resumed.
   private ExecutionRecoveryUtils.RecoveryPlan _recoveryPlanToResume;
 
@@ -340,6 +350,9 @@ public class Executor {
     _shutdownRequested = false;
     _executionStateToPersist = null;
     _recoveryPlanToResume = null;
+    _executionStateCheckpointIntervalMs = config.getLong(ExecutorConfig.EXECUTOR_STATE_CHECKPOINT_INTERVAL_MS_CONFIG);
+    _lastCheckpointTimeMs = -1L;
+    _numCompletedTasksAtStart = 0;
   }
 
   /**
@@ -367,6 +380,10 @@ public class Executor {
     }
     _requestedExecutionProgressCheckIntervalMs = requestedExecutionProgressCheckIntervalMs;
     setExecutionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs);
+    if (_hasOngoingExecution) {
+      persistExecutionParameterChange(state -> state.toBuilder().executionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs)
+                                                    .build());
+    }
   }
 
   /**
@@ -991,12 +1008,28 @@ public class Executor {
     _latestClusterOfExecution = cluster;
     StrategyOptions strategyOptions = new StrategyOptions.Builder(cluster)
         .minIsrWithTimeByTopic(_topicMinIsrCache.minIsrWithTimeByTopic()).build();
+    if (_recoveryPlanToResume != null) {
+      // The tasks of the interrupted execution keep their execution ids; new ones get ids after all of them.
+      keepExecutionIdsOfInterruptedExecution(_recoveryPlanToResume);
+    }
     _executionTaskManager.addExecutionProposals(proposals, brokersToSkipConcurrencyCheck, strategyOptions, replicaMovementStrategy);
     if (_recoveryPlanToResume != null) {
-      // Tasks that were submitted to Kafka before the restart and are still being executed are only monitored until completion.
+      // Tasks that were submitted to Kafka before the restart and are still being executed are only monitored until completion, from
+      // the time they started.
+      Map<String, Long> startTimeByTask = new HashMap<>();
+      _recoveryPlanToResume.actionByTask().forEach((task, action) -> {
+        if (action == ExecutionRecoveryUtils.RecoveryAction.ADOPT) {
+          startTimeByTask.put(ExecutionTaskPlanner.taskKey(task.type(), task.topicPartition(), task.brokerId()), task.startTimeMs());
+        }
+      });
       List<ExecutionTask> adoptedTasks = _executionTaskManager.adoptInProgressTasks(_recoveryPlanToResume.adoptedInterBrokerPartitions(),
-                                                                                    _recoveryPlanToResume.adoptedIntraBrokerReplicas());
+                                                                                    _recoveryPlanToResume.adoptedIntraBrokerReplicas(),
+                                                                                    startTimeByTask);
       LOG.info("User task {}: Adopted {} in-progress task(s) of the interrupted execution: {}", _uuid, adoptedTasks.size(), adoptedTasks);
+      // The progress of the resumed execution counts the tasks the interrupted execution had finished.
+      List<ExecutionTask> finishedTasks = finishedTasksOfInterruptedExecution(_recoveryPlanToResume);
+      _executionTaskManager.restoreFinishedTasks(finishedTasks);
+      LOG.info("User task {}: Restored {} task(s) that the interrupted execution had finished.", _uuid, finishedTasks.size());
     }
     _concurrencyAdjuster.initAdjustment(loadMonitor,
                                         requestedInterBrokerPartitionMovementConcurrency,
@@ -1005,6 +1038,60 @@ public class Executor {
                                         requestedBrokerLeadershipMovementConcurrency);
     setRequestedMaxInterBrokerPartitionMovements(requestedMaxInterBrokerPartitionMovements);
     setRequestedExecutionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs);
+  }
+
+  /**
+   * Make the tasks of a resumed execution keep the execution ids they had before the restart -- see {@link PersistedTask#executionId()}.
+   *
+   * @param recoveryPlan The recovery plan of the interrupted execution.
+   */
+  private void keepExecutionIdsOfInterruptedExecution(ExecutionRecoveryUtils.RecoveryPlan recoveryPlan) {
+    Map<String, Long> executionIdByTask = new HashMap<>();
+    long maxExecutionId = -1L;
+    for (Map.Entry<PersistedTask, ExecutionRecoveryUtils.RecoveryAction> entry : recoveryPlan.actionByTask().entrySet()) {
+      PersistedTask task = entry.getKey();
+      maxExecutionId = Math.max(maxExecutionId, task.executionId());
+      if (task.executionId() != PersistedTask.UNKNOWN_EXECUTION_ID
+          && (entry.getValue() == ExecutionRecoveryUtils.RecoveryAction.PENDING || entry.getValue() == ExecutionRecoveryUtils.RecoveryAction.ADOPT)) {
+        executionIdByTask.put(ExecutionTaskPlanner.taskKey(task.type(), task.topicPartition(), task.brokerId()), task.executionId());
+      }
+    }
+    _executionTaskManager.keepExecutionIds(executionIdByTask, maxExecutionId + 1);
+  }
+
+  /**
+   * @param recoveryPlan The recovery plan of the interrupted execution.
+   * @return The tasks that the interrupted execution finished (i.e. completed, or ended with an error) before the restart -- or that
+   * Kafka completed during the restart -- in their final state, with their persisted execution ids and times.
+   */
+  private List<ExecutionTask> finishedTasksOfInterruptedExecution(ExecutionRecoveryUtils.RecoveryPlan recoveryPlan) {
+    List<ExecutionTask> finishedTasks = new ArrayList<>();
+    long now = _time.milliseconds();
+    PersistedExecutionState state = recoveryPlan.state();
+    recoveryPlan.actionByTask().forEach((task, action) -> {
+      if (action != ExecutionRecoveryUtils.RecoveryAction.COMPLETED && action != ExecutionRecoveryUtils.RecoveryAction.FINISHED_WITH_ERROR) {
+        return;
+      }
+      ExecutionProposal proposal = state.proposals().get(task.topicPartition());
+      long executionId = task.executionId() != PersistedTask.UNKNOWN_EXECUTION_ID ? task.executionId()
+                                                                                    : _executionTaskManager.newExecutionId();
+      long alertingThresholdMs = _config.getLong(ExecutorConfig.TASK_EXECUTION_ALERTING_THRESHOLD_MS_CONFIG);
+      ExecutionTask finishedTask = task.type() == INTRA_BROKER_REPLICA_ACTION
+                                   ? new ExecutionTask(executionId, proposal, task.brokerId(), task.type(), alertingThresholdMs)
+                                   : new ExecutionTask(executionId, proposal, task.type(), alertingThresholdMs);
+      long endTimeMs = task.endTimeMs() > 0 ? task.endTimeMs() : now;
+      finishedTask.inProgress(task.startTimeMs() > 0 ? task.startTimeMs() : endTimeMs);
+      if (action == ExecutionRecoveryUtils.RecoveryAction.COMPLETED) {
+        finishedTask.completed(endTimeMs);
+      } else if (task.state() == ExecutionTaskState.DEAD) {
+        finishedTask.kill(endTimeMs);
+      } else {
+        finishedTask.abort();
+        finishedTask.aborted(endTimeMs);
+      }
+      finishedTasks.add(finishedTask);
+    });
+    return finishedTasks;
   }
 
   /**
@@ -1072,6 +1159,20 @@ public class Executor {
    */
   public synchronized void setExecutionConcurrencyForAllBrokersOrCluster(Integer concurrency, ConcurrencyType concurrencyType) {
     _executionTaskManager.getExecutionConcurrencyManager().setExecutionConcurrencyForAllBrokersOrCluster(concurrency, concurrencyType);
+    if (_hasOngoingExecution) {
+      // An execution resumed after a restart uses the concurrency in force, not the one it was started with.
+      persistExecutionParameterChange(state -> {
+        PersistedExecutionState.Builder builder = state.toBuilder();
+        switch (concurrencyType) {
+          case INTER_BROKER_REPLICA -> builder.interBrokerPartitionMovementConcurrency(concurrency);
+          case INTRA_BROKER_REPLICA -> builder.intraBrokerPartitionMovementConcurrency(concurrency);
+          case LEADERSHIP_CLUSTER -> builder.clusterLeadershipMovementConcurrency(concurrency);
+          case LEADERSHIP_BROKER -> builder.brokerLeadershipMovementConcurrency(concurrency);
+          default -> throw new IllegalArgumentException("Unsupported concurrency type " + concurrencyType + " is provided.");
+        }
+        return builder.build();
+      });
+    }
   }
 
   /**
@@ -1094,6 +1195,10 @@ public class Executor {
   public void setRequestedMaxInterBrokerPartitionMovements(Integer requestedMaxInterBrokerPartitionMovements) {
     _executionTaskManager.getExecutionConcurrencyManager().
         setClusterInterBrokerPartitionMovementConcurrency(requestedMaxInterBrokerPartitionMovements);
+    if (_hasOngoingExecution) {
+      persistExecutionParameterChange(state -> state.toBuilder().maxInterBrokerPartitionMovements(requestedMaxInterBrokerPartitionMovements)
+                                                    .build());
+    }
   }
 
   /**
@@ -1191,11 +1296,14 @@ public class Executor {
       // A new execution -- the recovery of an earlier interrupted execution is no longer reported.
       _interruptedExecutionRecovery = null;
     }
-    maybeFingerprintLogDirsOfExecution();
+    fingerprintLogDirsOfExecution(true);
+    _numCompletedTasksAtStart = (int) _executionTaskManager.allTasks().stream().filter(t -> t.state() == ExecutionTaskState.COMPLETED)
+                                                          .count();
     // Persist the initial state of the execution before starting it.
     synchronized (_executionStateStoreLock) {
       _lastPersistedTaskStateVersion = -1L;
       _lastPersistedExecutorState = null;
+      _lastCheckpointTimeMs = -1L;
       _executionStatePersistenceFailureReported = false;
     }
     checkpointExecutionState();
@@ -1204,33 +1312,54 @@ public class Executor {
 
   /**
    * Persist the state of the ongoing execution if it has changed since it was last persisted -- i.e. a task was added or
-   * changed its state, or the executor state has changed. Failure to persist the state does not affect the execution.
+   * changed its state, or the executor state has changed -- or if it was last persisted {@link #_executionStateCheckpointIntervalMs}
+   * ago: the time of the last checkpoint is when the execution was last known to be running, and its fingerprints are what the rest
+   * of the cluster looked like then (see {@link #reasonToNotResume}), so a long execution is checkpointed also while its tasks take
+   * long. Failure to persist the state does not affect the execution.
+   *
+   * <p>A resumed execution that has completed a task since it resumed has made progress: its resume count starts over, so that
+   * {@link ExecutorConfig#RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG} bounds the restarts in a row without progress.</p>
    *
    * The state is not persisted after a shutdown is requested, because the shutdown stops the ongoing execution (i.e. marks
    * the in-progress tasks as dead and rolls back their reassignments) and the persisted state is meant to reflect the
    * execution as it was before the shutdown, so that it can be recovered upon restart.
    */
   private void checkpointExecutionState() {
-    PersistedExecutionState executionStateToPersist = _executionStateToPersist;
-    if (executionStateToPersist == null || _shutdownRequested) {
+    if (_executionStateToPersist == null || _shutdownRequested) {
       return;
     }
     synchronized (_executionStateStoreLock) {
+      PersistedExecutionState executionStateToPersist = _executionStateToPersist;
+      if (executionStateToPersist == null) {
+        return;
+      }
+      long now = System.currentTimeMillis();
       long taskStateVersion = _executionTaskManager.taskStateVersion();
       ExecutorState.State executorState = _executorState.state();
-      if (taskStateVersion == _lastPersistedTaskStateVersion && executorState == _lastPersistedExecutorState) {
+      if (!isCheckpointDue(now) && taskStateVersion == _lastPersistedTaskStateVersion
+          && executorState == _lastPersistedExecutorState) {
         return;
       }
       List<ExecutionTask> tasks = _executionTaskManager.allTasks();
       Map<TopicPartition, ExecutionProposal> proposals = new LinkedHashMap<>();
       List<PersistedTask> persistedTasks = new ArrayList<>(tasks.size());
+      int numCompletedTasks = 0;
       for (ExecutionTask task : tasks) {
         proposals.putIfAbsent(task.proposal().topicPartition(), task.proposal());
         persistedTasks.add(PersistedTask.of(task));
+        if (task.state() == ExecutionTaskState.COMPLETED) {
+          numCompletedTasks++;
+        }
+      }
+      if (executionStateToPersist.resumeCount() > 0 && numCompletedTasks > _numCompletedTasksAtStart) {
+        LOG.info("User task {}: The resumed execution has completed a task, so its resume count ({}) starts over.",
+                 executionStateToPersist.uuid(), executionStateToPersist.resumeCount());
+        executionStateToPersist = executionStateToPersist.toBuilder().resumeCount(0).build();
+        _executionStateToPersist = executionStateToPersist;
       }
       PersistedExecutionState.Builder stateBuilder = executionStateToPersist.toBuilder()
                                                                             .executorState(executorState)
-                                                                            .lastUpdateTimeMs(System.currentTimeMillis())
+                                                                            .lastUpdateTimeMs(now)
                                                                             .proposals(proposals.values())
                                                                             .tasks(persistedTasks);
       Cluster cluster = _latestClusterOfExecution;
@@ -1242,6 +1371,7 @@ public class Executor {
         _executionStateStore.save(state);
         _lastPersistedTaskStateVersion = taskStateVersion;
         _lastPersistedExecutorState = executorState;
+        _lastCheckpointTimeMs = now;
       } catch (IOException | RuntimeException e) {
         LOG.warn("User task {}: Failed to persist the execution state.", state.uuid(), e);
         if (!_executionStatePersistenceFailureReported) {
@@ -1254,13 +1384,60 @@ public class Executor {
   }
 
   /**
-   * If the execution that is about to start moves replicas between logdirs, record the logdirs of the other replicas of its brokers,
-   * so that upon recovery, Cruise Control can tell whether replicas were moved between those logdirs while it was not running.
-   * Failing to retrieve the logdirs only prevents resuming the execution after a restart.
+   * Must be called while holding {@link #_executionStateStoreLock}.
+   *
+   * @param nowMs The current time.
+   * @return {@code true} if the ongoing execution was last checkpointed {@link #_executionStateCheckpointIntervalMs} ago (or never).
    */
-  private void maybeFingerprintLogDirsOfExecution() {
-    PersistedExecutionState executionStateToPersist = _executionStateToPersist;
-    if (executionStateToPersist == null) {
+  private boolean isCheckpointDue(long nowMs) {
+    return _lastCheckpointTimeMs < 0 || nowMs - _lastCheckpointTimeMs >= _executionStateCheckpointIntervalMs;
+  }
+
+  /**
+   * Called by the execution thread at every progress check: if the periodic checkpoint is due, refresh the fingerprint of the logdirs
+   * outside the execution first (it asks the brokers, so it is not refreshed at every checkpoint), then checkpoint.
+   */
+  private void checkpointExecutionStateAtProgressCheck() {
+    boolean due;
+    synchronized (_executionStateStoreLock) {
+      due = _executionStateToPersist != null && isCheckpointDue(System.currentTimeMillis());
+    }
+    if (due) {
+      fingerprintLogDirsOfExecution(false);
+    }
+    checkpointExecutionState();
+  }
+
+  /**
+   * Persist a change of the parameters of the ongoing execution right away -- e.g. a concurrency changed by an admin request --
+   * so that an execution resumed after a restart uses it rather than the value the execution started with.
+   *
+   * @param change Applies the change to the persisted state of the ongoing execution.
+   */
+  private void persistExecutionParameterChange(Function<PersistedExecutionState, PersistedExecutionState> change) {
+    synchronized (_executionStateStoreLock) {
+      PersistedExecutionState executionStateToPersist = _executionStateToPersist;
+      if (executionStateToPersist == null) {
+        return;
+      }
+      _executionStateToPersist = change.apply(executionStateToPersist);
+      // Persist even if no task has changed since the last checkpoint.
+      _lastPersistedTaskStateVersion = -1L;
+    }
+    checkpointExecutionState();
+  }
+
+  /**
+   * If the ongoing execution moves replicas between logdirs, record the logdirs of the other replicas of its brokers, so that upon
+   * recovery, Cruise Control can tell whether replicas were moved between those logdirs while it was not running. Recorded when the
+   * execution starts, and refreshed with the periodic checkpoints (see {@link #checkpointExecutionState()}). Failing to retrieve
+   * the logdirs when the execution starts only prevents resuming the execution after a restart; failing to refresh them keeps the
+   * fingerprint from before.
+   *
+   * @param atStart {@code true} if the execution is about to start.
+   */
+  private void fingerprintLogDirsOfExecution(boolean atStart) {
+    if (_executionStateToPersist == null) {
       return;
     }
     Set<Integer> brokers = new TreeSet<>();
@@ -1271,16 +1448,28 @@ public class Executor {
         brokers.add(task.brokerId());
       }
     }
+    if (brokers.isEmpty() && !atStart) {
+      return;
+    }
     Map<Integer, Long> logDirFingerprintByBroker = null;
     if (!brokers.isEmpty()) {
       try {
         logDirFingerprintByBroker = ExecutionRecoveryUtils.logDirFingerprintByBroker(describeLogDirs(brokers), brokers, partitionsOfExecution);
       } catch (InterruptedException | ExecutionException | TimeoutException e) {
+        if (!atStart) {
+          LOG.warn("User task {}: Failed to refresh the logdirs of brokers {} -- keeping their fingerprint from before.", _uuid, brokers, e);
+          return;
+        }
         LOG.warn("User task {}: Failed to retrieve the logdirs of brokers {} -- the execution cannot be resumed after a restart.", _uuid,
                  brokers, e);
       }
     }
-    _executionStateToPersist = executionStateToPersist.toBuilder().logDirFingerprintByBroker(logDirFingerprintByBroker).build();
+    synchronized (_executionStateStoreLock) {
+      PersistedExecutionState executionStateToPersist = _executionStateToPersist;
+      if (executionStateToPersist != null) {
+        _executionStateToPersist = executionStateToPersist.toBuilder().logDirFingerprintByBroker(logDirFingerprintByBroker).build();
+      }
+    }
   }
 
   /**
@@ -1606,8 +1795,12 @@ public class Executor {
     Cluster cluster = null;
     Map<TopicPartition, PartitionReassignment> ongoingReassignments = null;
     try {
-      cluster = _metadataClient.cluster();
+      // The reassignments first, the replicas second (each call fetches them from the cluster): a reassignment of the execution that
+      // finishes in between is then either listed (adopted, then seen done) or not (its new replicas are what the metadata shows). The
+      // other way round, the metadata may still show the replicas of both sides of a reassignment that is not listed anymore -- which
+      // reads as a partition moved by someone else and prevents the resume.
       ongoingReassignments = ExecutionUtils.ongoingPartitionReassignments(_adminClient);
+      cluster = _metadataClient.cluster();
       recoveryPlan = ExecutionRecoveryUtils.reconcile(state, cluster, ongoingReassignments, logDirInfoForIntraBrokerReplicaTasks(state));
       recovery.setTasksByAction(recoveryPlan.numTasksByAction());
     } catch (Exception e) {
@@ -1617,7 +1810,7 @@ public class Executor {
 
     String reasonToNotResume = reasonToNotResume(state, recoveryPlan, cluster, ongoingReassignments, recovery);
     String summary = String.format("Task [%s] execution (reason: %s) was interrupted by a Cruise Control restart (started: %s, last "
-                                   + "updated: %s, executor state: %s). Recovered task states: %s.", state.uuid(), state.reason(),
+                                   + "checkpoint: %s, executor state: %s). Recovered task states: %s.", state.uuid(), state.reason(),
                                    utcDateFor(state.startTimeMs()), utcDateFor(state.lastUpdateTimeMs()), state.executorState(),
                                    recoveryPlan == null ? "unknown" : recoveryPlan.numTasksByAction());
     if (reasonToNotResume == null) {
@@ -1631,6 +1824,7 @@ public class Executor {
       } catch (Exception e) {
         LOG.error("Failed to resume the interrupted execution {}.", state.uuid(), e);
         failGeneratingProposalsForExecution(state.uuid());
+        recoverFinishedUserTask(state.uuid(), true);
         reasonToNotResume = "failed to resume the execution: " + e.getMessage();
       }
     }
@@ -1674,16 +1868,11 @@ public class Executor {
     if (state.outsideExecutionFingerprint() == null) {
       return "its state does not tell whether the cluster has changed since -- e.g. it was persisted by an older version";
     }
-    long ageMs = System.currentTimeMillis() - state.lastUpdateTimeMs();
-    if (ageMs > _resumeInterruptedExecutionMaxAgeMs) {
-      return String.format("it last made progress %d seconds ago, more than %s (%d ms)", TimeUnit.MILLISECONDS.toSeconds(ageMs),
-                           ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG, _resumeInterruptedExecutionMaxAgeMs);
+    String reason = reasonToNotResumeOldOrRepeated(state);
+    if (reason != null) {
+      return reason;
     }
-    if (state.resumeCount() >= _resumeInterruptedExecutionMaxCount) {
-      return String.format("it has already been resumed %d times (%s)", state.resumeCount(),
-                           ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG);
-    }
-    String reason = recoveryPlan.reasonToNotResume();
+    reason = recoveryPlan.reasonToNotResume();
     if (reason != null) {
       return reason;
     }
@@ -1700,6 +1889,62 @@ public class Executor {
                            divergences.size(), divergences.get(0));
     }
     return null;
+  }
+
+  /**
+   * @param state Persisted state of the interrupted execution.
+   * @return The reason to not resume the interrupted execution because it is too old or resumed too often in a row, or {@code null}.
+   */
+  private String reasonToNotResumeOldOrRepeated(PersistedExecutionState state) {
+    long ageMs = System.currentTimeMillis() - state.lastUpdateTimeMs();
+    if (ageMs > _resumeInterruptedExecutionMaxAgeMs) {
+      return String.format("it was last checkpointed %d seconds ago, more than %s (%d ms)", TimeUnit.MILLISECONDS.toSeconds(ageMs),
+                           ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG, _resumeInterruptedExecutionMaxAgeMs);
+    }
+    if (state.resumeCount() >= _resumeInterruptedExecutionMaxCount) {
+      return String.format("it has already been resumed %d times in a row without completing a task (%s)", state.resumeCount(),
+                           ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG);
+    }
+    return null;
+  }
+
+  /**
+   * @param state Persisted state of an interrupted execution.
+   * @return {@code true} if the user task that started the interrupted execution can be reported again.
+   */
+  private boolean canRecoverUserTask(PersistedExecutionState state) {
+    return state.triggeredByUserRequest() && state.userTask() != null && _userTaskManager != null;
+  }
+
+  /**
+   * Report the execution recovered after a restart under the user task that started it before the restart: the user task is in
+   * execution until the recovered execution finishes.
+   *
+   * @param state Persisted state of the interrupted execution.
+   * @return {@code true} if the user task is reported again.
+   */
+  private boolean recoverUserTask(PersistedExecutionState state) {
+    if (!canRecoverUserTask(state)) {
+      return false;
+    }
+    try {
+      return _userTaskManager.recoverUserTask(state.uuid(), state.userTask());
+    } catch (RuntimeException e) {
+      LOG.warn("Interrupted execution {}: Failed to report it under its user task {}.", state.uuid(), state.userTask(), e);
+      return false;
+    }
+  }
+
+  /**
+   * Finish the user task of a recovered execution that did not start.
+   *
+   * @param uuid UUID of the interrupted execution.
+   * @param completedWithError {@code true} if the user task completed with an error.
+   */
+  private void recoverFinishedUserTask(String uuid, boolean completedWithError) {
+    if (_userTaskManager != null) {
+      _userTaskManager.finishRecoveredUserTask(uuid, completedWithError);
+    }
   }
 
   /**
@@ -1810,7 +2055,9 @@ public class Executor {
                                                                            adoptedProposals));
     }
 
-    setGeneratingProposalsForExecution(state.uuid(), () -> ExecutionRecoveryUtils.resumedReason(state.reason()), false);
+    // Reported under the user task that started it, if known.
+    boolean userTaskRecovered = recoverUserTask(state);
+    setGeneratingProposalsForExecution(state.uuid(), () -> ExecutionRecoveryUtils.resumedReason(state.reason()), userTaskRecovered);
     _recoveryPlanToResume = recoveryPlan;
     try {
       if (state.operation() == PersistedExecutionState.Operation.DEMOTE_BROKERS) {
@@ -1823,7 +2070,7 @@ public class Executor {
                                state.executionProgressCheckIntervalMs(),
                                replicaMovementStrategy,
                                state.replicationThrottle(),
-                               false,
+                               userTaskRecovered,
                                state.uuid());
       } else {
         executeProposals(proposalsToResume,
@@ -1838,7 +2085,7 @@ public class Executor {
                          state.executionProgressCheckIntervalMs(),
                          replicaMovementStrategy,
                          state.replicationThrottle(),
-                         false,
+                         userTaskRecovered,
                          state.uuid(),
                          state.kafkaAssignerMode(),
                          state.skipInterBrokerReplicaConcurrencyAdjustment());
@@ -2299,12 +2546,39 @@ public class Executor {
       }
     }
 
+    /**
+     * Persist the user task of the execution with it, so that an execution resumed after a restart is reported under the same user task.
+     *
+     * @param userTaskInfo The user task of the execution.
+     */
+    private void persistUserTask(UserTaskManager.UserTaskInfo userTaskInfo) {
+      if (userTaskInfo == null) {
+        return;
+      }
+      PersistedUserTask userTask;
+      try {
+        userTask = new PersistedUserTask(userTaskInfo.endPoint().toString(), userTaskInfo.requestWithParams(),
+                                         userTaskInfo.clientIdentity(), userTaskInfo.startMs());
+      } catch (RuntimeException e) {
+        // Only reporting the resumed execution under the same user task depends on it -- not the execution.
+        LOG.warn("User task {}: Failed to record the user task with the execution state.", _uuid, e);
+        return;
+      }
+      synchronized (_executionStateStoreLock) {
+        PersistedExecutionState executionStateToPersist = _executionStateToPersist;
+        if (executionStateToPersist != null && !userTask.equals(executionStateToPersist.userTask())) {
+          _executionStateToPersist = executionStateToPersist.toBuilder().userTask(userTask).build();
+        }
+      }
+    }
+
     private UserTaskManager.UserTaskInfo initExecution() {
       UserTaskManager.UserTaskInfo userTaskInfo = null;
       // If the task is triggered from a user request, mark the task to be in-execution state in user task manager and
       // retrieve the associated user task information.
       if (_isTriggeredByUserRequest) {
         userTaskInfo = _userTaskManager.markTaskExecutionBegan(_uuid);
+        persistUserTask(userTaskInfo);
       }
       String reason = _reasonSupplier.get();
       _executorState = ExecutorState.executionStarting(_uuid, reason, _recentlyDemotedBrokers, _recentlyRemovedBrokers, _isTriggeredByUserRequest);
@@ -2413,12 +2687,13 @@ public class Executor {
     private void notifyFinishedTask(UserTaskManager.UserTaskInfo userTaskInfo) {
       // If the finished task was triggered by a user request, update task status in user task manager; if task is triggered
       // by an anomaly self-healing, update the task status in anomaly detector.
-      // A resumed execution is neither known by the user task manager nor by the anomaly detector of this Cruise Control instance.
       boolean completeWithError = (_executorState.state() == STOPPING_EXECUTION || _executionException != null);
-      if (_isResumedExecution) {
-        LOG.debug("User task {}: The resumed execution finished (with error: {}).", _uuid, completeWithError);
-      } else if (userTaskInfo != null) {
+      if (userTaskInfo != null) {
+        // Also a resumed execution, which the restart reports under the user task that started it (see #recoverUserTask).
         _userTaskManager.markTaskExecutionFinished(_uuid, completeWithError);
+      } else if (_isResumedExecution) {
+        // A resumed self-healing execution is not known by the anomaly detector of this Cruise Control instance.
+        LOG.debug("User task {}: The resumed execution finished (with error: {}).", _uuid, completeWithError);
       } else {
         _anomalyDetectorManager.markSelfHealingFinished(_uuid, completeWithError);
       }
@@ -2516,7 +2791,7 @@ public class Executor {
                                                            _isTriggeredByUserRequest);
       }
       // Persist the progress of the execution (if any).
-      checkpointExecutionState();
+      checkpointExecutionStateAtProgressCheck();
     }
 
     private void interBrokerMoveReplicas() throws InterruptedException, ExecutionException, TimeoutException {

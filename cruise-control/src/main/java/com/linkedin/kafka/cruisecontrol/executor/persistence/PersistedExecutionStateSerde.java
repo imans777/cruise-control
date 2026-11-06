@@ -56,6 +56,11 @@ public final class PersistedExecutionStateSerde {
   static final String REPLICATION_THROTTLE = "replicationThrottle";
   static final String KAFKA_ASSIGNER_MODE = "kafkaAssignerMode";
   static final String SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT = "skipInterBrokerReplicaConcurrencyAdjustment";
+  static final String USER_TASK = "userTask";
+  static final String END_POINT = "endPoint";
+  static final String REQUEST = "request";
+  static final String CLIENT_IDENTITY = "clientIdentity";
+  static final String EXECUTION_ID = "executionId";
   static final String PROPOSALS = "proposals";
   static final String TOPIC = "topic";
   static final String PARTITION = "partition";
@@ -132,6 +137,16 @@ public final class PersistedExecutionStateSerde {
     json.name(SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).value(state.skipInterBrokerReplicaConcurrencyAdjustment());
     json.endObject();
 
+    PersistedUserTask userTask = state.userTask();
+    if (userTask != null) {
+      json.name(USER_TASK).beginObject();
+      json.name(END_POINT).value(userTask.endPoint());
+      json.name(REQUEST).value(userTask.request());
+      json.name(CLIENT_IDENTITY).value(userTask.clientIdentity());
+      json.name(START_TIME_MS).value(userTask.startMs());
+      json.endObject();
+    }
+
     ReplicaPlacementFingerprint fingerprint = state.outsideExecutionFingerprint();
     if (fingerprint != null) {
       json.name(OUTSIDE_EXECUTION_FINGERPRINT).beginObject();
@@ -180,6 +195,9 @@ public final class PersistedExecutionStateSerde {
       json.name(STATE).value(task.state().name());
       json.name(START_TIME_MS).value(task.startTimeMs());
       json.name(END_TIME_MS).value(task.endTimeMs());
+      if (task.executionId() != PersistedTask.UNKNOWN_EXECUTION_ID) {
+        json.name(EXECUTION_ID).value(task.executionId());
+      }
       json.endObject();
     }
     json.endArray();
@@ -226,6 +244,12 @@ public final class PersistedExecutionStateSerde {
              .replicationThrottle(optionalLong(parameters, REPLICATION_THROTTLE))
              .kafkaAssignerMode(required(parameters, KAFKA_ASSIGNER_MODE).getAsBoolean())
              .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean());
+      JsonElement userTask = optional(root, USER_TASK);
+      if (userTask != null) {
+        JsonObject u = userTask.getAsJsonObject();
+        builder.userTask(new PersistedUserTask(required(u, END_POINT).getAsString(), required(u, REQUEST).getAsString(),
+                                               optionalString(u, CLIENT_IDENTITY), required(u, START_TIME_MS).getAsLong()));
+      }
       // Fields added in version 2 are optional, so that a version 1 state can still be recovered (but not resumed).
       JsonElement cleanupOnly = optional(root, CLEANUP_ONLY);
       builder.cleanupOnly(cleanupOnly != null && cleanupOnly.getAsBoolean());
@@ -262,12 +286,14 @@ public final class PersistedExecutionStateSerde {
       for (JsonElement element : required(root, TASKS).getAsJsonArray()) {
         JsonObject t = element.getAsJsonObject();
         Integer brokerId = optionalInteger(t, BROKER_ID);
+        Long executionId = optionalLong(t, EXECUTION_ID);
         tasks.add(new PersistedTask(ExecutionTask.TaskType.valueOf(required(t, TYPE).getAsString()),
                                     new TopicPartition(required(t, TOPIC).getAsString(), required(t, PARTITION).getAsInt()),
                                     brokerId == null ? PersistedTask.NO_BROKER_ID : brokerId,
                                     ExecutionTaskState.valueOf(required(t, STATE).getAsString()),
                                     required(t, START_TIME_MS).getAsLong(),
-                                    required(t, END_TIME_MS).getAsLong()));
+                                    required(t, END_TIME_MS).getAsLong(),
+                                    executionId == null ? PersistedTask.UNKNOWN_EXECUTION_ID : executionId));
       }
       builder.tasks(tasks);
       return builder.build();

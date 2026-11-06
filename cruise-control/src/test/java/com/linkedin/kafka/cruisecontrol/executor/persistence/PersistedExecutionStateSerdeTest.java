@@ -62,13 +62,14 @@ public class PersistedExecutionStateSerdeTest {
         .replicaMovementStrategy("PostponeUrpReplicaMovementStrategy,BaseReplicaMovementStrategy")
         .replicationThrottle(1000000L)
         .skipInterBrokerReplicaConcurrencyAdjustment(true)
+        .userTask(new PersistedUserTask("REBALANCE", "POST /kafkacruisecontrol/rebalance?dryrun=false", "127.0.0.1", 900L))
         .cleanupOnly(true)
         .outsideExecutionFingerprint(new ReplicaPlacementFingerprint(-42L, 7, Map.of(0, 5, 1, 9)))
         .logDirFingerprintByBroker(Map.of(1, 123L, 2, -456L))
         .proposals(Arrays.asList(interBroker, intraBroker, otherInterBroker))
         .tasks(Arrays.asList(
             new PersistedTask(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, TP0, PersistedTask.NO_BROKER_ID,
-                              ExecutionTaskState.IN_PROGRESS, 1500L, -1L),
+                              ExecutionTaskState.IN_PROGRESS, 1500L, -1L, 7L),
             new PersistedTask(ExecutionTask.TaskType.LEADER_ACTION, TP0, PersistedTask.NO_BROKER_ID, ExecutionTaskState.PENDING, -1L, -1L),
             new PersistedTask(ExecutionTask.TaskType.INTRA_BROKER_REPLICA_ACTION, TP1, 1, ExecutionTaskState.COMPLETED, 1200L, 1300L),
             new PersistedTask(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, TP2, PersistedTask.NO_BROKER_ID,
@@ -109,6 +110,7 @@ public class PersistedExecutionStateSerdeTest {
     assertEquals(expected.replicationThrottle(), actual.replicationThrottle());
     assertEquals(expected.kafkaAssignerMode(), actual.kafkaAssignerMode());
     assertEquals(expected.skipInterBrokerReplicaConcurrencyAdjustment(), actual.skipInterBrokerReplicaConcurrencyAdjustment());
+    assertEquals(expected.userTask(), actual.userTask());
     assertEquals(expected.cleanupOnly(), actual.cleanupOnly());
     assertEquals(expected.outsideExecutionFingerprint(), actual.outsideExecutionFingerprint());
     assertEquals(expected.logDirFingerprintByBroker(), actual.logDirFingerprintByBroker());
@@ -140,6 +142,17 @@ public class PersistedExecutionStateSerdeTest {
     assertFalse(deserialized.cleanupOnly());
     assertNull(deserialized.outsideExecutionFingerprint());
     assertNull(deserialized.logDirFingerprintByBroker());
+    assertNull(deserialized.userTask());
+  }
+
+  @Test
+  public void testTasksWithoutExecutionIdAreReadable() {
+    // Tasks persisted before execution ids were.
+    JsonObject json = JsonParser.parseString(PersistedExecutionStateSerde.toJson(sampleState())).getAsJsonObject();
+    json.getAsJsonArray(PersistedExecutionStateSerde.TASKS).forEach(t -> t.getAsJsonObject().remove(PersistedExecutionStateSerde.EXECUTION_ID));
+    PersistedExecutionState state = PersistedExecutionStateSerde.fromJson(json.toString());
+    assertEquals(PersistedTask.UNKNOWN_EXECUTION_ID, state.tasks().get(0).executionId());
+    assertEquals(sampleState().tasks().get(1), state.tasks().get(1));
   }
 
   @Test
