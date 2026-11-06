@@ -2124,7 +2124,8 @@ public class Executor {
       } else {
         LOG.error("User task {}: Broker removal operation failed due to exception", uuid, e);
       }
-      processExecuteProposalsFailure();
+      // E.g. a queued disk rebalance refused by the offline logdir check: the reason goes to the notification of its end.
+      processExecuteProposalsFailure(String.format("the execution failed to start: %s", e.getMessage()));
       throw e;
     }
   }
@@ -2983,9 +2984,16 @@ public class Executor {
   }
 
   private void processExecuteProposalsFailure() {
+    processExecuteProposalsFailure("the execution failed to start");
+  }
+
+  /**
+   * @param reason Why the execution failed to start, reported if it was a queued execution.
+   */
+  private void processExecuteProposalsFailure(String reason) {
     _executionStateToPersist = null;
     _executionTaskManager.clear();
-    endQueuedExecution(true, "the execution failed to start");
+    endQueuedExecution(true, reason);
     _uuid = null;
     _reasonSupplier = null;
     _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());

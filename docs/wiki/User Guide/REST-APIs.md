@@ -383,7 +383,7 @@ Supported parameters are:
 | log_dir_throttle                              | long      | upper bound on the bandwidth used to move replicas between the disks of a broker (in bytes per second)                                | null                  | yes       | 
 | destination_broker_ids                        | list      | specify brokers to move replicas to                                                                                                   | available brokers     | yes       | 
 | rebalance_disk                                | boolean   | whether to balance load between disks within brokers, with the intra-broker goals in `goals` (default: `intra.broker.goals`) (requires JBOD Kafka deployment) | false                 | yes       | 
-| rebalance_disk_broker_by_broker               | boolean   | whether to execute the disk rebalance one broker at a time (requires `rebalance_disk=true`)                                           | false                 | yes       | 
+| rebalance_disk_broker_by_broker               | boolean   | whether to execute the disk rebalance one broker at a time (requires `rebalance_disk=true` or `queue_rebalance_disk=true`)                                           | false                 | yes       | 
 | queue_rebalance_disk                          | boolean   | whether to rebalance the disks within brokers once the execution of this rebalance completes (requires `dryrun=false`)                | false                 | yes       | 
 | json                                          | boolean   | return in JSON format or not                                                                                                          | false                 | yes       | 
 | verbose                                       | boolean   | return detailed state information                                                                                                     | false                 | yes       | 
@@ -485,6 +485,7 @@ With `queue_rebalance_disk=true`, a rebalance balances the disks within the brok
 * The executor state (`GET /kafkacruisecontrol/state?substates=executor`) reports `queuedExecution: REBALANCE_DISK` while the disk rebalance is queued, and the reason of the user task, suffixed with `(queued REBALANCE_DISK)`, while it is prepared and executed.
 * The disk rebalance is dropped if the rebalance's execution is stopped or fails, and `POST /kafkacruisecontrol/stop_proposal_execution` also cancels it before it starts. A dropped disk rebalance, or one that cannot start (e.g. the load monitor is not ready in time), finishes the user task with an error, and the executor notifier reports why. If the disks are already balanced, the user task completes without a second execution.
 * `queue_rebalance_disk` requires `dryrun=false`, and cannot be combined with `rebalance_disk=true`.
+* With `rebalance_disk_broker_by_broker=true`, the queued disk rebalance runs one broker at a time, as a disk rebalance does. If a broker it would move replicas on has an offline log directory, it is refused like any disk rebalance (see below), and the user task finishes with an error that names the broker.
 
 ### Add a list of new brokers to Kafka Cluster
 The following POST request adds the given brokers to the Kafka cluster

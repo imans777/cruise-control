@@ -617,6 +617,12 @@ public class ParameterUtilsTest {
     params.put(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "false");
     Assert.assertFalse(ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(params)));
 
+    // Set along with queue_rebalance_disk=true: the queued disk rebalance runs broker by broker.
+    Map<String, String> queueParams = new HashMap<>();
+    queueParams.put(ParameterUtils.QUEUE_REBALANCE_DISK_PARAM, "true");
+    queueParams.put(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "true");
+    Assert.assertTrue(ParameterUtils.isRebalanceDiskBrokerByBroker(mockRequestWithParams(queueParams)));
+
     // Set without rebalance_disk=true.
     Map<String, String> invalidParams = Collections.singletonMap(ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM, "true");
     Assert.assertThrows(UserRequestException.class,

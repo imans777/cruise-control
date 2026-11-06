@@ -396,9 +396,9 @@ public final class ParameterUtils {
    */
   static boolean isRebalanceDiskBrokerByBroker(CruiseControlRequestContext requestContext) {
     boolean isRebalanceDiskBrokerByBroker = getBooleanParam(requestContext, REBALANCE_DISK_BROKER_BY_BROKER_PARAM, false);
-    if (isRebalanceDiskBrokerByBroker && !isRebalanceDiskMode(requestContext)) {
-      throw new UserRequestException(String.format("%s requires %s to be set to true.", REBALANCE_DISK_BROKER_BY_BROKER_PARAM,
-                                                   REBALANCE_DISK_MODE_PARAM));
+    if (isRebalanceDiskBrokerByBroker && !isRebalanceDiskMode(requestContext) && !queueRebalanceDisk(requestContext)) {
+      throw new UserRequestException(String.format("%s requires %s or %s to be set to true.", REBALANCE_DISK_BROKER_BY_BROKER_PARAM,
+                                                   REBALANCE_DISK_MODE_PARAM, QUEUE_REBALANCE_DISK_PARAM));
     }
     return isRebalanceDiskBrokerByBroker;
   }

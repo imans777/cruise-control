@@ -161,7 +161,7 @@ RebalanceEndpoint:
       - name: rebalance_disk_broker_by_broker
         in: query
         description: Whether to execute the disk rebalance one broker at a time, i.e. finish moving replicas between the
-          disks of a broker before starting on the next broker (requires rebalance_disk to be true).
+          disks of a broker before starting on the next broker (requires rebalance_disk or queue_rebalance_disk to be true).
         schema:
           type: boolean
           default: false
