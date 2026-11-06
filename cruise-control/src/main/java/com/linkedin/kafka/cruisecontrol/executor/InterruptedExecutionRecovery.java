@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.TopicPartitionReplica;
 
 import static com.linkedin.cruisecontrol.CruiseControlUtils.utcDateFor;
 
@@ -49,6 +50,8 @@ final class InterruptedExecutionRecovery {
   private static final String TASKS_BY_RECOVERY_ACTION = "tasksByRecoveryAction";
   @JsonResponseField(required = false)
   private static final String IN_FLIGHT_PARTITION_MOVEMENTS = "inFlightPartitionMovements";
+  @JsonResponseField(required = false)
+  private static final String IN_FLIGHT_LOG_DIR_MOVEMENTS = "inFlightLogDirMovements";
   @JsonResponseField(required = false)
   private static final String CLEANUP_DEADLINE = "cleanupDeadline";
   @JsonResponseField(required = false)
@@ -92,6 +95,7 @@ final class InterruptedExecutionRecovery {
   private List<String> _divergences;
   private Map<String, Integer> _tasksByAction;
   private List<String> _inFlightMovements;
+  private List<String> _inFlightLogDirMovements;
   private long _cleanupDeadlineMs;
   private List<String> _keptThrottles;
   private String _error;
@@ -105,6 +109,7 @@ final class InterruptedExecutionRecovery {
     _resumeCount = state.resumeCount();
     _divergences = Collections.emptyList();
     _inFlightMovements = Collections.emptyList();
+    _inFlightLogDirMovements = Collections.emptyList();
     _keptThrottles = Collections.emptyList();
     _cleanupDeadlineMs = -1L;
     _status = Status.DECIDING;
@@ -142,6 +147,12 @@ final class InterruptedExecutionRecovery {
 
   synchronized void setInFlightMovements(Collection<TopicPartition> inFlightMovements) {
     _inFlightMovements = new ArrayList<>(new TreeSet<>(inFlightMovements.stream().map(TopicPartition::toString).collect(Collectors.toSet())));
+  }
+
+  synchronized void setInFlightLogDirMovements(Collection<TopicPartitionReplica> inFlightLogDirMovements) {
+    _inFlightLogDirMovements = inFlightLogDirMovements.stream().map(r -> String.format("%s-%d on broker %d", r.topic(), r.partition(),
+                                                                                       r.brokerId()))
+                                                      .sorted().collect(Collectors.toList());
   }
 
   synchronized void setCleanupDeadlineMs(long cleanupDeadlineMs) {
@@ -184,6 +195,9 @@ final class InterruptedExecutionRecovery {
     }
     if (!_inFlightMovements.isEmpty()) {
       json.put(IN_FLIGHT_PARTITION_MOVEMENTS, firstItems(_inFlightMovements));
+    }
+    if (!_inFlightLogDirMovements.isEmpty()) {
+      json.put(IN_FLIGHT_LOG_DIR_MOVEMENTS, firstItems(_inFlightLogDirMovements));
     }
     if (_cleanupDeadlineMs > 0) {
       json.put(CLEANUP_DEADLINE, utcDateFor(_cleanupDeadlineMs));

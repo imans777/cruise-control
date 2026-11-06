@@ -116,8 +116,8 @@ Upon startup, Cruise Control reconciles the persisted state (if any) with the cu
 progress is checked for whether Kafka is still executing it, has completed it, or has not started it. Then, it either resumes the
 remaining tasks of the interrupted execution (see `resume.interrupted.execution.on.startup`) -- monitoring the tasks that Kafka is still
 executing rather than submitting them again, continuing from the throttles and the concurrency in force before the restart, and reported
-under the same user task -- or cleans it up: it waits for the in-flight tasks to finish and removes the replication throttles left
-behind by the interrupted execution.
+under the same user task -- or cleans it up: it waits for the in-flight tasks (reassignments and log dir movements) to finish and removes
+the throttles left behind by the interrupted execution.
 
 An interrupted execution is resumed only if the cluster is as the execution left it. It is cleaned up instead if it was last checkpointed
 longer ago than `resume.interrupted.execution.max.age.ms`, if it was resumed `resume.interrupted.execution.max.count` times in a row
@@ -129,7 +129,8 @@ of the execution was changed, or a destination does not have enough usable space
 a different cluster could e.g. move replicas to a broker that has been filled up since.
 
 The cleanup is reported as the `RECOVERING_INTERRUPTED_EXECUTION` executor state: new executions (and self-healing) wait for it, and
-stopping it (e.g. `stop_proposal_execution`) cancels the in-flight reassignments of the interrupted execution right away -- as does
+stopping it (e.g. `stop_proposal_execution`) cancels the in-flight reassignments and log dir movements of the interrupted execution right
+away -- as does
 reaching `interrupted.execution.cleanup.timeout.ms`. A throttled rate is removed only if it still has the value that the execution set;
 a rate changed by someone else in the meantime is kept. The state endpoint reports how the latest interrupted execution was recovered
 until the next execution starts.

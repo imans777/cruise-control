@@ -790,6 +790,10 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     // A replication throttle changed by an admin request (PR #17) is what a resumed execution uses.
     assertTrue(executor.updateOngoingExecutionReplicationThrottle(200_000L));
     assertEquals(Long.valueOf(200_000L), _store.state().replicationThrottle());
+    // The checkpoints persist the retained throttles too, but never the throttles of the ongoing execution: its persisted state
+    // has them, and recovering them from both would remove them without matching their values (e.g. an operator's rate).
+    assertTrue(_store.retainedThrottles() == null
+               || PersistedExecutionStateSerde.retainedThrottlesFromJson(_store.retainedThrottles()).brokers().isEmpty());
     // The switch is persisted from the start (off here), and switching the adjustment on and off during the execution (decision D2)
     // is persisted too: once on, the execution stays adjusted.
     assertEquals(PersistedExecutionState.ReplicationThrottleAdjuster.OFF, _store.state().replicationThrottleAdjuster());
@@ -825,6 +829,55 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     // The restart reverted the switch to the config; the resumed execution switched it off again.
     assertFalse(executor.isReplicationThrottleAdjusterEnabled());
     assertEquals(List.of(0, 2), currentReplicas(0));
+  }
+
+  @Test
+  public void testLogDirThrottlesRetainedBeforeRestartAreRestored() throws Exception {
+    // Log dir throttles (PR #26) that an execution set before Cruise Control was killed: broker 0 had its own value 777, brokers 1
+    // and 2 had none. Meanwhile someone else set broker 1 to 555.
+    setPerBrokerLogDirThrottle(0, "1000");
+    setPerBrokerLogDirThrottle(1, "555");
+    setPerBrokerLogDirThrottle(2, "1000");
+    Map<Integer, String> originals = new HashMap<>();
+    originals.put(0, "777");
+    originals.put(1, null);
+    originals.put(2, null);
+    _store.saveRetainedThrottles(PersistedExecutionStateSerde.retainedThrottlesToJson(Collections.emptySet(), Collections.emptyList(),
+                                                                                      originals, Map.of(0, "1000", 1, "1000", 2, "1000")));
+
+    AnomalyDetectorManager anomalyDetectorManager = mockAnomalyDetectorManager(null);
+    Executor executor = newExecutor(false, null, new RecordingNotifier(), anomalyDetectorManager);
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitUntilTrue(() -> _store.retainedThrottles() == null, "The retained log dir throttles are not restored", WAIT_TIME_MS, 100L);
+    // The originals are put back where the brokers still carry the value applied before the restart; broker 1's new value is kept.
+    assertEquals("777", perBrokerLogDirThrottle(0));
+    assertEquals("555", perBrokerLogDirThrottle(1));
+    assertNull(perBrokerLogDirThrottle(2));
+    setPerBrokerLogDirThrottle(0, null);
+    setPerBrokerLogDirThrottle(1, null);
+    EasyMock.verify(anomalyDetectorManager);
+  }
+
+  private void setPerBrokerLogDirThrottle(int broker, String value) throws Exception {
+    ConfigResource resource = new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(broker));
+    AlterConfigOp op = value == null
+                       ? new AlterConfigOp(new ConfigEntry(LogDirThrottleHelper.LOG_DIR_THROTTLE_CONFIG, null), AlterConfigOp.OpType.DELETE)
+                       : new AlterConfigOp(new ConfigEntry(LogDirThrottleHelper.LOG_DIR_THROTTLE_CONFIG, value), AlterConfigOp.OpType.SET);
+    _adminClient.incrementalAlterConfigs(Map.of(resource, List.of(op))).all().get();
+    waitUntilTrue(() -> {
+      try {
+        return Objects.equals(value, perBrokerLogDirThrottle(broker));
+      } catch (Exception e) {
+        return false;
+      }
+    }, "The log dir throttle of broker " + broker + " is not changed", WAIT_TIME_MS, 100L);
+  }
+
+  private String perBrokerLogDirThrottle(int broker) throws Exception {
+    ConfigResource resource = new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(broker));
+    ConfigEntry entry = _adminClient.describeConfigs(Collections.singleton(resource)).all().get().get(resource)
+                                    .get(LogDirThrottleHelper.LOG_DIR_THROTTLE_CONFIG);
+    return entry == null || entry.source() != ConfigEntry.ConfigSource.DYNAMIC_BROKER_CONFIG ? null : entry.value();
   }
 
   @Test
@@ -1182,6 +1235,52 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     waitForExecutionToFinish(executor);
     assertTrue(executor.isReplicationThrottleAdjusterEnabled());
     assertEquals(List.of(0, 2), currentReplicas(0));
+  }
+
+  @Test
+  public void testCleanupWaitsForAndCancelsInFlightLogDirMovements() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    produceToPartition0();
+    TopicPartitionReplica replica = new TopicPartitionReplica(TOPIC, 0, 0);
+    String sourceLogDir = logDirInfo(replica).getCurrentReplicaLogDir();
+    String destinationLogDir = LOG_DIR_1.equals(sourceLogDir) ? LOG_DIR_2 : LOG_DIR_1;
+    // The interrupted execution submitted the intra-broker replica movement before the restart; a tiny rate keeps it in flight.
+    setAlterLogDirsRate(0, "1000");
+    _adminClient.alterReplicaLogDirs(Map.of(replica, destinationLogDir)).all().get();
+    waitUntilTrue(() -> {
+      try {
+        return destinationLogDir.equals(logDirInfo(replica).getFutureReplicaLogDir());
+      } catch (Exception e) {
+        return false;
+      }
+    }, "The intra-broker replica movement did not start", WAIT_TIME_MS, 100L);
+    ExecutionProposal proposal = new ExecutionProposal(TP0, 0, new ReplicaPlacementInfo(0, sourceLogDir),
+                                                       List.of(new ReplicaPlacementInfo(0, sourceLogDir), new ReplicaPlacementInfo(1)),
+                                                       List.of(new ReplicaPlacementInfo(0, destinationLogDir), new ReplicaPlacementInfo(1)));
+    _store.save(interruptedExecutionState(null, List.of(proposal)).toBuilder()
+        .executorState(ExecutorState.State.INTRA_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS)
+        .tasks(List.of(new PersistedTask(ExecutionTask.TaskType.INTRA_BROKER_REPLICA_ACTION, TP0, 0, ExecutionTaskState.IN_PROGRESS, 1L,
+                                         -1L)))
+        .build());
+    Properties overrides = new Properties();
+    overrides.setProperty(ExecutorConfig.INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG, "3000");
+    Executor executor = newExecutor(false, null, new RecordingNotifier(), mockAnomalyDetectorManager(null), overrides);
+    try {
+      executor.recoverInterruptedExecution(mockLoadMonitor());
+      // Not resumed: the cleanup waits for the in-flight log dir movement, which Kafka carries on with ...
+      waitUntilTrue(() -> List.of(TOPIC + "-0 on broker 0").equals(executor.state().recovery().get("inFlightLogDirMovements")),
+                    "The in-flight log dir movement is not reported", WAIT_TIME_MS, 100L);
+      assertEquals(ExecutorState.State.RECOVERING_INTERRUPTED_EXECUTION, executor.state().state());
+      // ... and cancels it once the cleanup times out: the replica stays in its logdir, without a future replica.
+      waitForExecutionToFinish(executor);
+      ReplicaLogDirInfo info = logDirInfo(replica);
+      assertEquals(sourceLogDir, info.getCurrentReplicaLogDir());
+      assertNull(info.getFutureReplicaLogDir());
+      assertNull(_store.state());
+      assertEquals("CLEANED_UP", recovery(executor).get("status"));
+    } finally {
+      setAlterLogDirsRate(0, null);
+    }
   }
 
   @Test

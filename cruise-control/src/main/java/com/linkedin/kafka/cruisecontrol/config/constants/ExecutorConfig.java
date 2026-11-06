@@ -789,10 +789,10 @@ public final class ExecutorConfig {
   public static final String INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG = "interrupted.execution.cleanup.timeout.ms";
   public static final long DEFAULT_INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS = TimeUnit.HOURS.toMillis(1);
   public static final String INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_DOC = "The maximum time in ms to wait for the partition"
-      + " reassignments of an interrupted execution that is not resumed to finish, before cancelling them and removing the"
-      + " replication throttles that the interrupted execution left behind. Until then, the executor reports the"
+      + " reassignments and the log dir movements of an interrupted execution that is not resumed to finish, before cancelling them"
+      + " and removing the throttles that the interrupted execution left behind. Until then, the executor reports the"
       + " RECOVERING_INTERRUPTED_EXECUTION state, and a new execution can only be started by stopping the cleanup -- which"
-      + " cancels those reassignments right away.";
+      + " cancels those movements right away.";
 
   private ExecutorConfig() {
   }

@@ -87,6 +87,7 @@ public final class PersistedExecutionState {
   private final Long _replicationThrottle;
   private final boolean _kafkaAssignerMode;
   private final boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+  private final Long _logDirThrottle;
   private final ReplicationThrottleAdjuster _replicationThrottleAdjuster;
   private final PersistedAdjusterState _adjusterState;
   private final PersistedUserTask _userTask;
@@ -119,6 +120,7 @@ public final class PersistedExecutionState {
     _replicationThrottle = builder._replicationThrottle;
     _kafkaAssignerMode = builder._kafkaAssignerMode;
     _skipInterBrokerReplicaConcurrencyAdjustment = builder._skipInterBrokerReplicaConcurrencyAdjustment;
+    _logDirThrottle = builder._logDirThrottle;
     _replicationThrottleAdjuster = builder._replicationThrottleAdjuster == null ? ReplicationThrottleAdjuster.OFF
                                                                                 : builder._replicationThrottleAdjuster;
     _adjusterState = builder._adjusterState;
@@ -165,6 +167,7 @@ public final class PersistedExecutionState {
         .replicationThrottle(_replicationThrottle)
         .kafkaAssignerMode(_kafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(_skipInterBrokerReplicaConcurrencyAdjustment)
+        .logDirThrottle(_logDirThrottle)
         .replicationThrottleAdjuster(_replicationThrottleAdjuster)
         .adjusterState(_adjusterState)
         .userTask(_userTask)
@@ -274,6 +277,14 @@ public final class PersistedExecutionState {
   }
 
   /**
+   * @return the log dir throttle (bytes/sec) of the intra-broker replica movements of the execution, or null if they are not
+   * throttled (PR #26; changed at runtime by PR #17).
+   */
+  public Long logDirThrottle() {
+    return _logDirThrottle;
+  }
+
+  /**
    * @return Whether replication throttle adjustment was on during the execution -- see {@link ReplicationThrottleAdjuster}.
    */
   public ReplicationThrottleAdjuster replicationThrottleAdjuster() {
@@ -375,6 +386,7 @@ public final class PersistedExecutionState {
     private Long _replicationThrottle;
     private boolean _kafkaAssignerMode;
     private boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+    private Long _logDirThrottle;
     private ReplicationThrottleAdjuster _replicationThrottleAdjuster;
     private PersistedAdjusterState _adjusterState;
     private PersistedUserTask _userTask;
@@ -566,6 +578,16 @@ public final class PersistedExecutionState {
      */
     public Builder skipInterBrokerReplicaConcurrencyAdjustment(boolean skip) {
       _skipInterBrokerReplicaConcurrencyAdjustment = skip;
+      return this;
+    }
+
+    /**
+     * @param logDirThrottle The log dir throttle (bytes/sec) of the intra-broker replica movements of the execution, or null
+     * if they are not throttled (PR #26; changed at runtime by PR #17).
+     * @return This builder.
+     */
+    public Builder logDirThrottle(Long logDirThrottle) {
+      _logDirThrottle = logDirThrottle;
       return this;
     }
 

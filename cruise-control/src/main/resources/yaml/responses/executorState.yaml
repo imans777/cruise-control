@@ -337,6 +337,10 @@ InterruptedExecutionRecovery:
       type: array
       items:
         type: string
+    inFlightLogDirMovements:
+      type: array
+      items:
+        type: string
     cleanupDeadline:
       type: string
     keptThrottles:
