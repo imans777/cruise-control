@@ -6,17 +6,21 @@ package com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable;
 
 import com.linkedin.cruisecontrol.exception.NotEnoughValidWindowsException;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControl;
+import com.linkedin.kafka.cruisecontrol.analyzer.BalancingConstraint;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizerResult;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.Goal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.exception.KafkaCruiseControlException;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
+import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.TopicConfigurationParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.TopicReplicationFactorChangeParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.response.OptimizationResult;
+import com.linkedin.kafka.cruisecontrol.servlet.response.stats.BrokerStats;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -207,12 +211,19 @@ public class UpdateTopicConfigurationRunnable extends GoalBasedOperationRunnable
     populateRackInfoForReplicationFactorChange(_topicsToChangeByReplicationFactor, _cluster,
                                                _skipRackAwarenessCheck, brokersByRack, rackByBroker);
     Map<TopicPartition, List<ReplicaPlacementInfo>> initReplicaDistribution = clusterModel.getReplicaDistribution();
+    // Adding and removing replicas changes the load and the stats of the cluster, hence the load and stats before the change
+    // are taken beforehand (over the same brokers as the optimizer takes its stats).
+    BrokerStats brokerStatsBeforeChange = clusterModel.brokerStats(null);
+    ClusterModelStats clusterModelStatsBeforeChange =
+        clusterModel.getClusterStats(new BalancingConstraint(_kafkaCruiseControl.config()), optimizationOptions,
+                                     GoalUtils.diskStatsBrokerIds(_goalsByPriority, optimizationOptions));
     // First try to add and remove replicas to achieve the replication factor for topics of interest.
     clusterModel.createOrDeleteReplicas(_topicsToChangeByReplicationFactor, brokersByRack, rackByBroker, _cluster);
     // Then further optimize the location of newly added replicas based on goals. Here we restrict the replica movement to
     // only considering newly added replicas, in order to minimize the total bytes to move.
     OptimizerResult result = _kafkaCruiseControl.optimizations(clusterModel, _goalsByPriority, _operationProgress,
-                                                               initReplicaDistribution, optimizationOptions);
+                                                               initReplicaDistribution, optimizationOptions,
+                                                               brokerStatsBeforeChange, clusterModelStatsBeforeChange);
     if (!_dryRun) {
       _kafkaCruiseControl.executeProposals(result.goalProposals(), Collections.emptySet(), false, _concurrentInterBrokerPartitionMovements,
           _maxInterBrokerPartitionMovements,
