@@ -2060,6 +2060,7 @@ public class Executor {
         .replicaMovementStrategy(replicaMovementStrategy == null ? null : replicaMovementStrategy.name())
         .replicationThrottle(replicationThrottle)
         .logDirThrottle(logDirThrottle)
+        .intraBrokerMovementsBrokerByBroker(intraBrokerMovementsBrokerByBroker)
         .kafkaAssignerMode(isKafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(skipInterBrokerReplicaConcurrencyAdjustment)
         .build();
@@ -3564,7 +3565,8 @@ public class Executor {
                          userTaskRecovered,
                          state.uuid(),
                          state.kafkaAssignerMode(),
-                         state.skipInterBrokerReplicaConcurrencyAdjustment());
+                         state.skipInterBrokerReplicaConcurrencyAdjustment(),
+                         state.intraBrokerMovementsBrokerByBroker());
       }
     } finally {
       _recoveryPlanToResume = null;
