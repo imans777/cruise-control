@@ -45,6 +45,10 @@ final class InterruptedExecutionRecovery {
   @JsonResponseField(required = false)
   private static final String REASON_NOT_RESUMED = "reasonNotResumed";
   @JsonResponseField(required = false)
+  private static final String QUEUED_EXECUTION_NOT_RESUMED = "queuedExecutionNotResumed";
+  @JsonResponseField(required = false)
+  private static final String QUEUED_EXECUTION_RESUMED = "queuedExecutionResumed";
+  @JsonResponseField(required = false)
   private static final String DIVERGENCES = "divergences";
   @JsonResponseField(required = false)
   private static final String TASKS_BY_RECOVERY_ACTION = "tasksByRecoveryAction";
@@ -90,6 +94,10 @@ final class InterruptedExecutionRecovery {
   private final long _startTimeMs;
   private final long _lastUpdateTimeMs;
   private final int _resumeCount;
+  // The type of an execution that was queued after the interrupted one (e.g. REBALANCE_DISK) and is not queued again, or null.
+  private String _queuedExecutionNotResumed;
+  // The type of an execution that was queued after the interrupted one and is queued again (or started) by the recovery, or null.
+  private String _queuedExecutionResumed;
   private Status _status;
   private String _reasonNotResumed;
   private List<String> _divergences;
@@ -107,6 +115,8 @@ final class InterruptedExecutionRecovery {
     _startTimeMs = state.startTimeMs();
     _lastUpdateTimeMs = state.lastUpdateTimeMs();
     _resumeCount = state.resumeCount();
+    _queuedExecutionNotResumed = null;
+    _queuedExecutionResumed = null;
     _divergences = Collections.emptyList();
     _inFlightMovements = Collections.emptyList();
     _inFlightLogDirMovements = Collections.emptyList();
@@ -155,6 +165,20 @@ final class InterruptedExecutionRecovery {
                                                       .sorted().collect(Collectors.toList());
   }
 
+  /**
+   * @param type The type of the execution queued after the interrupted one, which the recovery does not queue again.
+   */
+  synchronized void setQueuedExecutionNotResumed(String type) {
+    _queuedExecutionNotResumed = type;
+  }
+
+  /**
+   * @param type The type of the execution queued after the interrupted one, which the recovery queues again (or starts).
+   */
+  synchronized void setQueuedExecutionResumed(String type) {
+    _queuedExecutionResumed = type;
+  }
+
   synchronized void setCleanupDeadlineMs(long cleanupDeadlineMs) {
     _cleanupDeadlineMs = cleanupDeadlineMs;
   }
@@ -186,6 +210,12 @@ final class InterruptedExecutionRecovery {
     json.put(STATUS, _status.name());
     if (_reasonNotResumed != null) {
       json.put(REASON_NOT_RESUMED, _reasonNotResumed);
+    }
+    if (_queuedExecutionNotResumed != null) {
+      json.put(QUEUED_EXECUTION_NOT_RESUMED, _queuedExecutionNotResumed);
+    }
+    if (_queuedExecutionResumed != null) {
+      json.put(QUEUED_EXECUTION_RESUMED, _queuedExecutionResumed);
     }
     if (!_divergences.isEmpty()) {
       json.put(DIVERGENCES, firstItems(_divergences));

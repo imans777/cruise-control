@@ -64,8 +64,10 @@ public class PersistedExecutionStateSerdeTest {
         .replicationThrottle(1000000L)
         .skipInterBrokerReplicaConcurrencyAdjustment(true)
         .intraBrokerMovementsBrokerByBroker(true)
+        .queuedExecution("REBALANCE_DISK")
         .logDirThrottle(2000000L)
         .replicationThrottleAdjuster(PersistedExecutionState.ReplicationThrottleAdjuster.TURNED_OFF)
+        .queuedExecutionParameters(Map.of("destinationBrokerIds", "1,2", "logDirThrottle", "2000000"))
         .adjusterState(new PersistedAdjusterState(Map.of(0, 300L, 1, 400L), Map.of(1, 500L), Set.of(1), Set.of(0, 1), Map.of(2, 3)))
         .userTask(new PersistedUserTask("REBALANCE", "POST /kafkacruisecontrol/rebalance?dryrun=false", "127.0.0.1", 900L))
         .cleanupOnly(true)
@@ -116,9 +118,11 @@ public class PersistedExecutionStateSerdeTest {
     assertEquals(expected.kafkaAssignerMode(), actual.kafkaAssignerMode());
     assertEquals(expected.skipInterBrokerReplicaConcurrencyAdjustment(), actual.skipInterBrokerReplicaConcurrencyAdjustment());
     assertEquals(expected.intraBrokerMovementsBrokerByBroker(), actual.intraBrokerMovementsBrokerByBroker());
+    assertEquals(expected.queuedExecution(), actual.queuedExecution());
     assertEquals(expected.logDirThrottle(), actual.logDirThrottle());
     assertEquals(expected.replicationThrottleAdjuster(), actual.replicationThrottleAdjuster());
     assertEquals(expected.replicationThrottleAdjusted(), actual.replicationThrottleAdjusted());
+    assertEquals(expected.queuedExecutionParameters(), actual.queuedExecutionParameters());
     assertEquals(expected.adjusterState(), actual.adjusterState());
     assertEquals(expected.userTask(), actual.userTask());
     assertEquals(expected.cleanupOnly(), actual.cleanupOnly());
@@ -182,6 +186,7 @@ public class PersistedExecutionStateSerdeTest {
     assertNull(deserialized.outsideExecutionFingerprint());
     assertNull(deserialized.logDirFingerprintByBroker());
     assertEquals(PersistedExecutionState.ReplicationThrottleAdjuster.OFF, deserialized.replicationThrottleAdjuster());
+    assertNull(deserialized.queuedExecutionParameters());
     assertNull(deserialized.adjusterState());
     assertNull(deserialized.userTask());
   }

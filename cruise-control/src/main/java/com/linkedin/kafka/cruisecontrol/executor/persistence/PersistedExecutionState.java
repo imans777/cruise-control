@@ -88,8 +88,10 @@ public final class PersistedExecutionState {
   private final boolean _kafkaAssignerMode;
   private final boolean _skipInterBrokerReplicaConcurrencyAdjustment;
   private final boolean _intraBrokerMovementsBrokerByBroker;
+  private final String _queuedExecution;
   private final Long _logDirThrottle;
   private final ReplicationThrottleAdjuster _replicationThrottleAdjuster;
+  private final Map<String, String> _queuedExecutionParameters;
   private final PersistedAdjusterState _adjusterState;
   private final PersistedUserTask _userTask;
   private final boolean _cleanupOnly;
@@ -122,9 +124,12 @@ public final class PersistedExecutionState {
     _kafkaAssignerMode = builder._kafkaAssignerMode;
     _skipInterBrokerReplicaConcurrencyAdjustment = builder._skipInterBrokerReplicaConcurrencyAdjustment;
     _intraBrokerMovementsBrokerByBroker = builder._intraBrokerMovementsBrokerByBroker;
+    _queuedExecution = builder._queuedExecution;
     _logDirThrottle = builder._logDirThrottle;
     _replicationThrottleAdjuster = builder._replicationThrottleAdjuster == null ? ReplicationThrottleAdjuster.OFF
                                                                                 : builder._replicationThrottleAdjuster;
+    _queuedExecutionParameters = builder._queuedExecutionParameters == null
+                                 ? null : Collections.unmodifiableMap(new TreeMap<>(builder._queuedExecutionParameters));
     _adjusterState = builder._adjusterState;
     _userTask = builder._userTask;
     _cleanupOnly = builder._cleanupOnly;
@@ -170,8 +175,10 @@ public final class PersistedExecutionState {
         .kafkaAssignerMode(_kafkaAssignerMode)
         .skipInterBrokerReplicaConcurrencyAdjustment(_skipInterBrokerReplicaConcurrencyAdjustment)
         .intraBrokerMovementsBrokerByBroker(_intraBrokerMovementsBrokerByBroker)
+        .queuedExecution(_queuedExecution)
         .logDirThrottle(_logDirThrottle)
         .replicationThrottleAdjuster(_replicationThrottleAdjuster)
+        .queuedExecutionParameters(_queuedExecutionParameters)
         .adjusterState(_adjusterState)
         .userTask(_userTask)
         .cleanupOnly(_cleanupOnly)
@@ -288,6 +295,13 @@ public final class PersistedExecutionState {
   }
 
   /**
+   * @return The type of an execution queued after this one for the same user task (queue_rebalance_disk, PR #39), or null if none.
+   */
+  public String queuedExecution() {
+    return _queuedExecution;
+  }
+
+  /**
    * @return the log dir throttle (bytes/sec) of the intra-broker replica movements of the execution, or null if they are not
    * throttled (PR #26; changed at runtime by PR #17).
    */
@@ -308,6 +322,14 @@ public final class PersistedExecutionState {
    */
   public boolean replicationThrottleAdjusted() {
     return _replicationThrottleAdjuster.wasOn();
+  }
+
+  /**
+   * @return The parameters of the execution queued after this one (see {@link #queuedExecution()}), to queue it again after a restart;
+   * or {@code null} if none, or not known (e.g. persisted by an older version).
+   */
+  public Map<String, String> queuedExecutionParameters() {
+    return _queuedExecutionParameters;
   }
 
   /**
@@ -398,8 +420,10 @@ public final class PersistedExecutionState {
     private boolean _kafkaAssignerMode;
     private boolean _skipInterBrokerReplicaConcurrencyAdjustment;
     private boolean _intraBrokerMovementsBrokerByBroker;
+    private String _queuedExecution;
     private Long _logDirThrottle;
     private ReplicationThrottleAdjuster _replicationThrottleAdjuster;
+    private Map<String, String> _queuedExecutionParameters;
     private PersistedAdjusterState _adjusterState;
     private PersistedUserTask _userTask;
     private boolean _cleanupOnly;
@@ -604,6 +628,16 @@ public final class PersistedExecutionState {
     }
 
     /**
+     * @param queuedExecution The type of an execution queued after this one for the same user task (queue_rebalance_disk, PR #39),
+     * or null if none.
+     * @return This builder.
+     */
+    public Builder queuedExecution(String queuedExecution) {
+      _queuedExecution = queuedExecution;
+      return this;
+    }
+
+    /**
      * @param logDirThrottle The log dir throttle (bytes/sec) of the intra-broker replica movements of the execution, or null
      * if they are not throttled (PR #26; changed at runtime by PR #17).
      * @return This builder.
@@ -620,6 +654,15 @@ public final class PersistedExecutionState {
      */
     public Builder replicationThrottleAdjuster(ReplicationThrottleAdjuster replicationThrottleAdjuster) {
       _replicationThrottleAdjuster = replicationThrottleAdjuster;
+      return this;
+    }
+
+    /**
+     * @param queuedExecutionParameters The parameters of the execution queued after this one, or {@code null} if none.
+     * @return This builder.
+     */
+    public Builder queuedExecutionParameters(Map<String, String> queuedExecutionParameters) {
+      _queuedExecutionParameters = queuedExecutionParameters;
       return this;
     }
 

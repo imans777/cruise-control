@@ -60,11 +60,13 @@ public final class PersistedExecutionStateSerde {
   static final String KAFKA_ASSIGNER_MODE = "kafkaAssignerMode";
   static final String SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT = "skipInterBrokerReplicaConcurrencyAdjustment";
   static final String INTRA_BROKER_MOVEMENTS_BROKER_BY_BROKER = "intraBrokerMovementsBrokerByBroker";
+  static final String QUEUED_EXECUTION = "queuedExecution";
   static final String LOG_DIR_THROTTLE = "logDirThrottle";
   // Replaced by REPLICATION_THROTTLE_ADJUSTER; still read, as states persisted before carry them.
   static final String REPLICATION_THROTTLE_ADJUSTMENT_DISABLED = "replicationThrottleAdjustmentDisabled";
   static final String REPLICATION_THROTTLE_ADJUSTED = "replicationThrottleAdjusted";
   static final String REPLICATION_THROTTLE_ADJUSTER = "replicationThrottleAdjuster";
+  static final String QUEUED_EXECUTION_PARAMETERS = "queuedExecutionParameters";
   static final String ADJUSTER = "adjuster";
   static final String LEADER_THROTTLE_BY_BROKER = "leaderThrottleByBroker";
   static final String FOLLOWER_THROTTLE_BY_BROKER = "followerThrottleByBroker";
@@ -155,8 +157,16 @@ public final class PersistedExecutionStateSerde {
     json.name(KAFKA_ASSIGNER_MODE).value(state.kafkaAssignerMode());
     json.name(SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).value(state.skipInterBrokerReplicaConcurrencyAdjustment());
     json.name(INTRA_BROKER_MOVEMENTS_BROKER_BY_BROKER).value(state.intraBrokerMovementsBrokerByBroker());
+    json.name(QUEUED_EXECUTION).value(state.queuedExecution());
     json.name(LOG_DIR_THROTTLE).value(state.logDirThrottle());
     json.name(REPLICATION_THROTTLE_ADJUSTER).value(state.replicationThrottleAdjuster().name());
+    if (state.queuedExecutionParameters() != null) {
+      json.name(QUEUED_EXECUTION_PARAMETERS).beginObject();
+      for (Map.Entry<String, String> entry : state.queuedExecutionParameters().entrySet()) {
+        json.name(entry.getKey()).value(entry.getValue());
+      }
+      json.endObject();
+    }
     json.endObject();
 
     PersistedAdjusterState adjusterState = state.adjusterState();
@@ -271,8 +281,15 @@ public final class PersistedExecutionStateSerde {
              .kafkaAssignerMode(required(parameters, KAFKA_ASSIGNER_MODE).getAsBoolean())
              .skipInterBrokerReplicaConcurrencyAdjustment(required(parameters, SKIP_INTER_BROKER_REPLICA_CONCURRENCY_ADJUSTMENT).getAsBoolean())
              .intraBrokerMovementsBrokerByBroker(optionalBoolean(parameters, INTRA_BROKER_MOVEMENTS_BROKER_BY_BROKER))
+             .queuedExecution(optionalString(parameters, QUEUED_EXECUTION))
              .logDirThrottle(optionalLong(parameters, LOG_DIR_THROTTLE))
              .replicationThrottleAdjuster(replicationThrottleAdjusterFromJson(parameters));
+      JsonElement queuedExecutionParameters = optional(parameters, QUEUED_EXECUTION_PARAMETERS);
+      if (queuedExecutionParameters != null) {
+        Map<String, String> queuedParameters = new TreeMap<>();
+        queuedExecutionParameters.getAsJsonObject().entrySet().forEach(e -> queuedParameters.put(e.getKey(), e.getValue().getAsString()));
+        builder.queuedExecutionParameters(queuedParameters);
+      }
       JsonElement adjuster = optional(root, ADJUSTER);
       if (adjuster != null) {
         JsonObject a = adjuster.getAsJsonObject();

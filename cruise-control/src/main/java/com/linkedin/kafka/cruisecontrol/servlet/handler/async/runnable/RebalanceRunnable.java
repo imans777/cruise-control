@@ -183,7 +183,8 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
     if (!_dryRun) {
       if (_queueRebalanceDisk) {
         // Queue the disk rebalance before the execution starts, so it is in place however quickly the execution completes.
-        _kafkaCruiseControl.queueExecution(_uuid, QueuedRebalanceDiskRunnable.TYPE, new QueuedRebalanceDiskRunnable(_kafkaCruiseControl, this));
+        QueuedRebalanceDiskRunnable queuedRebalanceDisk = new QueuedRebalanceDiskRunnable(_kafkaCruiseControl, this);
+        _kafkaCruiseControl.queueExecution(_uuid, QueuedRebalanceDiskRunnable.TYPE, queuedRebalanceDisk, queuedRebalanceDisk.parameters());
         if (result.goalProposals().isEmpty()) {
           // Nothing to move between brokers: the disk rebalance starts right away.
           _kafkaCruiseControl.startQueuedExecutionNow(_uuid);

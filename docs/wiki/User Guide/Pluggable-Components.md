@@ -110,14 +110,16 @@ finishes, and at least every `executor.state.checkpoint.interval.ms` while nothi
 finishes (i.e. completes, is stopped, or fails), and retained if Cruise Control is shut down or crashes during the execution. With
 `resume.interrupted.execution.on.startup` enabled, a graceful shutdown leaves the in-flight movements and their throttles to Kafka, as
 a crash would, so that the restart adopts them. The state also carries what the concurrency adjuster changed (per-broker replication
-throttles and concurrency), runtime changes made with the `admin` endpoint, and the user task that started the execution.
+throttles and concurrency), runtime changes made with the `admin` endpoint, the user task that started the execution, and an execution
+queued after it (e.g. a disk rebalance, `queue_rebalance_disk`) with its parameters.
 
 Upon startup, Cruise Control reconciles the persisted state (if any) with the current state of the cluster -- e.g. a task that was in
 progress is checked for whether Kafka is still executing it, has completed it, or has not started it. Then, it either resumes the
 remaining tasks of the interrupted execution (see `resume.interrupted.execution.on.startup`) -- monitoring the tasks that Kafka is still
 executing rather than submitting them again, continuing from the throttles and the concurrency in force before the restart, and reported
 under the same user task -- or cleans it up: it waits for the in-flight tasks (reassignments and log dir movements) to finish and removes
-the throttles left behind by the interrupted execution.
+the throttles left behind by the interrupted execution. A queued execution is queued again after the resumed one; if the interrupted
+execution had completed, the execution queued after it starts.
 
 An interrupted execution is resumed only if the cluster is as the execution left it. It is cleaned up instead if it was last checkpointed
 longer ago than `resume.interrupted.execution.max.age.ms`, if it was resumed `resume.interrupted.execution.max.count` times in a row

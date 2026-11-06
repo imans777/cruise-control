@@ -44,6 +44,7 @@ import com.linkedin.kafka.cruisecontrol.monitor.MonitorUtils;
 import com.linkedin.kafka.cruisecontrol.monitor.metricdefinition.KafkaMetricDef;
 import com.linkedin.kafka.cruisecontrol.monitor.task.LoadMonitorTaskRunner;
 import com.linkedin.kafka.cruisecontrol.servlet.UserTaskManager;
+import com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable.QueuedRebalanceDiskRunnable;
 import com.linkedin.kafka.cruisecontrol.servlet.response.stats.BrokerStats;
 import java.io.InputStream;
 import java.util.Collection;
@@ -223,6 +224,10 @@ public class KafkaCruiseControl {
   public void startUp() {
     LOG.info("Starting Cruise Control...");
     _loadMonitor.startUp();
+    // A disk rebalance queued after the interrupted execution is queued again (PR #39).
+    _executor.setQueuedExecutionFactory((type, uuid, parameters) -> QueuedRebalanceDiskRunnable.TYPE.equals(type)
+                                                                    ? QueuedRebalanceDiskRunnable.fromParameters(this, uuid, parameters)
+                                                                    : null);
     // Recover the execution interrupted by a restart (if any) before starting the anomaly detection that may start a new execution.
     try {
       _executor.recoverInterruptedExecution(_loadMonitor);
@@ -950,6 +955,18 @@ public class KafkaCruiseControl {
    */
   public void queueExecution(String uuid, String type, Runnable start) {
     _executor.queueExecution(uuid, type, start);
+  }
+
+  /**
+   * See {@link Executor#queueExecution(String, String, Runnable, Map)}.
+   *
+   * @param uuid UUID of the user task whose execution is about to start.
+   * @param type The type of the queued execution (e.g. REBALANCE_DISK).
+   * @param start Generates the proposals of the queued execution and executes them.
+   * @param parameters The parameters to rebuild the queued execution from after a restart.
+   */
+  public void queueExecution(String uuid, String type, Runnable start, Map<String, String> parameters) {
+    _executor.queueExecution(uuid, type, start, parameters);
   }
 
   /**

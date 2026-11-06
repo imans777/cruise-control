@@ -327,6 +327,14 @@ InterruptedExecutionRecovery:
         - RETAINED_FOR_RESTART
     reasonNotResumed:
       type: string
+    queuedExecutionNotResumed:
+      type: string
+      description: The type of an execution that was queued after the interrupted one (e.g. REBALANCE_DISK), which the restart
+        does not queue again.
+    queuedExecutionResumed:
+      type: string
+      description: The type of an execution that was queued after the interrupted one (e.g. REBALANCE_DISK), which the restart
+        queues again after the resumed execution -- or starts, if the interrupted execution had completed.
     divergences:
       type: array
       items:

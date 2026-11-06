@@ -881,6 +881,27 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
   }
 
   @Test
+  public void testQueuedExecutionIsReportedNotResumed() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal pending = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    // The interrupted rebalance had a disk rebalance queued after it (queue_rebalance_disk, PR #39).
+    _store.save(interruptedExecutionState(null, List.of(pending)).toBuilder().queuedExecution("REBALANCE_DISK").build());
+    int numSavedStatesBeforeResume = _store.savedStates().size();
+
+    RecordingNotifier notifier = new RecordingNotifier();
+    Executor executor = newExecutor(true, null, notifier, mockAnomalyDetectorManager(null));
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    // The recovery reports that the queued disk rebalance is not resumed, and alerts.
+    assertEquals("REBALANCE_DISK", executor.state().recovery().get("queuedExecutionNotResumed"));
+    waitForExecutionToFinish(executor);
+    assertTrue(notifier.anyMessageContains("queued REBALANCE_DISK is not resumed"));
+    // The resumed execution does not queue it again.
+    PersistedExecutionState resumedState = _store.savedStates().get(numSavedStatesBeforeResume);
+    assertEquals(1, resumedState.resumeCount());
+    assertNull(resumedState.queuedExecution());
+  }
+
+  @Test
   public void testResumeKeepsBrokerByBrokerIntraBrokerMovements() throws Exception {
     createTopic(Map.of(0, List.of(0, 1)));
     ExecutionProposal pending = proposal(TP0, List.of(0, 1), List.of(0, 2));
@@ -1298,6 +1319,76 @@ public class ExecutorRecoveryTest extends CCKafkaClientsIntegrationTestHarness {
     } finally {
       setAlterLogDirsRate(0, null);
     }
+  }
+
+  /**
+   * A queued execution rebuilt by the test factory: it records that it ran, and finishes without executing.
+   */
+  private static final class RecordingQueuedExecution {
+    private final List<Map<String, String>> _parametersOfRuns = new CopyOnWriteArrayList<>();
+
+    Executor.QueuedExecutionFactory factory(Executor executor) {
+      return (type, uuid, parameters) -> () -> {
+        _parametersOfRuns.add(parameters);
+        executor.finishQueuedExecution(uuid, false, "the test queued execution has nothing to do");
+      };
+    }
+
+    List<Map<String, String>> parametersOfRuns() {
+      return _parametersOfRuns;
+    }
+  }
+
+  @Test
+  public void testResumeQueuesTheQueuedExecutionAgain() throws Exception {
+    createTopic(Map.of(0, List.of(0, 1)));
+    ExecutionProposal pending = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    // The interrupted rebalance had a disk rebalance queued after it, persisted with its parameters (PR #39).
+    Map<String, String> parameters = Map.of("logDirThrottle", "1000");
+    _store.save(interruptedExecutionState(null, List.of(pending)).toBuilder().queuedExecution("REBALANCE_DISK")
+                                                                     .queuedExecutionParameters(parameters).build());
+    int numSavedStatesBeforeResume = _store.savedStates().size();
+    Executor executor = newExecutor(true, null, new RecordingNotifier(), mockAnomalyDetectorManager(null));
+    RecordingQueuedExecution queued = new RecordingQueuedExecution();
+    executor.setQueuedExecutionFactory(queued.factory(executor));
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    assertEquals("REBALANCE_DISK", recovery(executor).get("queuedExecutionResumed"));
+    assertNull(recovery(executor).get("queuedExecutionNotResumed"));
+    // The resumed execution queues it again, and persists it again.
+    PersistedExecutionState resumedState = _store.savedStates().get(numSavedStatesBeforeResume);
+    assertEquals("REBALANCE_DISK", resumedState.queuedExecution());
+    assertEquals(parameters, resumedState.queuedExecutionParameters());
+    // It starts once the resumed execution completes.
+    waitUntilTrue(() -> queued.parametersOfRuns().size() == 1 && !executor.hasOngoingExecution()
+                        && executor.state().state() == ExecutorState.State.NO_TASK_IN_PROGRESS,
+                  "The queued execution did not run", WAIT_TIME_MS, 100L);
+    assertEquals(parameters, queued.parametersOfRuns().get(0));
+    assertEquals(List.of(0, 2), currentReplicas(0));
+    assertNull(_store.state());
+  }
+
+  @Test
+  public void testRestartStartsTheExecutionQueuedAfterACompletedExecution() throws Exception {
+    // The rebalance had completed, and its queued disk rebalance had not started yet when Cruise Control stopped.
+    createTopic(Map.of(0, List.of(0, 2)));
+    ExecutionProposal completed = proposal(TP0, List.of(0, 1), List.of(0, 2));
+    _store.save(interruptedExecutionState(null, List.of(completed)).toBuilder()
+        .queuedExecution("REBALANCE_DISK")
+        .queuedExecutionParameters(Map.of("fastMode", "true"))
+        .tasks(List.of(new PersistedTask(ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION, TP0, PersistedTask.NO_BROKER_ID,
+                                         ExecutionTaskState.COMPLETED, 1L, 2L)))
+        .build());
+    RecordingNotifier notifier = new RecordingNotifier();
+    Executor executor = newExecutor(true, null, notifier, mockAnomalyDetectorManager(null));
+    RecordingQueuedExecution queued = new RecordingQueuedExecution();
+    executor.setQueuedExecutionFactory(queued.factory(executor));
+    executor.recoverInterruptedExecution(mockLoadMonitor());
+    waitUntilTrue(() -> queued.parametersOfRuns().size() == 1 && executor.state().state() == ExecutorState.State.NO_TASK_IN_PROGRESS,
+                  "The queued execution did not run", WAIT_TIME_MS, 100L);
+    assertEquals("RESUMED", recovery(executor).get("status"));
+    assertEquals("REBALANCE_DISK", recovery(executor).get("queuedExecutionResumed"));
+    assertTrue(notifier.anyMessageContains("starting the REBALANCE_DISK queued after it"));
+    assertNull(_store.state());
   }
 
   @Test
