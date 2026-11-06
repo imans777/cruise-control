@@ -52,6 +52,7 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
   protected final Set<Integer> _destinationBrokerIds;
   protected final boolean _isRebalanceDiskMode;
   protected final boolean _isRebalanceDiskBrokerByBroker;
+  protected final boolean _queueRebalanceDisk;
   protected static final boolean SKIP_AUTO_REFRESHING_CONCURRENCY = false;
 
   /**
@@ -114,6 +115,7 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
     _destinationBrokerIds = destinationBrokerIds;
     _isRebalanceDiskMode = isRebalanceDiskMode;
     _isRebalanceDiskBrokerByBroker = SELF_HEALING_IS_REBALANCE_DISK_BROKER_BY_BROKER;
+    _queueRebalanceDisk = false;
   }
 
   public RebalanceRunnable(KafkaCruiseControl kafkaCruiseControl,
@@ -135,6 +137,7 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
     _destinationBrokerIds = parameters.destinationBrokerIds();
     _isRebalanceDiskMode = parameters.isRebalanceDiskMode();
     _isRebalanceDiskBrokerByBroker = parameters.isRebalanceDiskBrokerByBroker();
+    _queueRebalanceDisk = parameters.queueRebalanceDisk();
   }
 
   /**
@@ -178,6 +181,15 @@ public class RebalanceRunnable extends GoalBasedOperationRunnable {
                                                                 _fastMode);
     OptimizerResult result = proposalsRunnable.computeResult();
     if (!_dryRun) {
+      if (_queueRebalanceDisk) {
+        // Queue the disk rebalance before the execution starts, so it is in place however quickly the execution completes.
+        _kafkaCruiseControl.queueExecution(_uuid, QueuedRebalanceDiskRunnable.TYPE, new QueuedRebalanceDiskRunnable(_kafkaCruiseControl, this));
+        if (result.goalProposals().isEmpty()) {
+          // Nothing to move between brokers: the disk rebalance starts right away.
+          _kafkaCruiseControl.startQueuedExecutionNow(_uuid);
+          return result;
+        }
+      }
       _kafkaCruiseControl.executeProposals(result.goalProposals(), Collections.emptySet(), isKafkaAssignerMode(_goals),
           _concurrentInterBrokerPartitionMovements, _maxInterBrokerPartitionMovements,
           _concurrentIntraBrokerPartitionMovements, _clusterLeaderMovementConcurrency, _brokerLeaderMovementConcurrency,

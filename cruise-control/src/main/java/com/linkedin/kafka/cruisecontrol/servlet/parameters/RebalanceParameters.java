@@ -31,6 +31,8 @@ import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.REASON_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.STOP_ONGOING_EXECUTION_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.REBALANCE_DISK_BROKER_BY_BROKER_PARAM;
+import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.REBALANCE_DISK_MODE_PARAM;
+import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.QUEUE_REBALANCE_DISK_PARAM;
 
 
 /**
@@ -78,6 +80,7 @@ public class RebalanceParameters extends ProposalsParameters {
     validParameterNames.add(REVIEW_ID_PARAM);
     validParameterNames.add(STOP_ONGOING_EXECUTION_PARAM);
     validParameterNames.add(REBALANCE_DISK_BROKER_BY_BROKER_PARAM);
+    validParameterNames.add(QUEUE_REBALANCE_DISK_PARAM);
     validParameterNames.addAll(ProposalsParameters.CASE_INSENSITIVE_PARAMETER_NAMES);
     CASE_INSENSITIVE_PARAMETER_NAMES = Collections.unmodifiableSortedSet(validParameterNames);
   }
@@ -96,6 +99,7 @@ public class RebalanceParameters extends ProposalsParameters {
   protected String _reason;
   protected boolean _stopOngoingExecution;
   protected boolean _isRebalanceDiskBrokerByBroker;
+  protected boolean _queueRebalanceDisk;
 
   public RebalanceParameters() {
     super();
@@ -126,6 +130,15 @@ public class RebalanceParameters extends ProposalsParameters {
     _stopOngoingExecution = ParameterUtils.stopOngoingExecution(_requestContext);
     if (_stopOngoingExecution && _dryRun) {
       throw new UserRequestException(String.format("%s and %s cannot both be set to true.", STOP_ONGOING_EXECUTION_PARAM, DRY_RUN_PARAM));
+    }
+    _queueRebalanceDisk = ParameterUtils.queueRebalanceDisk(_requestContext);
+    if (_queueRebalanceDisk && _dryRun) {
+      throw new UserRequestException(String.format("%s requires %s=false: a dry run has no execution to queue a disk rebalance after.",
+                                                   QUEUE_REBALANCE_DISK_PARAM, DRY_RUN_PARAM));
+    }
+    if (_queueRebalanceDisk && _isRebalanceDiskMode) {
+      throw new UserRequestException(String.format("%s and %s cannot both be set to true.", QUEUE_REBALANCE_DISK_PARAM,
+                                                   REBALANCE_DISK_MODE_PARAM));
     }
   }
 
@@ -195,6 +208,13 @@ public class RebalanceParameters extends ProposalsParameters {
    */
   public boolean isRebalanceDiskBrokerByBroker() {
     return _isRebalanceDiskBrokerByBroker;
+  }
+
+  /**
+   * @return {@code true} to rebalance the disks of the brokers once the execution of this rebalance completes.
+   */
+  public boolean queueRebalanceDisk() {
+    return _queueRebalanceDisk;
   }
 
   @Override

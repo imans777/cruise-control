@@ -28,6 +28,8 @@ public final class ExecutorState {
   private static final String TRIGGERED_SELF_HEALING_TASK_ID = "triggeredSelfHealingTaskId";
   @JsonResponseField(required = false)
   private static final String TRIGGERED_TASK_REASON = "triggeredTaskReason";
+  @JsonResponseField(required = false)
+  private static final String QUEUED_EXECUTION = "queuedExecution";
   @JsonResponseField
   private static final String STATE = "state";
   // The throttles in force for the ongoing execution, if any.
@@ -234,6 +236,8 @@ public final class ExecutorState {
   private final Map<Integer, String> _ongoingLogDirThrottleByBroker;
   // The recovery of the latest execution interrupted by a Cruise Control restart (if any).
   private final Map<String, Object> _recovery;
+  // The type of an execution queued after the ongoing one of the same user task (e.g. REBALANCE_DISK), or null if none.
+  private final String _queuedExecution;
 
   private ExecutorState(State state,
                         ExecutionTasksSummary executionTasksSummary,
@@ -257,11 +261,13 @@ public final class ExecutorState {
     _ongoingReplicationThrottleByBroker = null;
     _ongoingLogDirThrottleByBroker = ongoingLogDirThrottleByBroker;
     _recovery = null;
+    _queuedExecution = null;
   }
 
   private ExecutorState(ExecutorState executorState,
                         SortedMap<Integer, BrokerReplicationThrottle> ongoingReplicationThrottleByBroker,
-                        Map<String, Object> recovery) {
+                        Map<String, Object> recovery,
+                        String queuedExecution) {
     _state = executorState._state;
     _executionTasksSummary = executorState._executionTasksSummary;
     _executionConcurrencySummary = executorState._executionConcurrencySummary;
@@ -274,6 +280,7 @@ public final class ExecutorState {
     _ongoingReplicationThrottleByBroker = ongoingReplicationThrottleByBroker;
     _ongoingLogDirThrottleByBroker = executorState._ongoingLogDirThrottleByBroker;
     _recovery = recovery;
+    _queuedExecution = queuedExecution;
   }
 
   /**
@@ -289,7 +296,7 @@ public final class ExecutorState {
     return new ExecutorState(_state, _executionTasksSummary, _executionConcurrencySummary, _uuid, _reason,
                              _recentlyDemotedBrokers, _recentlyRemovedBrokers, _isTriggeredByUserRequest,
                              ongoingReplicationThrottle, ongoingLogDirThrottleByBroker)
-        .withReplicationThrottleByBroker(_ongoingReplicationThrottleByBroker).withRecovery(_recovery);
+        .withReplicationThrottleByBroker(_ongoingReplicationThrottleByBroker).withRecovery(_recovery).withQueuedExecution(_queuedExecution);
   }
 
   /**
@@ -300,7 +307,7 @@ public final class ExecutorState {
    */
   public ExecutorState withReplicationThrottleByBroker(SortedMap<Integer, BrokerReplicationThrottle> ongoingReplicationThrottleByBroker) {
     return ongoingReplicationThrottleByBroker == null || ongoingReplicationThrottleByBroker.isEmpty()
-           ? this : new ExecutorState(this, ongoingReplicationThrottleByBroker, _recovery);
+           ? this : new ExecutorState(this, ongoingReplicationThrottleByBroker, _recovery, _queuedExecution);
   }
 
   /**
@@ -308,7 +315,30 @@ public final class ExecutorState {
    * @return This executor state, along with the given recovery of an interrupted execution.
    */
   public ExecutorState withRecovery(Map<String, Object> recovery) {
-    return recovery == null ? this : new ExecutorState(this, _ongoingReplicationThrottleByBroker, recovery);
+    return recovery == null ? this : new ExecutorState(this, _ongoingReplicationThrottleByBroker, recovery, _queuedExecution);
+  }
+
+  /**
+   * @param queuedExecution The type of an execution queued after the ongoing one of the same user task (e.g. REBALANCE_DISK), or
+   * {@code null} if none.
+   * @return This executor state, along with the given queued execution.
+   */
+  public ExecutorState withQueuedExecution(String queuedExecution) {
+    return queuedExecution == null ? this : new ExecutorState(this, _ongoingReplicationThrottleByBroker, _recovery, queuedExecution);
+  }
+
+  /**
+   * @return The type of an execution queued after the ongoing one of the same user task, or {@code null} if none.
+   */
+  public String queuedExecution() {
+    return _queuedExecution;
+  }
+
+  /**
+   * @return {@code true} if the execution is triggered by a user request, {@code false} otherwise.
+   */
+  public boolean isTriggeredByUserRequest() {
+    return _isTriggeredByUserRequest;
   }
 
   /**
@@ -751,6 +781,9 @@ public final class ExecutorState {
     if (_recovery != null) {
       execState.put(RECOVERY, _recovery);
     }
+    if (_queuedExecution != null) {
+      execState.put(QUEUED_EXECUTION, _queuedExecution);
+    }
     return execState;
   }
 
@@ -758,6 +791,13 @@ public final class ExecutorState {
    * @return Plaintext response for the executor state.
    */
   public String getPlaintext() {
+    String plaintext = plaintextWithoutQueuedExecution();
+    return _queuedExecution == null ? plaintext
+                                    : String.format("%s, %s: %s}", plaintext.substring(0, plaintext.lastIndexOf('}')), QUEUED_EXECUTION,
+                                                    _queuedExecution);
+  }
+
+  private String plaintextWithoutQueuedExecution() {
     String plaintext = plaintextWithoutRecovery();
     // Every plaintext state ends with a closing brace.
     return _recovery == null ? plaintext : String.format("%s, %s: %s}", plaintext.substring(0, plaintext.length() - 1), RECOVERY, _recovery);
