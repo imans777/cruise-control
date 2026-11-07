@@ -132,6 +132,34 @@ public class Host implements Serializable {
   }
 
   /**
+   * Mark specified disk for removal and update the capacity.
+   *
+   * @param brokerId The id of broker which host the disk.
+   * @param logdir Log directory of the disk.
+   * @return The disk capacity dropped due to the disk removal.
+   */
+  double markDiskForRemoval(int brokerId, String logdir) {
+    Broker broker = broker(brokerId);
+    double capacityDropped = broker.markDiskForRemoval(logdir);
+    _hostCapacity[DISK.id()] -= capacityDropped;
+    return capacityDropped;
+  }
+
+  /**
+   * Remove specified disk from the broker and update the capacity.
+   *
+   * @param brokerId The id of broker which hosts the disk.
+   * @param logdir Log directory of the disk.
+   * @return The capacity of the removed disk.
+   */
+  double removeDisk(int brokerId, String logdir) {
+    Broker broker = broker(brokerId);
+    double capacityRemoved = broker.removeDisk(logdir);
+    _hostCapacity[DISK.id()] -= capacityRemoved;
+    return capacityRemoved;
+  }
+
+  /**
    * @return The name of the host
    */
   public String name() {

@@ -6,17 +6,21 @@ package com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable;
 
 import com.linkedin.cruisecontrol.exception.NotEnoughValidWindowsException;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControl;
+import com.linkedin.kafka.cruisecontrol.analyzer.BalancingConstraint;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizerResult;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.Goal;
+import com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.exception.KafkaCruiseControlException;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
+import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.TopicConfigurationParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.TopicReplicationFactorChangeParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.response.OptimizationResult;
+import com.linkedin.kafka.cruisecontrol.servlet.response.stats.BrokerStats;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -37,7 +41,7 @@ import static com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable.Ru
 import static com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable.RunnableUtils.SELF_HEALING_EXECUTION_PROGRESS_CHECK_INTERVAL_MS;
 import static com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable.RunnableUtils.computeOptimizationOptions;
 import static com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable.RunnableUtils.populateRackInfoForReplicationFactorChange;
-import static com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable.RunnableUtils.partitionWithOfflineReplicas;
+import static com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable.RunnableUtils.partitionWithOfflineReplicasAfterReplicationFactorChange;
 import static com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable.RunnableUtils.topicsForReplicationFactorChange;
 
 
@@ -64,7 +68,10 @@ import static com.linkedin.kafka.cruisecontrol.servlet.handler.async.runnable.Ru
  * </ol>
  *
  * If the current replication factor of partition is larger than target replication factor, remove one or more follower
- * replicas from the partition. Replicas are removed following the reverse order of position in replica list of partition.
+ * replicas from the partition. Offline replicas (i.e. on dead brokers or broken disks) are removed first, then out-of-sync
+ * replicas, then the remaining followers following the reverse order of position in replica list of partition. Hence,
+ * decreasing the replication factor works when there are offline replicas, as long as all of them are removed by the
+ * replication factor change.
  *
  * For a partition, the PartitionInfo can be inconsistent with clusterModel. E.g.
  * In the PartitionInfo, a partition has replicas [A, B, C, D]. In clusterModel, the same partition only has replicas [A, B, C].
@@ -164,15 +171,19 @@ public class UpdateTopicConfigurationRunnable extends GoalBasedOperationRunnable
   protected void init() {
     super.init();
     _cluster = _kafkaCruiseControl.kafkaCluster();
-    // Ensure there is no offline replica in the cluster.
-    PartitionInfo partitionInfo = partitionWithOfflineReplicas(_cluster);
+    _topicsToChangeByReplicationFactor = topicsForReplicationFactorChange(_topicPatternByReplicationFactor, _cluster);
+    // Ensure there is no offline replica in the cluster that would remain after the replication factor change. Offline replicas
+    // that are removed by decreasing the replication factor are fine (e.g. to recover a cluster with dead brokers or broken disks).
+    PartitionInfo partitionInfo = partitionWithOfflineReplicasAfterReplicationFactorChange(_cluster, _topicsToChangeByReplicationFactor);
     if (partitionInfo != null) {
-      throw new IllegalStateException(String.format("Topic partition %s-%d has offline replicas on brokers %s.",
+      throw new IllegalStateException(String.format("Topic partition %s-%d has offline replicas on brokers %s, which would not be removed "
+                                                    + "by the requested replication factor change. Either decrease the replication "
+                                                    + "factor of the topic to at most the number of its online replicas, or fix the "
+                                                    + "offline replicas first (e.g. using fix_offline_replicas endpoint).",
                                                     partitionInfo.topic(), partitionInfo.partition(),
                                                     Arrays.stream(partitionInfo.offlineReplicas()).mapToInt(Node::id)
                                                           .boxed().collect(Collectors.toSet())));
     }
-    _topicsToChangeByReplicationFactor = topicsForReplicationFactorChange(_topicPatternByReplicationFactor, _cluster);
   }
 
   @Override
@@ -193,24 +204,33 @@ public class UpdateTopicConfigurationRunnable extends GoalBasedOperationRunnable
                                                                          _excludeRecentlyDemotedBrokers,
                                                                          _excludeRecentlyRemovedBrokers,
                                                                          _excludedTopics,
+                                                                         _includedTopics,
                                                                          Collections.emptySet(),
                                                                          true,
                                                                          _fastMode);
     populateRackInfoForReplicationFactorChange(_topicsToChangeByReplicationFactor, _cluster,
                                                _skipRackAwarenessCheck, brokersByRack, rackByBroker);
     Map<TopicPartition, List<ReplicaPlacementInfo>> initReplicaDistribution = clusterModel.getReplicaDistribution();
+    // Adding and removing replicas changes the load and the stats of the cluster, hence the load and stats before the change
+    // are taken beforehand (over the same brokers as the optimizer takes its stats).
+    BrokerStats brokerStatsBeforeChange = clusterModel.brokerStats(null);
+    ClusterModelStats clusterModelStatsBeforeChange =
+        clusterModel.getClusterStats(new BalancingConstraint(_kafkaCruiseControl.config()), optimizationOptions,
+                                     GoalUtils.diskStatsBrokerIds(_goalsByPriority, optimizationOptions));
     // First try to add and remove replicas to achieve the replication factor for topics of interest.
     clusterModel.createOrDeleteReplicas(_topicsToChangeByReplicationFactor, brokersByRack, rackByBroker, _cluster);
     // Then further optimize the location of newly added replicas based on goals. Here we restrict the replica movement to
     // only considering newly added replicas, in order to minimize the total bytes to move.
     OptimizerResult result = _kafkaCruiseControl.optimizations(clusterModel, _goalsByPriority, _operationProgress,
-                                                               initReplicaDistribution, optimizationOptions);
+                                                               initReplicaDistribution, optimizationOptions,
+                                                               brokerStatsBeforeChange, clusterModelStatsBeforeChange);
     if (!_dryRun) {
       _kafkaCruiseControl.executeProposals(result.goalProposals(), Collections.emptySet(), false, _concurrentInterBrokerPartitionMovements,
           _maxInterBrokerPartitionMovements,
           0, _clusterLeaderMovementConcurrency, _brokerLeaderMovementConcurrency,
           _executionProgressCheckIntervalMs, _replicaMovementStrategy, _replicationThrottle, _isTriggeredByUserRequest, _uuid,
-          SKIP_AUTO_REFRESHING_CONCURRENCY);
+          SKIP_AUTO_REFRESHING_CONCURRENCY,
+          false);
     }
     return result;
   }
