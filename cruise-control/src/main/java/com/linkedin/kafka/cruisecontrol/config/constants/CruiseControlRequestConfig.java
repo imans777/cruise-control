@@ -12,6 +12,7 @@ import com.linkedin.kafka.cruisecontrol.servlet.handler.async.TopicConfiguration
 import com.linkedin.kafka.cruisecontrol.servlet.handler.async.AddBrokerRequest;
 import com.linkedin.kafka.cruisecontrol.servlet.handler.async.RemoveBrokerRequest;
 import com.linkedin.kafka.cruisecontrol.servlet.handler.sync.UserPermissionRequest;
+import com.linkedin.kafka.cruisecontrol.servlet.handler.async.ReassignPartitionsRequest;
 import com.linkedin.kafka.cruisecontrol.servlet.handler.async.RemoveDisksRequest;
 import com.linkedin.kafka.cruisecontrol.servlet.handler.async.DemoteRequest;
 import com.linkedin.kafka.cruisecontrol.servlet.handler.async.RebalanceRequest;
@@ -197,6 +198,13 @@ public final class CruiseControlRequestConfig {
   public static final String DEFAULT_REMOVE_DISKS_REQUEST_CLASS = RemoveDisksRequest.class.getName();
   public static final String REMOVE_DISKS_REQUEST_CLASS_DOC = "The class to handle a disks removal request.";
 
+  /**
+   * <code>reassign.partitions.request.class</code>
+   */
+  public static final String REASSIGN_PARTITIONS_REQUEST_CLASS_CONFIG = "reassign.partitions.request.class";
+  public static final String DEFAULT_REASSIGN_PARTITIONS_REQUEST_CLASS = ReassignPartitionsRequest.class.getName();
+  public static final String REASSIGN_PARTITIONS_REQUEST_CLASS_DOC = "The class to handle a manual partition reassignment request.";
+
   private CruiseControlRequestConfig() {
   }
 
@@ -321,6 +329,11 @@ public final class CruiseControlRequestConfig {
                             ConfigDef.Type.CLASS,
                             DEFAULT_REMOVE_DISKS_REQUEST_CLASS,
                             ConfigDef.Importance.MEDIUM,
-                            REMOVE_DISKS_REQUEST_CLASS_DOC);
+                            REMOVE_DISKS_REQUEST_CLASS_DOC)
+                    .define(REASSIGN_PARTITIONS_REQUEST_CLASS_CONFIG,
+                            ConfigDef.Type.CLASS,
+                            DEFAULT_REASSIGN_PARTITIONS_REQUEST_CLASS,
+                            ConfigDef.Importance.MEDIUM,
+                            REASSIGN_PARTITIONS_REQUEST_CLASS_DOC);
   }
 }

@@ -118,6 +118,23 @@ PartitionLoadEndpoint:
         description: Reason for request.
         schema:
           type: string
+      - name: populate_disk_info
+        in: query
+        description: Whether to show the log directory of each replica (leaderLogdir and followerLogdirs), as reported by Kafka.
+        schema:
+          type: boolean
+          default: false
+      - name: brokerid_and_logdirs
+        in: query
+        description: List of broker id and log directory pairs (e.g. 101-/data/d1) to show only partitions with a replica on one of
+                     these log directories. Implies populate_disk_info.
+        schema:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        # default is an empty map
     responses:
       '200':
         description: Successful partition load state response.

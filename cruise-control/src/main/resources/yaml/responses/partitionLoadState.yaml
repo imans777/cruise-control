@@ -53,3 +53,9 @@ PartitionLoadRecord:
     msg_in:
       type: integer
       format: double
+    leaderLogdir:
+      type: string
+    followerLogdirs:
+      type: array
+      items:
+        type: string
