@@ -7,6 +7,9 @@ package com.linkedin.kafka.cruisecontrol.servlet.parameters;
 import com.linkedin.cruisecontrol.http.CruiseControlRequestContext;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
+import com.linkedin.kafka.cruisecontrol.executor.ExecutionTimeWindow;
+import com.linkedin.kafka.cruisecontrol.servlet.UserRequestException;
+import java.time.ZoneId;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -14,6 +17,8 @@ import com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint;
 import org.easymock.EasyMock;
 import org.junit.Assert;
 import org.junit.Test;
+
+import static org.junit.Assert.assertThrows;
 
 public class ParameterUtilsTest {
 
@@ -166,6 +171,77 @@ public class ParameterUtilsTest {
 
     EasyMock.verify(mockRequest);
     Assert.assertEquals(Long.valueOf(EXECUTION_PROGRESS_CHECK_INTERVAL_STRING), executionProgressCheckIntervalMs);
+  }
+
+  private static CruiseControlRequestContext mockRequestWithParameters(Map<String, String> parameters) {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    Map<String, String[]> paramMap = new HashMap<>();
+    parameters.keySet().forEach(name -> paramMap.put(name, new String[]{name}));
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(paramMap).anyTimes();
+    parameters.forEach((name, value) -> EasyMock.expect(mockRequest.getParameter(name)).andReturn(value).anyTimes());
+    EasyMock.replay(mockRequest);
+    return mockRequest;
+  }
+
+  private static KafkaCruiseControlConfig mockConfigWithExecutionWindowTimeZone(String timeZone) {
+    KafkaCruiseControlConfig controlConfig = EasyMock.mock(KafkaCruiseControlConfig.class);
+    EasyMock.expect(controlConfig.getString(ExecutorConfig.EXECUTION_WINDOW_TIMEZONE_CONFIG)).andReturn(timeZone).anyTimes();
+    EasyMock.replay(controlConfig);
+    return controlConfig;
+  }
+
+  private static Map<String, String> executionWindowParameters(String startHour, String endHour) {
+    Map<String, String> parameters = new HashMap<>();
+    if (startHour != null) {
+      parameters.put(ParameterUtils.EXECUTION_WINDOW_START_HOUR_PARAM, startHour);
+    }
+    if (endHour != null) {
+      parameters.put(ParameterUtils.EXECUTION_WINDOW_END_HOUR_PARAM, endHour);
+    }
+    return parameters;
+  }
+
+  @Test
+  public void testParseExecutionTimeWindowNoValue() {
+    CruiseControlRequestContext mockRequest = mockRequestWithParameters(Collections.emptyMap());
+    Assert.assertNull(ParameterUtils.executionTimeWindow(mockRequest, mockConfigWithExecutionWindowTimeZone("UTC")));
+  }
+
+  @Test
+  public void testParseExecutionTimeWindowWithValue() {
+    CruiseControlRequestContext mockRequest = mockRequestWithParameters(executionWindowParameters("7", "14"));
+    ExecutionTimeWindow window = ParameterUtils.executionTimeWindow(mockRequest, mockConfigWithExecutionWindowTimeZone("Asia/Tehran"));
+    Assert.assertEquals(new ExecutionTimeWindow(7, 14, ZoneId.of("Asia/Tehran")), window);
+
+    // An empty time zone config falls back to the JVM default time zone.
+    window = ParameterUtils.executionTimeWindow(mockRequest, mockConfigWithExecutionWindowTimeZone(""));
+    Assert.assertEquals(new ExecutionTimeWindow(7, 14, ZoneId.systemDefault()), window);
+
+    // A window that spans midnight.
+    mockRequest = mockRequestWithParameters(executionWindowParameters("22", "6"));
+    window = ParameterUtils.executionTimeWindow(mockRequest, mockConfigWithExecutionWindowTimeZone("UTC"));
+    Assert.assertEquals(new ExecutionTimeWindow(22, 6, ZoneId.of("UTC")), window);
+  }
+
+  @Test
+  public void testParseExecutionTimeWindowWithInvalidValue() {
+    KafkaCruiseControlConfig config = mockConfigWithExecutionWindowTimeZone("UTC");
+    // Only one of start and end hour is given.
+    assertThrows(UserRequestException.class,
+                 () -> ParameterUtils.executionTimeWindow(mockRequestWithParameters(executionWindowParameters("7", null)), config));
+    assertThrows(UserRequestException.class,
+                 () -> ParameterUtils.executionTimeWindow(mockRequestWithParameters(executionWindowParameters(null, "14")), config));
+    // Out of range hours.
+    assertThrows(UserRequestException.class,
+                 () -> ParameterUtils.executionTimeWindow(mockRequestWithParameters(executionWindowParameters("-1", "14")), config));
+    assertThrows(UserRequestException.class,
+                 () -> ParameterUtils.executionTimeWindow(mockRequestWithParameters(executionWindowParameters("7", "24")), config));
+    // Not an integer.
+    assertThrows(UserRequestException.class,
+                 () -> ParameterUtils.executionTimeWindow(mockRequestWithParameters(executionWindowParameters("7:30", "14")), config));
+    // Same start and end hour.
+    assertThrows(UserRequestException.class,
+                 () -> ParameterUtils.executionTimeWindow(mockRequestWithParameters(executionWindowParameters("7", "7")), config));
   }
 
   @Test

@@ -11,9 +11,12 @@ import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeLargeReplica
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeMinIsrWithOfflineReplicasStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeOneAboveMinIsrWithOfflineReplicasStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.PrioritizeSmallReplicaMovementStrategy;
+import java.time.DateTimeException;
+import java.time.ZoneId;
 import java.util.StringJoiner;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigException;
 
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.REASON_PARAM;
 import static org.apache.kafka.common.config.ConfigDef.Range.atLeast;
@@ -497,6 +500,15 @@ public final class ExecutorConfig {
   public static final String AUTO_STOP_EXTERNAL_AGENT_DOC = "When starting a new proposal execution while external agent is reassigning partitions,"
       + " automatically stop the external agent and start the execution."
       + " Set to false to keep the external agent reassignment and skip starting the execution.";
+
+  /**
+   * <code>execution.window.timezone</code>
+   */
+  public static final String EXECUTION_WINDOW_TIMEZONE_CONFIG = "execution.window.timezone";
+  public static final String DEFAULT_EXECUTION_WINDOW_TIMEZONE = "";
+  public static final String EXECUTION_WINDOW_TIMEZONE_DOC = "The time zone (e.g. UTC, Europe/Berlin) in which the execution time"
+      + " window hours given via execution_window_start_hour and execution_window_end_hour request parameters are interpreted."
+      + " If empty, the default time zone of the JVM running Cruise Control is used.";
   private ExecutorConfig() {
   }
 
@@ -797,6 +809,36 @@ public final class ExecutorConfig {
                             ConfigDef.Type.BOOLEAN,
                             DEFAULT_AUTO_STOP_EXTERNAL_AGENT,
                             ConfigDef.Importance.MEDIUM,
-                            AUTO_STOP_EXTERNAL_AGENT_DOC);
+                            AUTO_STOP_EXTERNAL_AGENT_DOC)
+                    .define(EXECUTION_WINDOW_TIMEZONE_CONFIG,
+                            ConfigDef.Type.STRING,
+                            DEFAULT_EXECUTION_WINDOW_TIMEZONE,
+                            new ExecutionWindowTimeZoneValidator(),
+                            ConfigDef.Importance.LOW,
+                            EXECUTION_WINDOW_TIMEZONE_DOC);
+  }
+
+  /**
+   * @param timeZone Value of {@link #EXECUTION_WINDOW_TIMEZONE_CONFIG}.
+   * @return The time zone to use for execution time windows -- the JVM default time zone if the given value is empty.
+   */
+  public static ZoneId executionWindowZoneId(String timeZone) {
+    return timeZone == null || timeZone.trim().isEmpty() ? ZoneId.systemDefault() : ZoneId.of(timeZone.trim());
+  }
+
+  private static final class ExecutionWindowTimeZoneValidator implements ConfigDef.Validator {
+    @Override
+    public void ensureValid(String name, Object value) {
+      try {
+        executionWindowZoneId((String) value);
+      } catch (DateTimeException e) {
+        throw new ConfigException(name, value, "Invalid time zone: " + e.getMessage());
+      }
+    }
+
+    @Override
+    public String toString() {
+      return "A valid time zone ID (e.g. UTC, Europe/Berlin), or empty for the JVM default time zone";
+    }
   }
 }

@@ -7,6 +7,7 @@ package com.linkedin.kafka.cruisecontrol.servlet.parameters;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.WebServerConfig;
 import com.linkedin.kafka.cruisecontrol.executor.ConcurrencyType;
+import com.linkedin.kafka.cruisecontrol.executor.ExecutionTimeWindow;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.servlet.CruiseControlEndPoint;
 import com.linkedin.kafka.cruisecontrol.servlet.UserRequestException;
@@ -22,6 +23,8 @@ import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.CONCURRENT_LEADER_MOVEMENTS_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.BROKER_CONCURRENT_LEADER_MOVEMENTS_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.EXECUTION_PROGRESS_CHECK_INTERVAL_MS_PARAM;
+import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.EXECUTION_WINDOW_END_HOUR_PARAM;
+import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.EXECUTION_WINDOW_START_HOUR_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.MAX_PARTITION_MOVEMENTS_IN_CLUSTER_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.SKIP_HARD_GOAL_CHECK_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.REPLICA_MOVEMENT_STRATEGIES_PARAM;
@@ -52,7 +55,7 @@ import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils
  *    &amp;rebalance_disk=[true/false]&amp;review_id=[id]&amp;get_response_schema=[true/false]
  *    &amp;replication_throttle=[bytes_per_second]&amp;reason=[reason-for-request]
  *    &amp;execution_progress_check_interval_ms=[interval_in_ms]&amp;stop_ongoing_execution=[true/false]&amp;fast_mode=[true/false]
- *    &amp;doAs=[user]
+ *    &amp;execution_window_start_hour=[0-23]&amp;execution_window_end_hour=[0-23]&amp;doAs=[user]
  * </pre>
  */
 public class RebalanceParameters extends ProposalsParameters {
@@ -72,6 +75,8 @@ public class RebalanceParameters extends ProposalsParameters {
     validParameterNames.add(REPLICATION_THROTTLE_PARAM);
     validParameterNames.add(REVIEW_ID_PARAM);
     validParameterNames.add(STOP_ONGOING_EXECUTION_PARAM);
+    validParameterNames.add(EXECUTION_WINDOW_START_HOUR_PARAM);
+    validParameterNames.add(EXECUTION_WINDOW_END_HOUR_PARAM);
     validParameterNames.addAll(ProposalsParameters.CASE_INSENSITIVE_PARAMETER_NAMES);
     CASE_INSENSITIVE_PARAMETER_NAMES = Collections.unmodifiableSortedSet(validParameterNames);
   }
@@ -88,6 +93,7 @@ public class RebalanceParameters extends ProposalsParameters {
   protected Integer _reviewId;
   protected String _reason;
   protected boolean _stopOngoingExecution;
+  protected ExecutionTimeWindow _executionTimeWindow;
 
   public RebalanceParameters() {
     super();
@@ -116,6 +122,11 @@ public class RebalanceParameters extends ProposalsParameters {
     _stopOngoingExecution = ParameterUtils.stopOngoingExecution(_requestContext);
     if (_stopOngoingExecution && _dryRun) {
       throw new UserRequestException(String.format("%s and %s cannot both be set to true.", STOP_ONGOING_EXECUTION_PARAM, DRY_RUN_PARAM));
+    }
+    _executionTimeWindow = ParameterUtils.executionTimeWindow(_requestContext, _config);
+    if (_executionTimeWindow != null && _dryRun) {
+      throw new UserRequestException(String.format("%s and %s cannot be set when %s is true.", EXECUTION_WINDOW_START_HOUR_PARAM,
+                                                   EXECUTION_WINDOW_END_HOUR_PARAM, DRY_RUN_PARAM));
     }
   }
 
@@ -174,6 +185,13 @@ public class RebalanceParameters extends ProposalsParameters {
 
   public boolean stopOngoingExecution() {
     return _stopOngoingExecution;
+  }
+
+  /**
+   * @return The daily time window within which the execution is allowed to start new movements, or {@code null} if not set.
+   */
+  public ExecutionTimeWindow executionTimeWindow() {
+    return _executionTimeWindow;
   }
 
   @Override
