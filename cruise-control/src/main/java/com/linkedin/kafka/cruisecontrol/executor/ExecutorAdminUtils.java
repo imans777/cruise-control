@@ -30,11 +30,14 @@ import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.Config;
+import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.LogDirDescription;
 import org.apache.kafka.clients.admin.ReplicaInfo;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicPartitionReplica;
+import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.KafkaStorageException;
 import org.apache.kafka.common.errors.LogDirNotFoundException;
 import org.apache.kafka.common.errors.ReplicaNotAvailableException;
@@ -45,6 +48,7 @@ import static com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig.L
 import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.ReplicaLogDirInfo;
 
 public final class ExecutorAdminUtils {
+  static final String LOG_SEGMENT_DELETE_DELAY_MS_CONFIG = "log.segment.delete.delay.ms";
   private static final Logger LOG = LoggerFactory.getLogger(ExecutorAdminUtils.class);
 
   private ExecutorAdminUtils() {
@@ -135,6 +139,96 @@ public final class ExecutorAdminUtils {
       }
     }
     return false;
+  }
+
+  /**
+   * Describe the log dirs of the given brokers. A broker that fails to respond is left out of the result.
+   *
+   * @param brokerIds The ids of the brokers to describe.
+   * @param adminClient The adminClient to send describeLogDirs request.
+   * @param config The config object that holds all the Cruise Control related configs
+   * @return The log dirs of the brokers that responded, by broker id.
+   */
+  static Map<Integer, Map<String, LogDirDescription>> describeLogDirs(Collection<Integer> brokerIds,
+                                                                      Admin adminClient,
+                                                                      KafkaCruiseControlConfig config) {
+    Map<Integer, Map<String, LogDirDescription>> logDirsByBrokerId = new HashMap<>();
+    if (brokerIds.isEmpty()) {
+      return logDirsByBrokerId;
+    }
+    for (Map.Entry<Integer, KafkaFuture<Map<String, LogDirDescription>>> entry
+        : adminClient.describeLogDirs(brokerIds).descriptions().entrySet()) {
+      try {
+        logDirsByBrokerId.put(entry.getKey(), entry.getValue().get(config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS));
+      } catch (InterruptedException | ExecutionException | TimeoutException e) {
+        LOG.warn("Encounter exception {} when describing the log dirs of broker {}.", e.getMessage(), entry.getKey());
+      }
+    }
+    return logDirsByBrokerId;
+  }
+
+  /**
+   * Get the {@code log.segment.delete.delay.ms} of the given brokers, i.e. how long after a replica is removed from a broker its
+   * files are deleted. A broker that fails to respond is left out of the result.
+   *
+   * @param brokerIds The ids of the brokers.
+   * @param adminClient The adminClient to send describeConfigs request.
+   * @param config The config object that holds all the Cruise Control related configs
+   * @return The {@code log.segment.delete.delay.ms} of the brokers that responded, by broker id.
+   */
+  static Map<Integer, Long> logSegmentDeleteDelayMs(Collection<Integer> brokerIds,
+                                                    Admin adminClient,
+                                                    KafkaCruiseControlConfig config) {
+    Map<Integer, Long> deleteDelayMsByBrokerId = new HashMap<>();
+    if (brokerIds.isEmpty()) {
+      return deleteDelayMsByBrokerId;
+    }
+    Set<ConfigResource> brokerResources = brokerIds.stream()
+                                                   .map(id -> new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(id)))
+                                                   .collect(Collectors.toSet());
+    for (Map.Entry<ConfigResource, KafkaFuture<Config>> entry : adminClient.describeConfigs(brokerResources).values().entrySet()) {
+      try {
+        ConfigEntry deleteDelay = entry.getValue().get(config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS)
+                                       .get(LOG_SEGMENT_DELETE_DELAY_MS_CONFIG);
+        if (deleteDelay != null && deleteDelay.value() != null) {
+          deleteDelayMsByBrokerId.put(Integer.parseInt(entry.getKey().name()), Long.parseLong(deleteDelay.value()));
+        }
+      } catch (InterruptedException | ExecutionException | TimeoutException | NumberFormatException e) {
+        LOG.warn("Encounter exception {} when getting {} of broker {}.", e.getMessage(), LOG_SEGMENT_DELETE_DELAY_MS_CONFIG,
+                 entry.getKey().name());
+      }
+    }
+    return deleteDelayMsByBrokerId;
+  }
+
+  /**
+   * Get the log dir that each of the given replicas is in. A replica that does not exist yet, or whose broker fails to respond,
+   * is left out of the result.
+   *
+   * @param replicas The replicas.
+   * @param adminClient The adminClient to send describeReplicaLogDirs request.
+   * @param config The config object that holds all the Cruise Control related configs
+   * @return The current log dir of the given replicas.
+   */
+  static Map<TopicPartitionReplica, String> currentLogDirs(Set<TopicPartitionReplica> replicas,
+                                                           Admin adminClient,
+                                                           KafkaCruiseControlConfig config) {
+    Map<TopicPartitionReplica, String> logDirByReplica = new HashMap<>();
+    if (replicas.isEmpty()) {
+      return logDirByReplica;
+    }
+    for (Map.Entry<TopicPartitionReplica, KafkaFuture<ReplicaLogDirInfo>> entry
+        : adminClient.describeReplicaLogDirs(replicas).values().entrySet()) {
+      try {
+        ReplicaLogDirInfo info = entry.getValue().get(config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS);
+        if (info.getCurrentReplicaLogDir() != null) {
+          logDirByReplica.put(entry.getKey(), info.getCurrentReplicaLogDir());
+        }
+      } catch (InterruptedException | ExecutionException | TimeoutException e) {
+        LOG.debug("Encounter exception {} when fetching the log dir of replica {}.", e.getMessage(), entry.getKey());
+      }
+    }
+    return logDirByReplica;
   }
 }
 

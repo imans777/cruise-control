@@ -63,6 +63,10 @@ import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.Replic
  * The task is tracked both under source broker and destination broker's plan.
  * Once a task is fulfilled, the task will be removed from both source broker and destination broker's execution plan.
  * <p>
+ * If a {@link DiskCapacityTracker} is given, a partition movement task is picked only if the log dirs it writes to can hold
+ * a full copy of the replica. A task that does not fit is skipped and stays in the execution plan, so that it is picked once
+ * enough disk space is freed, and the next task in the execution order is checked instead.
+ * <p>
  * This class is not thread safe.
  */
 public class ExecutionTaskPlanner {
@@ -348,6 +352,26 @@ public class ExecutionTaskPlanner {
   public List<ExecutionTask> getInterBrokerReplicaMovementTasks(Map<Integer, Integer> readyBrokers,
                                                                 Set<TopicPartition> inProgressPartitions,
                                                                 int maxInterBrokerPartitionMovements) {
+    return getInterBrokerReplicaMovementTasks(readyBrokers, inProgressPartitions, maxInterBrokerPartitionMovements, null);
+  }
+
+  /**
+   * Get a list of executable inter-broker replica movements that comply with the concurrency constraint, the partitions in
+   * move constraint and, if a disk capacity tracker is given, the disk capacity of the log dirs they write to.
+   *
+   * @param readyBrokers The brokers that is ready to execute more movements.
+   * @param inProgressPartitions Topic partitions of replicas that are already in progress. This is needed because the
+   *                             controller does not allow updating the ongoing replica reassignment for a partition
+   *                             whose replica is being reassigned.
+   * @param maxInterBrokerPartitionMovements Maximum cap for number of partitions to move at any time
+   * @param diskCapacityTracker The disk capacity tracker to check and reserve the disk space of movements against, or {@code null}
+   *                            to ignore disk capacity.
+   * @return A list of movements that is executable for the ready brokers.
+   */
+  List<ExecutionTask> getInterBrokerReplicaMovementTasks(Map<Integer, Integer> readyBrokers,
+                                                         Set<TopicPartition> inProgressPartitions,
+                                                         int maxInterBrokerPartitionMovements,
+                                                         DiskCapacityTracker diskCapacityTracker) {
     LOG.trace("Getting inter-broker replica movement tasks for brokers with concurrency {}", readyBrokers);
     List<ExecutionTask> executableReplicaMovements = new ArrayList<>();
     SortedSet<Integer> interPartMoveBrokerIds = new TreeSet<>(_interPartMoveBrokerComparator);
@@ -406,9 +430,13 @@ public class ExecutionTaskPlanner {
           // Check if the proposal is executable.
           if (isExecutableProposal(task.proposal(), readyBrokers)
               && !inProgressPartitions.contains(tp)
-              && !partitionsInvolved.contains(tp)) {
+              && !partitionsInvolved.contains(tp)
+              && (diskCapacityTracker == null || diskCapacityTracker.fits(task))) {
             partitionsInvolved.add(tp);
             executableReplicaMovements.add(task);
+            if (diskCapacityTracker != null) {
+              diskCapacityTracker.reserve(task);
+            }
             // Record the brokers as involved in this round and stop involving them again in this round.
             brokerInvolved.add(sourceBroker);
             brokerInvolved.addAll(destinationBrokers);
@@ -445,6 +473,19 @@ public class ExecutionTaskPlanner {
    * @return A list of movements that is executable for the ready brokers.
    */
   public List<ExecutionTask> getIntraBrokerReplicaMovementTasks(Map<Integer, Integer> readyBrokers) {
+    return getIntraBrokerReplicaMovementTasks(readyBrokers, null);
+  }
+
+  /**
+   * Get a list of executable intra-broker replica movements that comply with the concurrency constraint and, if a disk capacity
+   * tracker is given, the disk capacity of the log dirs they write to.
+   *
+   * @param readyBrokers The brokers that is ready to execute more movements.
+   * @param diskCapacityTracker The disk capacity tracker to check and reserve the disk space of movements against, or {@code null}
+   *                            to ignore disk capacity.
+   * @return A list of movements that is executable for the ready brokers.
+   */
+  List<ExecutionTask> getIntraBrokerReplicaMovementTasks(Map<Integer, Integer> readyBrokers, DiskCapacityTracker diskCapacityTracker) {
     LOG.trace("Getting intra-broker replica movement tasks for brokers with concurrency {}", readyBrokers);
     List<ExecutionTask> executableReplicaMovements = new ArrayList<>();
 
@@ -453,12 +494,20 @@ public class ExecutionTaskPlanner {
       int limit = brokerEntry.getValue();
       if (_intraPartMoveTasksByBrokerId.containsKey(brokerId)) {
         Iterator<ExecutionTask> tasksForBroker = _intraPartMoveTasksByBrokerId.get(brokerId).iterator();
-        while (limit-- > 0 && tasksForBroker.hasNext()) {
+        while (limit > 0 && tasksForBroker.hasNext()) {
           ExecutionTask task = tasksForBroker.next();
+          if (diskCapacityTracker != null && !diskCapacityTracker.fits(task)) {
+            // Keep the task in the execution plan and check the next one.
+            continue;
+          }
           executableReplicaMovements.add(task);
+          if (diskCapacityTracker != null) {
+            diskCapacityTracker.reserve(task);
+          }
           // Remove the proposal from the execution plan.
           tasksForBroker.remove();
           _remainingIntraBrokerReplicaMovements.remove(task);
+          limit--;
         }
       }
     }

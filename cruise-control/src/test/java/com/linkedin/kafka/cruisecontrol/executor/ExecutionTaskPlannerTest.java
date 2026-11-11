@@ -24,8 +24,11 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Properties;
 import java.util.Set;
+import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult;
+import org.apache.kafka.clients.admin.LogDirDescription;
+import org.apache.kafka.clients.admin.ReplicaInfo;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.Node;
@@ -36,6 +39,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.kafka.common.TopicPartitionReplica;
+import org.apache.kafka.common.utils.MockTime;
 import org.easymock.EasyMock;
 import org.junit.Test;
 
@@ -53,6 +57,7 @@ import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.Replic
 public class ExecutionTaskPlannerTest {
   private static final int MAX_BROKER_CONCURRENCY = ExecutorConfig.DEFAULT_MAX_NUM_CLUSTER_MOVEMENTS_CONFIG - 1;
   private static final int MIN_BROKER_CONCURRENCY = 1;
+  private static final long GB = 1024L * 1024L * 1024L;
   private final ReplicaPlacementInfo _r0 = new ReplicaPlacementInfo(0);
   private final ReplicaPlacementInfo _r1 = new ReplicaPlacementInfo(1);
   private final ReplicaPlacementInfo _r2 = new ReplicaPlacementInfo(2);
@@ -472,6 +477,124 @@ public class ExecutionTaskPlannerTest {
     assertEquals(0, planner.remainingLeadershipMovements().size());
     assertEquals(0, planner.remainingIntraBrokerReplicaMovements().size());
     EasyMock.verify(mockAdminClient);
+  }
+
+  @Test
+  public void testInterBrokerPartitionMovementTasksDeferredForDiskCapacity() {
+    // Broker 1 has one 1000 GB log dir at 700 GB. x and y (190 GB each) move to broker 1, z (150 GB) moves off it.
+    ExecutionProposal x = new ExecutionProposal(new TopicPartition(TOPIC2, 0), 190 * 1024, _r0, List.of(_r0), List.of(_r1));
+    ExecutionProposal y = new ExecutionProposal(new TopicPartition(TOPIC2, 1), 190 * 1024, _r0, List.of(_r0), List.of(_r1));
+    ExecutionProposal z = new ExecutionProposal(new TopicPartition(TOPIC2, 2), 150 * 1024, _r1, List.of(_r1), List.of(_r2));
+    List<ExecutionProposal> proposals = List.of(x, y, z);
+    ExecutionTaskPlanner planner =
+        new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
+    planner.addExecutionProposals(proposals, strategyOptions(proposals), null);
+
+    // Without a disk capacity tracker, x and y start together.
+    ExecutionTaskPlanner plannerIgnoringDiskCapacity =
+        new ExecutionTaskPlanner(null, new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
+    plannerIgnoringDiskCapacity.addExecutionProposals(proposals, strategyOptions(proposals), null);
+    assertEquals(Set.of(x, y, z), plannerIgnoringDiskCapacity.getInterBrokerReplicaMovementTasks(readyBrokers(), Collections.emptySet(), 100)
+                                                             .stream().map(ExecutionTask::proposal).collect(Collectors.toSet()));
+
+    Map<Integer, Map<String, LogDirDescription>> logDirsByBroker = new HashMap<>();
+    logDirsByBroker.put(0, Map.of("/d", logDir(Map.of(x.topicPartition(), 190 * GB, y.topicPartition(), 190 * GB))));
+    logDirsByBroker.put(1, Map.of("/d", logDir(Map.of(z.topicPartition(), 150 * GB, new TopicPartition(TOPIC3, 0), 550 * GB))));
+    logDirsByBroker.put(2, Map.of("/d", logDir(Collections.emptyMap())));
+    MockTime time = new MockTime(0L, 0L, 0L);
+    DiskCapacityTracker tracker =
+        new DiskCapacityTracker(logDirsByBroker, Collections.emptySet(), Collections.emptyMap(), Collections.emptyMap(), time);
+
+    // x and z start. y waits: with x, it would take broker 1 to 1080 GB.
+    tracker.beginPlanning();
+    List<ExecutionTask> tasks = planner.getInterBrokerReplicaMovementTasks(readyBrokers(), Collections.emptySet(), 100, tracker);
+    assertEquals(Set.of(x, z), tasks.stream().map(ExecutionTask::proposal).collect(Collectors.toSet()));
+    assertEquals(1, planner.remainingInterBrokerReplicaMovements().size());
+    tasks.forEach(task -> task.inProgress(time.milliseconds()));
+    tracker.beginPlanning();
+    assertEquals(0, planner.getInterBrokerReplicaMovementTasks(readyBrokers(), Set.of(x.topicPartition(), z.topicPartition()), 100,
+                                                               tracker).size());
+
+    // Once z has completed and its replica on broker 1 is deleted, y fits: 700 + 190 + 190 - 150 = 930 GB.
+    tasks.stream().filter(task -> task.proposal().equals(z)).forEach(task -> task.completed(time.milliseconds()));
+    time.sleep(DiskCapacityTracker.DEFAULT_LOG_SEGMENT_DELETE_DELAY_MS);
+    tracker.beginPlanning();
+    tasks = planner.getInterBrokerReplicaMovementTasks(readyBrokers(), Set.of(x.topicPartition()), 100, tracker);
+    assertEquals(1, tasks.size());
+    assertEquals(y, tasks.get(0).proposal());
+  }
+
+  @Test
+  public void testIntraBrokerPartitionMovementTasksSkipTasksThatDoNotFit() {
+    // Two replicas move from /d0 to /d1 of broker 0, which is at 500 GB of 1000 GB. Only one movement at a time.
+    ReplicaPlacementInfo r0d0 = new ReplicaPlacementInfo(0, "/d0");
+    ReplicaPlacementInfo r0d1 = new ReplicaPlacementInfo(0, "/d1");
+    ExecutionProposal large = new ExecutionProposal(new TopicPartition(TOPIC2, 0), 600 * 1024, r0d0, List.of(r0d0), List.of(r0d1));
+    ExecutionProposal small = new ExecutionProposal(new TopicPartition(TOPIC2, 1), 10 * 1024, r0d0, List.of(r0d0), List.of(r0d1));
+    List<ExecutionProposal> proposals = List.of(large, small);
+    Map<TopicPartitionReplica, String> logDirByReplica = Map.of(new TopicPartitionReplica(TOPIC2, 0, 0), "/d0",
+                                                                new TopicPartitionReplica(TOPIC2, 1, 0), "/d0");
+    ExecutionTaskPlanner planner =
+        new ExecutionTaskPlanner(mockAdminClient(logDirByReplica),
+                                 new KafkaCruiseControlConfig(KafkaCruiseControlUnitTestUtils.getKafkaCruiseControlProperties()));
+    planner.addExecutionProposals(proposals, strategyOptions(proposals), null);
+
+    Map<String, LogDirDescription> logDirs = Map.of("/d0", logDir(Map.of(large.topicPartition(), 600 * GB, small.topicPartition(), 10 * GB)),
+                                                    "/d1", logDir(Map.of(new TopicPartition(TOPIC3, 0), 500 * GB)));
+    DiskCapacityTracker tracker =
+        new DiskCapacityTracker(Map.of(0, logDirs), Collections.emptySet(), Collections.emptyMap(), Collections.emptyMap(), new MockTime());
+
+    // The large replica comes first in the execution order but does not fit, so the small one is picked instead.
+    tracker.beginPlanning();
+    Map<Integer, Integer> readyBrokers = new HashMap<>();
+    readyBrokers.put(0, 1);
+    List<ExecutionTask> tasks = planner.getIntraBrokerReplicaMovementTasks(readyBrokers, tracker);
+    assertEquals(1, tasks.size());
+    assertEquals(small, tasks.get(0).proposal());
+    assertEquals(1, planner.remainingIntraBrokerReplicaMovements().size());
+    assertEquals(large, planner.remainingIntraBrokerReplicaMovements().iterator().next().proposal());
+  }
+
+  private StrategyOptions strategyOptions(List<ExecutionProposal> proposals) {
+    Set<PartitionInfo> partitions = new HashSet<>();
+    proposals.forEach(proposal -> partitions.add(generatePartitionInfo(proposal, false)));
+    return new StrategyOptions.Builder(new Cluster(null, _expectedNodes, partitions, Collections.emptySet(), Collections.emptySet())).build();
+  }
+
+  private static Map<Integer, Integer> readyBrokers() {
+    Map<Integer, Integer> readyBrokers = new HashMap<>();
+    for (int brokerId = 0; brokerId < 3; brokerId++) {
+      readyBrokers.put(brokerId, MAX_BROKER_CONCURRENCY);
+    }
+    return readyBrokers;
+  }
+
+  private static LogDirDescription logDir(Map<TopicPartition, Long> sizeByPartition) {
+    Map<TopicPartition, ReplicaInfo> replicas = new HashMap<>();
+    sizeByPartition.forEach((tp, size) -> replicas.put(tp, new ReplicaInfo(size, 0L, false)));
+    long used = sizeByPartition.values().stream().mapToLong(Long::longValue).sum();
+    return new LogDirDescription(null, replicas, 1000 * GB, 1000 * GB - used);
+  }
+
+  private static Admin mockAdminClient(Map<TopicPartitionReplica, String> logDirByReplica) {
+    Admin mockAdminClient = EasyMock.mock(Admin.class);
+    try {
+      // Reflectively set constructors from package private to public.
+      Constructor<DescribeReplicaLogDirsResult> resultConstructor = DescribeReplicaLogDirsResult.class.getDeclaredConstructor(Map.class);
+      resultConstructor.setAccessible(true);
+      Constructor<ReplicaLogDirInfo> infoConstructor =
+          ReplicaLogDirInfo.class.getDeclaredConstructor(String.class, long.class, String.class, long.class);
+      infoConstructor.setAccessible(true);
+      Map<TopicPartitionReplica, KafkaFuture<ReplicaLogDirInfo>> futureByReplica = new HashMap<>();
+      for (Map.Entry<TopicPartitionReplica, String> entry : logDirByReplica.entrySet()) {
+        futureByReplica.put(entry.getKey(), completedFuture(infoConstructor.newInstance(entry.getValue(), 0L, null, -1L)));
+      }
+      EasyMock.expect(mockAdminClient.describeReplicaLogDirs(anyObject())).andReturn(resultConstructor.newInstance(futureByReplica)).anyTimes();
+    } catch (InstantiationException | IllegalAccessException | InvocationTargetException | NoSuchMethodException e) {
+      throw new IllegalStateException(e);
+    }
+    EasyMock.replay(mockAdminClient);
+    return mockAdminClient;
   }
 
   @Test

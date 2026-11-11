@@ -19,13 +19,16 @@ package com.linkedin.kafka.cruisecontrol.executor;
 import com.codahale.metrics.MetricRegistry;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils;
 import com.linkedin.kafka.cruisecontrol.common.MetadataAdminClient;
+import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.common.TestConstants;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityConfigFileResolver;
+import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.MonitorConfig;
 import com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorManager;
+import com.linkedin.kafka.cruisecontrol.exception.BrokerCapacityResolutionException;
 import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.utils.CCKafkaClientsIntegrationTestHarness;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
@@ -126,6 +129,51 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
     } finally {
       KafkaCruiseControlUtils.closeAdminClientWithTimeout(adminClient);
     }
+  }
+
+  @Test
+  public void testReplicaReassignmentBlockedByDiskCapacity() throws Exception {
+    Map<String, TopicDescription> topicDescriptions = createTopics(0);
+    int initialLeader0 = topicDescriptions.get(TOPIC0).partitions().get(0).leader().id();
+    ExecutionProposal proposal =
+        new ExecutionProposal(TP0, 0, new ReplicaPlacementInfo(initialLeader0),
+                              Collections.singletonList(new ReplicaPlacementInfo(initialLeader0)),
+                              Collections.singletonList(new ReplicaPlacementInfo(initialLeader0 == 0 ? 1 : 0)));
+    // The capacity config gives each broker 1 MB of disk, which the log dirs of the test brokers already exceed.
+    Map<Resource, Double> capacity = new HashMap<>();
+    capacity.put(Resource.DISK, 1.0);
+    capacity.put(Resource.CPU, 100.0);
+    capacity.put(Resource.NW_IN, 10000.0);
+    capacity.put(Resource.NW_OUT, 10000.0);
+
+    KafkaCruiseControlConfig configs = new KafkaCruiseControlConfig(getExecutorProperties());
+    UserTaskManager.UserTaskInfo mockUserTaskInfo = getMockUserTaskInfo();
+    UserTaskManager mockUserTaskManager = getMockUserTaskManager(RANDOM_UUID, mockUserTaskInfo, Collections.singletonList(true));
+    ExecutorNotifier mockExecutorNotifier = EasyMock.mock(ExecutorNotifier.class);
+    Capture<String> captureMessage = Capture.newInstance(CaptureType.FIRST);
+    mockExecutorNotifier.sendAlert(EasyMock.capture(captureMessage));
+    LoadMonitor mockLoadMonitor = getMockLoadMonitor(new BrokerCapacityInfo(capacity));
+    AnomalyDetectorManager mockAnomalyDetectorManager = getMockAnomalyDetector(RANDOM_UUID, true);
+    EasyMock.replay(mockUserTaskInfo, mockUserTaskManager, mockExecutorNotifier, mockLoadMonitor, mockAnomalyDetectorManager);
+
+    Executor executor = new Executor(configs, Time.SYSTEM, new MetricRegistry(), _cluster.adminClient(),
+                                     new MetadataAdminClient(_cluster.adminClient()), mockExecutorNotifier, mockAnomalyDetectorManager);
+    executor.setUserTaskManager(mockUserTaskManager);
+    executor.setGeneratingProposalsForExecution(RANDOM_UUID, ExecutorTest.class::getSimpleName, true);
+    executor.executeProposals(Collections.singletonList(proposal), Collections.emptySet(), null, mockLoadMonitor, null, null,
+                              null, null, null, null, null, null, true, RANDOM_UUID, false, false);
+    waitUntilTrue(() -> (!executor.hasOngoingExecution() && executor.state().state() == ExecutorState.State.NO_TASK_IN_PROGRESS),
+                  "Proposal execution did not finish within the time limit",
+                  EXECUTION_DEADLINE_MS, EXECUTION_REGULAR_CHECK_MS);
+
+    // The execution failed without moving the partition.
+    String alert = captureMessage.getValue();
+    assertTrue(alert, alert.contains("None of the remaining inter-broker replica movements fits the disk capacity"));
+    assertTrue(alert, alert.contains("partition " + TP0));
+    TopicDescription topic0 = _cluster.adminClient().describeTopics(Collections.singleton(TOPIC0)).topicNameValues().get(TOPIC0).get();
+    assertEquals(Collections.singletonList(initialLeader0),
+                 topic0.partitions().get(PARTITION).replicas().stream().map(Node::id).collect(Collectors.toList()));
+    EasyMock.verify(mockUserTaskInfo, mockUserTaskManager, mockExecutorNotifier, mockLoadMonitor, mockAnomalyDetectorManager);
   }
 
   @Test
@@ -685,7 +733,17 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
   }
 
   private static LoadMonitor getMockLoadMonitor() {
+    // Without a capacity in the capacity config, the disk capacity of the log dirs is the total bytes that Kafka reports.
+    return getMockLoadMonitor(null);
+  }
+
+  private static LoadMonitor getMockLoadMonitor(BrokerCapacityInfo brokerCapacity) {
     LoadMonitor mockLoadMonitor = EasyMock.mock(LoadMonitor.class);
+    try {
+      EasyMock.expect(mockLoadMonitor.brokerCapacity(anyObject())).andReturn(brokerCapacity).anyTimes();
+    } catch (TimeoutException | BrokerCapacityResolutionException e) {
+      throw new IllegalStateException(e);
+    }
     EasyMock.expect(mockLoadMonitor.taskRunnerState())
             .andReturn(LoadMonitorTaskRunner.LoadMonitorTaskRunnerState.RUNNING)
             .anyTimes();
