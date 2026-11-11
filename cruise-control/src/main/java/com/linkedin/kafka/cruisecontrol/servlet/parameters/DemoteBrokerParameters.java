@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
+import java.util.regex.Pattern;
 
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.DRY_RUN_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.BROKER_ID_PARAM;
@@ -24,6 +25,8 @@ import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.EXECUTION_PROGRESS_CHECK_INTERVAL_MS_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.SKIP_URP_DEMOTION_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.EXCLUDE_FOLLOWER_DEMOTION_PARAM;
+import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.EXCLUDED_TOPICS_PARAM;
+import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.INCLUDED_TOPICS_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.REPLICA_MOVEMENT_STRATEGIES_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.REPLICATION_THROTTLE_PARAM;
 import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils.REVIEW_ID_PARAM;
@@ -39,6 +42,12 @@ import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils
  *   <li>Note that "review_id" is mutually exclusive to the other parameters -- i.e. they cannot be used together.</li>
  *   <li>Note that "brokerid_and_logdirs" takes comma as delimiter between two broker id and logdir pairs -- i.e. we assume
  *   a valid logdir name contains no comma.</li>
+ *   <li>Note that the partitions of topics matching "excluded_topics" (if specified) are skipped -- i.e. their replica
+ *   order and leadership remain unchanged. If "excluded_topics" is not specified, all topics are demoted (i.e. topics
+ *   excluded from partition movement by config are not excluded from demotion).</li>
+ *   <li>Note that only the partitions of topics matching "included_topics" (if specified) are demoted -- i.e. the replica
+ *   order and leadership of the other topics remain unchanged. "included_topics" and "excluded_topics" are mutually
+ *   exclusive.</li>
  * </ul>
  *
  * <pre>
@@ -51,7 +60,7 @@ import static com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils
  *    &amp;brokerid_and_logdirs=[broker_id1-logdir1,broker_id2-logdir2]&amp;review_id=[id]
  *    &amp;replication_throttle=[bytes_per_second]&amp;reason=[reason-for-request]
  *    &amp;execution_progress_check_interval_ms=[interval_in_ms]&amp;stop_ongoing_execution=[true/false]
- *    &amp;get_response_schema=[true/false]&amp;doAs=[user]
+ *    &amp;get_response_schema=[true/false]&amp;doAs=[user]&amp;excluded_topics=[pattern]&amp;included_topics=[pattern]
  * </pre>
  */
 public class DemoteBrokerParameters extends KafkaOptimizationParameters {
@@ -66,6 +75,8 @@ public class DemoteBrokerParameters extends KafkaOptimizationParameters {
     validParameterNames.add(EXECUTION_PROGRESS_CHECK_INTERVAL_MS_PARAM);
     validParameterNames.add(SKIP_URP_DEMOTION_PARAM);
     validParameterNames.add(EXCLUDE_FOLLOWER_DEMOTION_PARAM);
+    validParameterNames.add(EXCLUDED_TOPICS_PARAM);
+    validParameterNames.add(INCLUDED_TOPICS_PARAM);
     validParameterNames.add(REPLICA_MOVEMENT_STRATEGIES_PARAM);
     validParameterNames.add(REPLICATION_THROTTLE_PARAM);
     validParameterNames.add(REVIEW_ID_PARAM);
@@ -81,6 +92,8 @@ public class DemoteBrokerParameters extends KafkaOptimizationParameters {
   protected Long _executionProgressCheckIntervalMs;
   protected boolean _skipUrpDemotion;
   protected boolean _excludeFollowerDemotion;
+  protected Pattern _excludedTopics;
+  protected Pattern _includedTopics;
   protected ReplicaMovementStrategy _replicaMovementStrategy;
   protected Long _replicationThrottle;
   protected Integer _reviewId;
@@ -103,6 +116,8 @@ public class DemoteBrokerParameters extends KafkaOptimizationParameters {
     _allowCapacityEstimation = ParameterUtils.allowCapacityEstimation(_requestContext);
     _skipUrpDemotion = ParameterUtils.skipUrpDemotion(_requestContext);
     _excludeFollowerDemotion = ParameterUtils.excludeFollowerDemotion(_requestContext);
+    _excludedTopics = ParameterUtils.excludedTopics(_requestContext);
+    _includedTopics = ParameterUtils.includedTopics(_requestContext);
     _replicaMovementStrategy = ParameterUtils.getReplicaMovementStrategy(_requestContext, _config);
     _replicationThrottle = ParameterUtils.replicationThrottle(_requestContext, _config);
     boolean twoStepVerificationEnabled = _config.getBoolean(WebServerConfig.TWO_STEP_VERIFICATION_ENABLED_CONFIG);
@@ -151,6 +166,14 @@ public class DemoteBrokerParameters extends KafkaOptimizationParameters {
 
   public boolean excludeFollowerDemotion() {
     return _excludeFollowerDemotion;
+  }
+
+  public Pattern excludedTopics() {
+    return _excludedTopics;
+  }
+
+  public Pattern includedTopics() {
+    return _includedTopics;
   }
 
   public Map<Integer, Set<String>> brokerIdAndLogdirs() {

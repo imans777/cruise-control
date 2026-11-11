@@ -76,7 +76,7 @@ public class DemoteBrokerRunnable extends GoalBasedOperationRunnable {
                               Supplier<String> reasonSupplier,
                               boolean stopOngoingExecution) {
     super(kafkaCruiseControl, new OperationFuture("Broker Demotion for Self-Healing"), SELF_HEALING_DRYRUN, null,
-          stopOngoingExecution, null, true, null,
+          stopOngoingExecution, null, true, null, null,
           allowCapacityEstimation, excludeRecentlyDemotedBrokers, false, anomalyId, reasonSupplier,
           SELF_HEALING_IS_TRIGGERED_BY_USER_REQUEST, SELF_HEALING_FAST_MODE);
     _brokerIds = demotedBrokerIds;
@@ -96,7 +96,7 @@ public class DemoteBrokerRunnable extends GoalBasedOperationRunnable {
                               DemoteBrokerParameters parameters) {
 
     super(kafkaCruiseControl, future, parameters.dryRun(), null,
-          parameters.stopOngoingExecution(), null, true, null,
+          parameters.stopOngoingExecution(), null, true, parameters.excludedTopics(), parameters.includedTopics(),
           parameters.allowCapacityEstimation(), parameters.excludeRecentlyDemotedBrokers(), false,
           uuid, parameters::reason, true, false);
     _brokerIds = parameters.brokerIds();
@@ -122,9 +122,14 @@ public class DemoteBrokerRunnable extends GoalBasedOperationRunnable {
   protected void init() {
     _kafkaCruiseControl.sanityCheckDryRun(_dryRun, _stopOngoingExecution);
     _goalsByPriority = new ArrayList<>(1);
+    // Honor the excluded topics only if they are explicitly requested, by excluded_topics or by included_topics (the topics not
+    // matching it are excluded). Otherwise, all topics are demoted -- i.e. the topics excluded from partition movement by config
+    // are not excluded from demotion. The Kafka cluster is always provided, so
+    // that the leadership of a demoted partition moves only to an in-sync replica.
     _goalsByPriority.add(new PreferredLeaderElectionGoal(_skipUrpDemotion,
                                                          _excludeFollowerDemotion,
-                                                         _skipUrpDemotion ? _kafkaCruiseControl.kafkaCluster() : null));
+                                                         _kafkaCruiseControl.kafkaCluster(),
+                                                         _excludedTopics != null || _includedTopics != null));
 
     _operationProgress = _future.operationProgress();
     if (_stopOngoingExecution) {
@@ -174,6 +179,7 @@ public class DemoteBrokerRunnable extends GoalBasedOperationRunnable {
                                                                          _excludeRecentlyDemotedBrokers,
                                                                          _excludeRecentlyRemovedBrokers,
                                                                          _excludedTopics,
+                                                                         _includedTopics,
                                                                          Collections.emptySet(),
                                                                          false,
                                                                          _fastMode);

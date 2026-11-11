@@ -22,53 +22,85 @@ import com.codahale.metrics.Gauge;
 import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.Timer;
 import com.google.common.util.concurrent.AtomicDouble;
+import com.linkedin.cruisecontrol.monitor.sampling.aggregator.ValuesAndExtrapolations;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils;
 import com.linkedin.kafka.cruisecontrol.common.MetadataAdminClient;
+import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.common.TopicMinIsrCache;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
+import com.linkedin.kafka.cruisecontrol.config.constants.MonitorConfig;
 import com.linkedin.kafka.cruisecontrol.detector.AnomalyDetectorManager;
+import com.linkedin.kafka.cruisecontrol.exception.BrokerCapacityResolutionException;
 import com.linkedin.kafka.cruisecontrol.exception.OngoingExecutionException;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ConcurrencyAdjustingRecommendation;
 import com.linkedin.kafka.cruisecontrol.executor.concurrency.ExecutionConcurrencyManager;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.ExecutionStateStore;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedAdjusterState;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedExecutionState;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedExecutionStateSerde;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedTask;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.PersistedUserTask;
+import com.linkedin.kafka.cruisecontrol.executor.persistence.ReplicaPlacementFingerprint;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.executor.strategy.StrategyOptions;
+import com.linkedin.kafka.cruisecontrol.model.Broker;
+import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import com.linkedin.kafka.cruisecontrol.monitor.LoadMonitor;
+import com.linkedin.kafka.cruisecontrol.monitor.metricdefinition.KafkaMetricDef;
+import com.linkedin.kafka.cruisecontrol.monitor.sampling.holder.BrokerEntity;
 import com.linkedin.kafka.cruisecontrol.servlet.UserTaskManager;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AlterPartitionReassignmentsResult;
+import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.clients.admin.ElectLeadersResult;
+import org.apache.kafka.clients.admin.LogDirDescription;
+import org.apache.kafka.clients.admin.NewPartitionReassignment;
 import org.apache.kafka.clients.admin.PartitionReassignment;
 import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.TopicPartitionReplica;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import java.util.Collection;
 import java.util.List;
+import java.util.function.Predicate;
 
 import static com.linkedin.cruisecontrol.CruiseControlUtils.currentUtcDate;
 import static com.linkedin.cruisecontrol.CruiseControlUtils.utcDateFor;
@@ -95,6 +127,8 @@ public class Executor {
   private static final Logger LOG = LoggerFactory.getLogger(Executor.class);
   private static final Logger OPERATION_LOG = LoggerFactory.getLogger(OPERATION_LOGGER);
   private static final long EXECUTION_PROGRESS_CHECK_INTERVAL_ADJUSTING_MS = 1000;
+  // Upon a stop, the number of progress checks to wait for the brokers that do not respond about an intra-broker replica movement.
+  private static final int MAX_PROGRESS_CHECKS_TO_WAIT_FOR_LOGDIR_RESPONSE_UPON_STOP = 3;
   // The execution progress is controlled by the ExecutionTaskManager.
   private final ExecutionTaskManager _executionTaskManager;
   private final MetadataAdminClient _metadataClient;
@@ -102,11 +136,23 @@ public class Executor {
   private final long _defaultExecutionProgressCheckIntervalMs;
   private Long _requestedExecutionProgressCheckIntervalMs;
   private final ExecutorService _proposalExecutor;
+  // Starts an execution queued after the ongoing one (see #queueExecution), once the ongoing one completes.
+  private final ExecutorService _queuedExecutionStarter;
+  // An execution queued after the ongoing execution of the same user task, or null if none.
+  private volatile QueuedExecution _queuedExecution;
   private final Admin _adminClient;
   private final double _leaderMovementTimeoutMs;
 
   private static final int NO_STOP_EXECUTION = 0;
   private static final int STOP_EXECUTION = 1;
+  // Bounds the time that removing leftover replication throttles can block the proposal executor thread if a removal does
+  // not take effect. The removal is retried later.
+  private static final int LEFTOVER_REPLICATION_THROTTLE_REMOVAL_RETRIES = 5;
+  // The number of attempts to read back a config change while cleaning up an interrupted execution -- a few, so that the cleanup
+  // ends in minutes even if a config keeps being changed by someone else.
+  private static final int INTERRUPTED_EXECUTION_CONFIG_CHANGE_RETRIES = 5;
+  private static final long MAX_INTERRUPTED_EXECUTION_CLEANUP_RETRY_BACKOFF_MS = TimeUnit.MINUTES.toMillis(1);
+  private static final int MAX_INTERRUPTED_EXECUTION_CANCELLATIONS = 5;
 
   // Some state for external service to query
   private final AtomicInteger _stopSignal;
@@ -127,21 +173,66 @@ public class Executor {
   private final AtomicInteger _numExecutionStartedInNonKafkaAssignerMode;
   private volatile boolean _isKafkaAssignerMode;
   private volatile boolean _skipInterBrokerReplicaConcurrencyAdjustment;
+  // The replication throttle helper of the ongoing execution -- i.e. non-null only while the inter-broker replica
+  // movements of an ongoing execution are being executed. It enables dynamically updating the replication throttle
+  // of the ongoing execution (see {@link #updateOngoingExecutionReplicationThrottle(long)}).
+  private volatile ReplicationThrottleHelper _ongoingExecutionThrottleHelper;
+  // The log dir throttle helper of the ongoing execution -- i.e. non-null only while the intra-broker replica movements
+  // of an ongoing execution are being executed. It enables dynamically updating the log dir throttle of the ongoing
+  // execution (see {@link #updateOngoingExecutionLogDirThrottle(long)}).
+  private volatile LogDirThrottleHelper _ongoingExecutionLogDirThrottleHelper;
   // TODO: Execution history is currently kept in memory, but ideally we should move it to a persistent store.
   private final long _demotionHistoryRetentionTimeMs;
   private final long _removalHistoryRetentionTimeMs;
   private final ConcurrentMap<Integer, Long> _latestDemoteStartTimeMsByBrokerId;
   private final ConcurrentMap<Integer, Long> _latestRemoveStartTimeMsByBrokerId;
+  // Bounds the time that removing a leftover log dir throttle can block the proposal executor thread if a removal does not
+  // take effect. The removal is retried on the next sweep.
+  private static final int LEFTOVER_LOG_DIR_THROTTLE_REMOVAL_RETRIES = 5;
   private final ScheduledExecutorService _executionHistoryScannerExecutor;
+  // Replication throttles that executions have set, but not removed yet (see #removeLeftoverReplicationThrottles).
+  private final ReplicationThrottleHelper.AppliedThrottles _appliedReplicationThrottles;
+  private final AtomicBoolean _leftoverReplicationThrottleRemovalQueued;
+  private final ScheduledExecutorService _leftoverReplicationThrottleCleanerExecutor;
+  // Log dir throttles that executions have set, but not removed yet (see #removeLeftoverLogDirThrottles).
+  private final LogDirThrottleHelper.AppliedThrottles _appliedLogDirThrottles;
+  // The log dir throttle that the last execution applied to the brokers whose throttle it could not restore -- persisted with the
+  // record above, so that a throttle recovered after a restart is restored only if the broker still carries it.
+  private final Map<Integer, String> _lastAppliedLogDirThrottleByBroker = new ConcurrentHashMap<>();
+  // Brokers of the log dir throttles recovered from before a restart, mapped to the value applied to them before the restart.
+  private final Map<Integer, String> _recoveredAppliedLogDirThrottleByBroker = new ConcurrentHashMap<>();
+  private final AtomicBoolean _leftoverLogDirThrottleRemovalQueued;
+  private final ScheduledExecutorService _leftoverLogDirThrottleCleanerExecutor;
   private UserTaskManager _userTaskManager;
   private final AnomalyDetectorManager _anomalyDetectorManager;
   private final ConcurrencyAdjuster _concurrencyAdjuster;
   private final ScheduledExecutorService _concurrencyAdjusterExecutor;
   private final ConcurrentMap<ConcurrencyType, Boolean> _concurrencyAdjusterEnabled;
   private volatile boolean _concurrencyAdjusterMinIsrCheckEnabled;
+  private volatile boolean _replicationThrottleAdjusterEnabled;
+  private final boolean _replicationThrottleMinIsrCheckEnabled;
+  // The brokers to or from which the ongoing execution starts no new inter-broker replica movement, as of its last check.
+  private volatile Set<Integer> _brokersNotToStartMovementsOn = Collections.emptySet();
+  // The maximum age of the last valid broker metrics that replication throttle adjustment falls back to.
+  private final long _brokerMetricsWindowMs;
+  // The replication throttle helper of the ongoing inter-broker replica movements (if any).
+  private volatile ReplicationThrottleHelper _replicationThrottleHelper;
+  // Held by the concurrency adjuster while it applies replication throttle updates, after checking that the adjustment is enabled.
+  private final Object _replicationThrottleUpdateLock = new Object();
+  // The replication throttle that the operator set during the ongoing execution (admin?replication_throttle), or null. Decision
+  // D2: while the concurrency adjuster adjusts replication throttles, it may override this throttle; once replication throttle
+  // adjustment is turned off, this throttle is applied again and holds for the rest of the execution.
+  private volatile Long _operatorReplicationThrottle = null;
   private final TopicMinIsrCache _topicMinIsrCache;
+  private final boolean _clearReplicationThrottlesBeforeExecution;
   private final long _minExecutionProgressCheckIntervalMs;
   private final long _slowTaskAlertingBackoffTimeMs;
+  private final double _replicaMovementThrottleWriteRateMargin;
+  private final long _metricSamplingIntervalMs;
+  private final DataMovementProgressCheckScheduler _dataMovementProgressCheckScheduler;
+  private final long _taskExecutionAlertingThresholdMs;
+  private final double _interBrokerReplicaMovementRateAlertingThreshold;
+  private final double _intraBrokerReplicaMovementRateAlertingThreshold;
   private final KafkaCruiseControlConfig _config;
   private final AtomicDouble _partitionMovementCountPerSec;
   private final AtomicDouble _partitionMovementMbPerSec;
@@ -156,6 +247,52 @@ public class Executor {
   // Timer of executing proposal involved with broker demotion only (no broker removal).
   private final Timer _proposalExecutionTimerInvolveBrokerDemotionOnly;
   private final Timer _proposalExecutionTimer;
+  // Persists the state of the ongoing execution to recover it after a restart.
+  private final ExecutionStateStore _executionStateStore;
+  private final Object _executionStateStoreLock;
+  private final boolean _resumeInterruptedExecutionOnStartup;
+  private final long _resumeInterruptedExecutionMaxAgeMs;
+  private final int _resumeInterruptedExecutionMaxCount;
+  private final long _interruptedExecutionCleanupTimeoutMs;
+  // The recovery of the latest execution interrupted by a restart -- reported in the executor state until the next execution starts.
+  private volatile InterruptedExecutionRecovery _interruptedExecutionRecovery;
+  // The latest cluster metadata retrieved by the ongoing execution -- to fingerprint the replicas outside the execution.
+  private volatile Cluster _latestClusterOfExecution;
+  // The last persisted retained replication throttles (null: none), to skip rewriting an unchanged document. Guarded by
+  // _executionStateStoreLock.
+  private String _lastPersistedRetainedThrottles;
+  // The replication part of the persisted retained throttles: the record as of the last time it held no ongoing execution's throttles.
+  private volatile RetainedReplicationThrottles _persistedRetainedReplicationThrottles = RetainedReplicationThrottles.NONE;
+  // Set upon shutdown to retain the persisted state of an execution interrupted by the shutdown -- i.e. to recover it upon restart.
+  private volatile boolean _shutdownRequested;
+  // The parameters of the ongoing execution to persist, or null if the state of the ongoing execution is not persisted.
+  private volatile PersistedExecutionState _executionStateToPersist;
+  private long _lastPersistedTaskStateVersion;
+  private ExecutorState.State _lastPersistedExecutorState;
+  private boolean _executionStatePersistenceFailureReported;
+  // Whether the last attempt to persist the state of the ongoing execution succeeded -- a shutdown leaves the in-flight movements of
+  // the execution to Kafka only if the restart can recover them. Guarded by _executionStateStoreLock.
+  private boolean _executionStatePersisted;
+  // The time the state of the ongoing execution was last persisted. Guarded by _executionStateStoreLock.
+  private long _lastCheckpointTimeMs;
+  // The state of the concurrency adjuster as of the last checkpoint of the ongoing execution. Guarded by _executionStateStoreLock.
+  private PersistedAdjusterState _lastPersistedAdjusterState;
+  // The ongoing execution is checkpointed at least this often, even if nothing has changed -- see
+  // ExecutorConfig#EXECUTOR_STATE_CHECKPOINT_INTERVAL_MS_CONFIG.
+  private final long _executionStateCheckpointIntervalMs;
+  // The number of completed tasks of the ongoing execution when it started: a resumed execution that completes a task after it resumed
+  // has made progress, so its resume count starts over.
+  private volatile int _numCompletedTasksAtStart;
+  // The recovery plan of the interrupted execution that is being resumed, or null if no execution is being resumed.
+  private ExecutionRecoveryUtils.RecoveryPlan _recoveryPlanToResume;
+  // Set by a shutdown that leaves the in-flight movements of the ongoing execution to Kafka (see #shutdown()): the execution thread
+  // leaves at its next progress check without stopping anything, and the restart recovers the execution.
+  private volatile boolean _detachRequested;
+  // Wakes up the execution thread waiting for its next progress check when a shutdown detaches the execution.
+  private final Object _progressCheckWaitLock = new Object();
+  // Rebuilds an execution queued after an interrupted execution (e.g. a queued disk rebalance, PR #39) from its persisted parameters,
+  // or null if queued executions are not recovered.
+  private volatile QueuedExecutionFactory _queuedExecutionFactory;
 
   /**
    * The executor class that execute the proposals generated by optimizer.
@@ -182,6 +319,25 @@ public class Executor {
            MetadataAdminClient metadataClient,
            ExecutorNotifier executorNotifier,
            AnomalyDetectorManager anomalyDetectorManager) {
+    this(config, time, dropwizardMetricRegistry, adminClient, metadataClient, executorNotifier, anomalyDetectorManager, null);
+  }
+
+  /**
+   * The executor class that execute the proposals generated by optimizer.
+   * Package private for unit test.
+   *
+   * @param config The configurations for Cruise Control.
+   * @param executionStateStore The store to persist the state of the ongoing execution, or {@code null} to create it from
+   *                            the given config.
+   */
+  Executor(KafkaCruiseControlConfig config,
+           Time time,
+           MetricRegistry dropwizardMetricRegistry,
+           Admin adminClient,
+           MetadataAdminClient metadataClient,
+           ExecutorNotifier executorNotifier,
+           AnomalyDetectorManager anomalyDetectorManager,
+           ExecutionStateStore executionStateStore) {
     _numExecutionStopped = new AtomicInteger(0);
     _numExecutionStoppedByUser = new AtomicInteger(0);
     _executionStoppedByUser = new AtomicBoolean(false);
@@ -208,6 +364,9 @@ public class Executor {
     _requestedExecutionProgressCheckIntervalMs = null;
     _proposalExecutor =
         Executors.newSingleThreadExecutor(new KafkaCruiseControlThreadFactory("ProposalExecutor", false, LOG));
+    _queuedExecutionStarter =
+        Executors.newSingleThreadExecutor(new KafkaCruiseControlThreadFactory("QueuedExecutionStarter", true, LOG));
+    _queuedExecution = null;
     _latestDemoteStartTimeMsByBrokerId = new ConcurrentHashMap<>();
     _latestRemoveStartTimeMsByBrokerId = new ConcurrentHashMap<>();
     _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());
@@ -228,8 +387,19 @@ public class Executor {
     _anomalyDetectorManager = anomalyDetectorManager;
     _demotionHistoryRetentionTimeMs = config.getLong(ExecutorConfig.DEMOTION_HISTORY_RETENTION_TIME_MS_CONFIG);
     _removalHistoryRetentionTimeMs = config.getLong(ExecutorConfig.REMOVAL_HISTORY_RETENTION_TIME_MS_CONFIG);
+    _clearReplicationThrottlesBeforeExecution = config.getBoolean(ExecutorConfig.CLEAR_REPLICATION_THROTTLES_BEFORE_EXECUTION_CONFIG);
     _minExecutionProgressCheckIntervalMs = config.getLong(ExecutorConfig.MIN_EXECUTION_PROGRESS_CHECK_INTERVAL_MS_CONFIG);
     _slowTaskAlertingBackoffTimeMs = config.getLong(ExecutorConfig.SLOW_TASK_ALERTING_BACKOFF_TIME_MS_CONFIG);
+    _replicaMovementThrottleWriteRateMargin = config.getDouble(ExecutorConfig.REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG);
+    _metricSamplingIntervalMs = config.getLong(MonitorConfig.METRIC_SAMPLING_INTERVAL_MS_CONFIG);
+    _dataMovementProgressCheckScheduler = new DataMovementProgressCheckScheduler(
+        config.getBoolean(ExecutorConfig.PARTITION_MOVEMENT_PROGRESS_TRACKING_ENABLED_CONFIG),
+        config.getLong(ExecutorConfig.PARTITION_MOVEMENT_PROGRESS_CHECK_INTERVAL_MS_CONFIG));
+    _taskExecutionAlertingThresholdMs = config.getLong(ExecutorConfig.TASK_EXECUTION_ALERTING_THRESHOLD_MS_CONFIG);
+    _interBrokerReplicaMovementRateAlertingThreshold =
+        config.getDouble(ExecutorConfig.INTER_BROKER_REPLICA_MOVEMENT_RATE_ALERTING_THRESHOLD_CONFIG);
+    _intraBrokerReplicaMovementRateAlertingThreshold =
+        config.getDouble(ExecutorConfig.INTRA_BROKER_REPLICA_MOVEMENT_RATE_ALERTING_THRESHOLD_CONFIG);
     _concurrencyAdjusterEnabled = new ConcurrentHashMap<>(ConcurrencyType.cachedValues().size());
     _concurrencyAdjusterEnabled.put(ConcurrencyType.INTER_BROKER_REPLICA,
                                     config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_INTER_BROKER_REPLICA_ENABLED_CONFIG));
@@ -240,6 +410,11 @@ public class Executor {
     // Support for intra-broker replica movement is pending https://github.com/cruise-control-for-kafka/cruise-control/issues/1299.
     _concurrencyAdjusterEnabled.put(ConcurrencyType.INTRA_BROKER_REPLICA, false);
     _concurrencyAdjusterMinIsrCheckEnabled = config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG);
+    _replicationThrottleAdjusterEnabled = config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_ENABLED_CONFIG);
+    _replicationThrottleMinIsrCheckEnabled =
+        config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG);
+    _brokerMetricsWindowMs = config.getLong(MonitorConfig.BROKER_METRICS_WINDOW_MS_CONFIG);
+    _replicationThrottleHelper = null;
     _concurrencyAdjusterExecutor = Executors.newSingleThreadScheduledExecutor(
         new KafkaCruiseControlThreadFactory(ConcurrencyAdjuster.class.getSimpleName()));
     int numMinIsrCheck = config.getInt(ExecutorConfig.CONCURRENCY_ADJUSTER_NUM_MIN_ISR_CHECK_CONFIG);
@@ -250,13 +425,35 @@ public class Executor {
                                              ExecutionUtils.MIN_ISR_CACHE_CLEANER_PERIOD,
                                              ExecutionUtils.MIN_ISR_CACHE_CLEANER_INITIAL_DELAY,
                                              _time);
-    _concurrencyAdjusterExecutor.scheduleAtFixedRate(_concurrencyAdjuster, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+    // With a fixed delay, a slow run (e.g. replication throttle updates waiting for a slow broker) is not followed by catch-up runs
+    // back to back, which would apply several throttle decreases at once.
+    _concurrencyAdjusterExecutor.scheduleWithFixedDelay(_concurrencyAdjuster, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+    _appliedLogDirThrottles = new LogDirThrottleHelper.AppliedThrottles();
+    _leftoverLogDirThrottleRemovalQueued = new AtomicBoolean(false);
+    _leftoverLogDirThrottleCleanerExecutor = Executors.newSingleThreadScheduledExecutor(
+        new KafkaCruiseControlThreadFactory(LeftoverLogDirThrottleCleaner.class.getSimpleName()));
+    // A log dir throttle that an execution failed to restore is retried as often as the progress of an execution is checked.
+    long leftoverLogDirThrottleCheckIntervalMs = Math.max(1L, _defaultExecutionProgressCheckIntervalMs);
+    _leftoverLogDirThrottleCleanerExecutor.scheduleAtFixedRate(new LeftoverLogDirThrottleCleaner(),
+                                                               leftoverLogDirThrottleCheckIntervalMs,
+                                                               leftoverLogDirThrottleCheckIntervalMs,
+                                                               TimeUnit.MILLISECONDS);
     _executionHistoryScannerExecutor = Executors.newSingleThreadScheduledExecutor(
         new KafkaCruiseControlThreadFactory(ExecutionHistoryScanner.class.getSimpleName()));
     _executionHistoryScannerExecutor.scheduleAtFixedRate(new ExecutionHistoryScanner(),
                                                          ExecutionUtils.EXECUTION_HISTORY_SCANNER_INITIAL_DELAY_SECONDS,
                                                          ExecutionUtils.EXECUTION_HISTORY_SCANNER_PERIOD_SECONDS,
                                                          TimeUnit.SECONDS);
+    _appliedReplicationThrottles = new ReplicationThrottleHelper.AppliedThrottles();
+    _leftoverReplicationThrottleRemovalQueued = new AtomicBoolean(false);
+    _leftoverReplicationThrottleCleanerExecutor = Executors.newSingleThreadScheduledExecutor(
+        new KafkaCruiseControlThreadFactory(LeftoverReplicationThrottleCleaner.class.getSimpleName()));
+    // Leftover throttles of ongoing partition reassignments are removed once they finish, so check as often as the progress of an execution.
+    long leftoverReplicationThrottleCheckIntervalMs = Math.max(1L, _defaultExecutionProgressCheckIntervalMs);
+    _leftoverReplicationThrottleCleanerExecutor.scheduleAtFixedRate(new LeftoverReplicationThrottleCleaner(),
+                                                                    leftoverReplicationThrottleCheckIntervalMs,
+                                                                    leftoverReplicationThrottleCheckIntervalMs,
+                                                                    TimeUnit.MILLISECONDS);
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, PARTITION_MOVEMENT_PER_SEC),
                                       (Gauge<Double>) _partitionMovementCountPerSec::get);
     dropwizardMetricRegistry.register(MetricRegistry.name(EXECUTOR_SENSOR, PARTITION_MOVEMENT_MB_PER_SEC),
@@ -267,6 +464,51 @@ public class Executor {
         TIMER_PROPOSAL_EXECUTION_TIME_INVOLVE_BROKER_DEMOTION_ONLY));
     _proposalExecutionTimer = dropwizardMetricRegistry.timer(MetricRegistry.name(EXECUTOR_SENSOR,
         TIMER_PROPOSAL_EXECUTION_TIME));
+    _executionStateStore = executionStateStore != null ? executionStateStore
+                                                       : config.getConfiguredInstance(ExecutorConfig.EXECUTOR_STATE_STORE_CLASS_CONFIG,
+                                                                                      ExecutionStateStore.class);
+    _executionStateStoreLock = new Object();
+    _resumeInterruptedExecutionOnStartup = config.getBoolean(ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG);
+    _resumeInterruptedExecutionMaxAgeMs = config.getLong(ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG);
+    _resumeInterruptedExecutionMaxCount = config.getInt(ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG);
+    _interruptedExecutionCleanupTimeoutMs = config.getLong(ExecutorConfig.INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG);
+    _interruptedExecutionRecovery = null;
+    _latestClusterOfExecution = null;
+    _shutdownRequested = false;
+    _executionStateToPersist = null;
+    _recoveryPlanToResume = null;
+    _lastPersistedRetainedThrottles = null;
+    _executionStateCheckpointIntervalMs = config.getLong(ExecutorConfig.EXECUTOR_STATE_CHECKPOINT_INTERVAL_MS_CONFIG);
+    _executionStatePersisted = false;
+    _lastCheckpointTimeMs = -1L;
+    _numCompletedTasksAtStart = 0;
+    _detachRequested = false;
+    _queuedExecutionFactory = null;
+  }
+
+  /**
+   * Rebuilds an execution queued after an execution interrupted by a restart, from the parameters it was persisted with (see
+   * {@link #queueExecution(String, String, Runnable, Map)}).
+   */
+  @FunctionalInterface
+  public interface QueuedExecutionFactory {
+    /**
+     * @param type The type of the queued execution (e.g. REBALANCE_DISK).
+     * @param uuid UUID of the user task of the queued execution.
+     * @param parameters The parameters the queued execution was persisted with.
+     * @return The start of the queued execution, or {@code null} if it cannot be rebuilt.
+     */
+    Runnable create(String type, String uuid, Map<String, String> parameters);
+  }
+
+  /**
+   * Set how an execution queued after an execution interrupted by a restart is rebuilt, so that it is queued again when the interrupted
+   * execution is resumed. Must be set before {@link #recoverInterruptedExecution(LoadMonitor)}.
+   *
+   * @param queuedExecutionFactory Rebuilds a queued execution from its persisted parameters.
+   */
+  public void setQueuedExecutionFactory(QueuedExecutionFactory queuedExecutionFactory) {
+    _queuedExecutionFactory = queuedExecutionFactory;
   }
 
   /**
@@ -294,6 +536,10 @@ public class Executor {
     }
     _requestedExecutionProgressCheckIntervalMs = requestedExecutionProgressCheckIntervalMs;
     setExecutionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs);
+    if (_hasOngoingExecution) {
+      persistExecutionParameterChange(state -> state.toBuilder().executionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs)
+                                                    .build());
+    }
   }
 
   /**
@@ -444,6 +690,69 @@ public class Executor {
   }
 
   /**
+   * Remove the log dir throttles that executions have left behind -- i.e. the per-broker
+   * {@code replica.alter.log.dirs.io.max.bytes.per.second} that an execution set and then failed to restore, because the
+   * broker could not be described or altered at the time. The value is a DYNAMIC broker config, so it survives broker
+   * restarts; and a later execution reading it would treat it as the operator's own value and faithfully put it back. So
+   * without this sweep a single failed restore leaves a rate limit on that broker for good.
+   *
+   * <p>Called only while there is no ongoing execution, and from the proposal executor thread, so that it cannot interfere
+   * with an execution's own throttling.</p>
+   *
+   * <p>The record of what was borrowed is persisted with the retained replication throttles (Integration PR#15 -> PR#26), so it
+   * survives a hard kill of the process too; the throttles recovered after a restart are restored only if the broker still carries
+   * the value applied before the restart (see {@link #restoreRecoveredLogDirThrottles()}).</p>
+   */
+  private void removeLeftoverLogDirThrottles() {
+    if (_hasOngoingExecution || _appliedLogDirThrottles.isEmpty()) {
+      return;
+    }
+    restoreRecoveredLogDirThrottles();
+    Map<Integer, String> originals = _appliedLogDirThrottles.originalThrottleByBroker();
+    Map<Integer, String> leftovers = new HashMap<>(originals);
+    leftovers.keySet().removeAll(_recoveredAppliedLogDirThrottleByBroker.keySet());
+    if (!leftovers.isEmpty()) {
+      LOG.info("Removing leftover log dir throttles of brokers {}.", leftovers.keySet());
+      Set<Integer> brokers = new HashSet<>(leftovers.keySet());
+      // The applied rate is not checked here: this runs after the execution that set it has finished, so a current value that
+      // differs from the original is restored rather than left alone.
+      LogDirThrottleHelper.removeThrottles(_adminClient, leftovers, null, LEFTOVER_LOG_DIR_THROTTLE_REMOVAL_RETRIES);
+      brokers.removeAll(leftovers.keySet());
+      originals.keySet().removeAll(brokers);
+    }
+    _lastAppliedLogDirThrottleByBroker.keySet().retainAll(originals.keySet());
+    persistRetainedReplicationThrottles();
+  }
+
+  /**
+   * A runnable class to periodically remove the log dir throttles that executions left behind (see
+   * {@link #removeLeftoverLogDirThrottles()}) while there is no ongoing execution.
+   */
+  private class LeftoverLogDirThrottleCleaner implements Runnable {
+    @Override
+    public void run() {
+      if (_hasOngoingExecution || _appliedLogDirThrottles.isEmpty()
+          || !_leftoverLogDirThrottleRemovalQueued.compareAndSet(false, true)) {
+        return;
+      }
+      try {
+        // Remove the throttles in the proposal executor thread, so that the removal does not interfere with an execution.
+        _proposalExecutor.execute(() -> {
+          try {
+            removeLeftoverLogDirThrottles();
+          } finally {
+            _leftoverLogDirThrottleRemovalQueued.set(false);
+          }
+        });
+      } catch (Throwable t) {
+        // E.g. the proposal executor is shut down.
+        _leftoverLogDirThrottleRemovalQueued.set(false);
+        LOG.debug("Failed to queue the removal of leftover log dir throttles.", t);
+      }
+    }
+  }
+
+  /**
    * A runnable class to remove expired execution history.
    */
   private class ExecutionHistoryScanner implements Runnable {
@@ -456,6 +765,247 @@ public class Executor {
         LOG.warn("Received exception when trying to expire execution history.", t);
       }
     }
+  }
+
+  /**
+   * A runnable class to periodically remove the replication throttles that executions left behind (see
+   * {@link #removeLeftoverReplicationThrottles()}) while there is no ongoing execution.
+   */
+  private class LeftoverReplicationThrottleCleaner implements Runnable {
+    @Override
+    public void run() {
+      if (_hasOngoingExecution || _appliedReplicationThrottles.isEmpty()
+          || !_leftoverReplicationThrottleRemovalQueued.compareAndSet(false, true)) {
+        return;
+      }
+      try {
+        // Remove the throttles in the proposal executor thread, so that the removal does not interfere with an execution.
+        _proposalExecutor.execute(() -> {
+          try {
+            removeLeftoverReplicationThrottles();
+          } finally {
+            _leftoverReplicationThrottleRemovalQueued.set(false);
+          }
+        });
+      } catch (Throwable t) {
+        // E.g. the proposal executor is shut down.
+        _leftoverReplicationThrottleRemovalQueued.set(false);
+        LOG.debug("Failed to schedule the removal of leftover replication throttles.", t);
+      }
+    }
+  }
+
+  /**
+   * Removes the replication throttles that executions set, but could not remove -- e.g. because an execution failed while
+   * replicas were still moving, or a broker was unavailable. The throttles of the partitions that are still being reassigned,
+   * and the throttled rates of unavailable brokers are retained, so that a later call removes them. Must be called from the
+   * proposal executor thread, so that it does not interfere with the throttles of an ongoing execution.
+   */
+  private void removeLeftoverReplicationThrottles() {
+    try {
+      if (!_appliedReplicationThrottles.isEmpty()) {
+        new ReplicationThrottleHelper(_adminClient, null, LEFTOVER_REPLICATION_THROTTLE_REMOVAL_RETRIES, Collections.emptySet(),
+                                      _appliedReplicationThrottles)
+            .clearLeftoverThrottles(ExecutionUtils.partitionsBeingReassigned(_adminClient));
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } catch (ExecutionException | TimeoutException | RuntimeException e) {
+      LOG.warn("Failed to remove leftover replication throttles. Will retry later.", e);
+    } finally {
+      persistRetainedReplicationThrottles();
+    }
+  }
+
+  /**
+   * Persist the replication throttles that executions set, but could not remove yet (see {@link #removeLeftoverReplicationThrottles()}),
+   * so that they are removed even if Cruise Control restarts in the meantime. Unlike the execution state, they outlive the execution
+   * that set them: the record is persisted after every sweep (including the one at the end of an execution), and loaded back upon
+   * startup by {@link #recoverInterruptedExecution(LoadMonitor)}.
+   */
+  private void persistRetainedReplicationThrottles() {
+    // Called only while the record holds no throttle of an ongoing execution -- after a sweep, or when an interrupted execution
+    // hands its throttles over. During an execution the record also holds the throttles the execution is using: those are the
+    // persisted execution state's, and recovering them from here too would remove them without matching their values (e.g. an
+    // operator's rate set while Cruise Control was down).
+    _persistedRetainedReplicationThrottles = new RetainedReplicationThrottles(_appliedReplicationThrottles);
+    persistRetainedThrottles();
+  }
+
+  /**
+   * Persist the retained throttles: the replication throttles as of the last {@link #persistRetainedReplicationThrottles()}, and the
+   * current record of the log dir throttles. Called at every checkpoint of an execution too, as the original log dir throttles that
+   * the execution borrows (PR #26) are known only in memory.
+   */
+  private void persistRetainedThrottles() {
+    String json;
+    try {
+      RetainedReplicationThrottles replicationThrottles = _persistedRetainedReplicationThrottles;
+      Set<Integer> brokers = replicationThrottles.brokers();
+      List<ExecutionProposal> proposals = replicationThrottles.proposals();
+      Map<Integer, String> originalLogDirThrottleByBroker = new HashMap<>(_appliedLogDirThrottles.originalThrottleByBroker());
+      json = brokers.isEmpty() && proposals.isEmpty() && originalLogDirThrottleByBroker.isEmpty()
+             ? null : PersistedExecutionStateSerde.retainedThrottlesToJson(brokers, proposals, originalLogDirThrottleByBroker,
+                                                                           appliedLogDirThrottleByBroker());
+    } catch (RuntimeException e) {
+      // E.g. the log dir record changed while being copied: the next call persists it.
+      LOG.debug("Failed to snapshot the retained throttles.", e);
+      return;
+    }
+    synchronized (_executionStateStoreLock) {
+      if (Objects.equals(json, _lastPersistedRetainedThrottles)) {
+        return;
+      }
+      try {
+        _executionStateStore.saveRetainedThrottles(json);
+        _lastPersistedRetainedThrottles = json;
+      } catch (IOException | RuntimeException e) {
+        LOG.warn("Failed to persist the retained replication throttles {}.", json, e);
+      }
+    }
+  }
+
+  /**
+   * A snapshot of the record of the replication throttles that executions set, but could not remove yet.
+   */
+  private static final class RetainedReplicationThrottles {
+    private static final RetainedReplicationThrottles NONE = new RetainedReplicationThrottles(Collections.emptySet(), Collections.emptyList());
+    private final Set<Integer> _brokers;
+    private final List<ExecutionProposal> _proposals;
+
+    RetainedReplicationThrottles(Collection<Integer> brokers, Collection<ExecutionProposal> proposals) {
+      _brokers = Collections.unmodifiableSet(new TreeSet<>(brokers));
+      _proposals = List.copyOf(proposals);
+    }
+
+    RetainedReplicationThrottles(ReplicationThrottleHelper.AppliedThrottles appliedThrottles) {
+      this(appliedThrottles.brokers(), appliedThrottles.proposals());
+    }
+
+    Set<Integer> brokers() {
+      return _brokers;
+    }
+
+    List<ExecutionProposal> proposals() {
+      return _proposals;
+    }
+  }
+
+  /**
+   * @return The log dir throttle applied to each broker of {@link #_appliedLogDirThrottles}, where known: by the ongoing execution,
+   * by the last execution (for the brokers whose throttle it could not restore), or before a restart.
+   */
+  private Map<Integer, String> appliedLogDirThrottleByBroker() {
+    Map<Integer, String> applied = new HashMap<>(_recoveredAppliedLogDirThrottleByBroker);
+    applied.putAll(_lastAppliedLogDirThrottleByBroker);
+    LogDirThrottleHelper logDirThrottleHelper = _ongoingExecutionLogDirThrottleHelper;
+    if (logDirThrottleHelper != null) {
+      applied.putAll(logDirThrottleHelper.appliedThrottleByBroker());
+    }
+    return applied;
+  }
+
+  /**
+   * Restore the log dir throttles recovered from before a restart (see {@link #loadRetainedReplicationThrottles()}): the original
+   * per-broker value of a broker is put back only if the broker still carries the value applied before the restart -- a different
+   * value was set by someone else in the meantime, and is left alone. Must be called while no execution throttles these brokers.
+   */
+  private void restoreRecoveredLogDirThrottles() {
+    if (_recoveredAppliedLogDirThrottleByBroker.isEmpty()) {
+      return;
+    }
+    Map<Integer, String> originals = _appliedLogDirThrottles.originalThrottleByBroker();
+    Map<Integer, String> recovered = new HashMap<>();
+    for (Integer broker : new ArrayList<>(_recoveredAppliedLogDirThrottleByBroker.keySet())) {
+      if (originals.containsKey(broker)) {
+        recovered.put(broker, originals.get(broker));
+      } else {
+        _recoveredAppliedLogDirThrottleByBroker.remove(broker);
+      }
+    }
+    if (!recovered.isEmpty()) {
+      LOG.info("Restoring the log dir throttles of brokers {} that an execution set before the restart.", recovered.keySet());
+      Set<Integer> brokers = new HashSet<>(recovered.keySet());
+      // Drops a broker from the given map once its throttle is restored, or left alone because somebody else changed it.
+      LogDirThrottleHelper.removeThrottles(_adminClient, recovered, new HashMap<>(_recoveredAppliedLogDirThrottleByBroker),
+                                           LEFTOVER_LOG_DIR_THROTTLE_REMOVAL_RETRIES);
+      brokers.removeAll(recovered.keySet());
+      originals.keySet().removeAll(brokers);
+      _recoveredAppliedLogDirThrottleByBroker.keySet().removeAll(brokers);
+    }
+    persistRetainedReplicationThrottles();
+  }
+
+  /**
+   * Load the replication throttles that were retained before a restart (see {@link #persistRetainedReplicationThrottles()}), so that
+   * {@link LeftoverReplicationThrottleCleaner} removes them once their partition movements finish and their brokers are available.
+   * The log dir throttles retained before the restart are loaded too (PR #26), and {@link LeftoverLogDirThrottleCleaner} restores
+   * them (see {@link #restoreRecoveredLogDirThrottles()}).
+   */
+  private void loadRetainedReplicationThrottles() {
+    synchronized (_executionStateStoreLock) {
+      try {
+        Optional<String> json = _executionStateStore.loadRetainedThrottles();
+        if (json.isPresent()) {
+          PersistedExecutionStateSerde.RetainedThrottles retained = PersistedExecutionStateSerde.retainedThrottlesFromJson(json.get());
+          _appliedReplicationThrottles.add(retained.brokers(), retained.proposals());
+          _persistedRetainedReplicationThrottles = new RetainedReplicationThrottles(retained.brokers(), retained.proposals());
+          _appliedLogDirThrottles.originalThrottleByBroker().putAll(retained.originalLogDirThrottleByBroker());
+          _recoveredAppliedLogDirThrottleByBroker.putAll(retained.appliedLogDirThrottleByBroker());
+          _lastPersistedRetainedThrottles = json.get();
+          LOG.info("Recovered the throttles retained before the restart: replication throttles of brokers {} and {} partition "
+                   + "movement(s), log dir throttles of brokers {}.", retained.brokers(), retained.proposals().size(),
+                   retained.originalLogDirThrottleByBroker().keySet());
+        }
+      } catch (IOException | RuntimeException e) {
+        LOG.error("Failed to load the replication throttles retained before the restart.", e);
+        _executorNotifier.sendAlert("Failed to load the replication throttles retained before the restart: " + e.getMessage());
+      }
+    }
+  }
+
+  /**
+   * Remove the replication throttles of an interrupted execution that are recorded in the given record, with a helper that removes a
+   * throttled rate only if it is still the throttle of the interrupted execution (see
+   * {@link ReplicationThrottleHelper#forInterruptedExecution}). What cannot be removed now -- e.g. the throttled rate of a broker that
+   * is not alive, or a removal that does not read back -- is handed over to the record of the throttles that executions set but could
+   * not remove yet, which is persisted and swept until they are removed, also across restarts.
+   *
+   * <p>If the concurrency adjuster managed the replication throttle of the interrupted execution (PR #13), its brokers carry
+   * per-broker rates that no single value matches: their rates are removed whatever their value -- under decision D2 the adjuster
+   * overrides an operator's rate anyway.</p>
+   *
+   * @param uuid UUID of the interrupted execution.
+   * @param throttleRate The replication throttle of the interrupted execution.
+   * @param throttleAdjusted {@code true} if the concurrency adjuster managed the replication throttle of the interrupted execution.
+   * @param interruptedThrottles The throttles of the interrupted execution to remove.
+   * @return Descriptions of the throttled rates that were kept (set by someone else) or retained (to be removed later).
+   */
+  private List<String> removeThrottlesOfInterruptedExecution(String uuid, Long throttleRate, boolean throttleAdjusted,
+                                                             ReplicationThrottleHelper.AppliedThrottles interruptedThrottles)
+      throws InterruptedException {
+    ReplicationThrottleHelper throttleHelper = throttleAdjusted
+        ? new ReplicationThrottleHelper(_adminClient, null, INTERRUPTED_EXECUTION_CONFIG_CHANGE_RETRIES, Collections.emptySet(),
+                                        interruptedThrottles)
+        : ReplicationThrottleHelper.forInterruptedExecution(_adminClient, throttleRate, INTERRUPTED_EXECUTION_CONFIG_CHANGE_RETRIES,
+                                                            interruptedThrottles);
+    try {
+      throttleHelper.clearLeftoverThrottles(ExecutionUtils.partitionsBeingReassigned(_adminClient));
+    } catch (ExecutionException | TimeoutException | RuntimeException e) {
+      LOG.warn("Interrupted execution {}: Failed to remove some leftover replication throttles -- they are retained and removed later.",
+               uuid, e);
+    }
+    List<String> keptThrottles = new ArrayList<>(throttleHelper.keptRates());
+    if (!interruptedThrottles.isEmpty()) {
+      LOG.warn("Interrupted execution {}: Retaining the replication throttles of brokers {} and of {} partition movements until the "
+               + "movements finish and the brokers are available.", uuid, interruptedThrottles.brokers(),
+               interruptedThrottles.proposals().size());
+      new TreeSet<>(interruptedThrottles.brokers()).forEach(b -> keptThrottles.add(
+          String.format("broker %d: retained -- its throttled rates are removed once it is available", b)));
+      _appliedReplicationThrottles.add(interruptedThrottles.brokers(), interruptedThrottles.proposals());
+    }
+    persistRetainedReplicationThrottles();
+    return keptThrottles;
   }
 
   /**
@@ -473,6 +1023,28 @@ public class Executor {
     private int _numChecks;
     private final ExecutionConcurrencyManager _executionConcurrencyManager;
     private volatile boolean _started;
+    // Broker capacities used for replication throttle adjustment, cached for the ongoing execution.
+    private ClusterModel _clusterCapacity;
+    // The last known write rate (KB/sec) of partitions used for replication throttle adjustment, kept for the ongoing execution.
+    private final Map<TopicPartition, Double> _lastKnownWriteRateKBpsByPartition = new HashMap<>();
+    // The last valid broker metrics used for replication throttle adjustment, kept for the ongoing execution.
+    private final Map<Integer, TimedMetrics> _lastValidBrokerMetricsById = new HashMap<>();
+    // The progress of the in-progress inter-broker replica movements, used to escalate their needed throttle when they stall at it.
+    private final Map<TopicPartition, MovementProgress> _movementProgressByPartition = new HashMap<>();
+    // The number of consecutive metric-based checks at which the metrics of each broker were over a concurrency adjuster limit.
+    private final Map<Integer, Integer> _consecutiveOverLimitChecksByBroker = new HashMap<>();
+    // The values of the limit metrics that count only when they rise, at the previous metric-based check of each broker.
+    private final Map<Integer, Map<String, Double>> _lastRiseTriggeredLimitValuesByBroker = new HashMap<>();
+    // The brokers whose leader (follower) throttle is past slow start: it was decreased, or the broker was over a concurrency adjuster
+    // limit, during the ongoing execution -- from then on, a full throttle is raised by the additive increase instead of doubled.
+    // Concurrent: the checkpoints of the execution read them without the lock of the adjuster (see #slowStartEndedBrokers).
+    private final Set<Integer> _leaderSlowStartEndedBrokers = ConcurrentHashMap.newKeySet();
+    private final Set<Integer> _followerSlowStartEndedBrokers = ConcurrentHashMap.newKeySet();
+    // The number of consecutive metric-based checks at which the leader (follower) throttle of each broker was far above its use.
+    private final Map<Integer, Integer> _leaderFarAboveUseChecksByBroker = new HashMap<>();
+    private final Map<Integer, Integer> _followerFarAboveUseChecksByBroker = new HashMap<>();
+    // Brokers (and directions) already warned about for needing more than the maximum replication throttle.
+    private final Set<String> _needAboveMaxWarnings = new HashSet<>();
 
     public ConcurrencyAdjuster(int numMinIsrCheck) {
       _numMinIsrCheck = numMinIsrCheck;
@@ -513,7 +1085,41 @@ public class Executor {
      */
     public synchronized void clearAdjustment() {
       _started = false;
+      _clusterCapacity = null;
+      _lastKnownWriteRateKBpsByPartition.clear();
+      _lastValidBrokerMetricsById.clear();
+      _movementProgressByPartition.clear();
+      _consecutiveOverLimitChecksByBroker.clear();
+      _lastRiseTriggeredLimitValuesByBroker.clear();
+      _leaderSlowStartEndedBrokers.clear();
+      _followerSlowStartEndedBrokers.clear();
+      _leaderFarAboveUseChecksByBroker.clear();
+      _followerFarAboveUseChecksByBroker.clear();
+      _needAboveMaxWarnings.clear();
       _executionConcurrencyManager.reset();
+    }
+
+    /**
+     * Not synchronized: a checkpoint calls it while holding the lock of the execution state store -- and possibly the lock of the
+     * executor, which the adjuster may wait for while holding its own lock (e.g. to stop the execution).
+     *
+     * @param leaderSlowStartEndedBrokers A set to populate with the brokers whose leader throttle is past slow start.
+     * @param followerSlowStartEndedBrokers A set to populate with the brokers whose follower throttle is past slow start.
+     */
+    void slowStartEndedBrokers(Set<Integer> leaderSlowStartEndedBrokers, Set<Integer> followerSlowStartEndedBrokers) {
+      leaderSlowStartEndedBrokers.addAll(_leaderSlowStartEndedBrokers);
+      followerSlowStartEndedBrokers.addAll(_followerSlowStartEndedBrokers);
+    }
+
+    /**
+     * Mark the given brokers as past slow start -- e.g. for an execution resumed after a restart.
+     *
+     * @param leaderSlowStartEndedBrokers Brokers whose leader throttle is past slow start.
+     * @param followerSlowStartEndedBrokers Brokers whose follower throttle is past slow start.
+     */
+    void restoreSlowStartEndedBrokers(Set<Integer> leaderSlowStartEndedBrokers, Set<Integer> followerSlowStartEndedBrokers) {
+      _leaderSlowStartEndedBrokers.addAll(leaderSlowStartEndedBrokers);
+      _followerSlowStartEndedBrokers.addAll(followerSlowStartEndedBrokers);
     }
 
     /**
@@ -662,12 +1268,542 @@ public class Executor {
       return currentConcurrency;
     }
 
+    private boolean canRefreshReplicationThrottle(ReplicationThrottleHelper throttleHelper) {
+      return _replicationThrottleAdjusterEnabled && _loadMonitor != null && _stopSignal.get() == NO_STOP_EXECUTION
+             && _executorState.state() == ExecutorState.State.INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS
+             && throttleHelper != null && throttleHelper.throttlingEnabled();
+    }
+
+    /**
+     * Get the brokers that are behind on an (At/Under)MinISR partition without offline replicas -- see
+     * {@link ExecutionUtils#brokersBehindOnMinIsrPartitions(Cluster, Map, Collection, Set)}: the concurrency adjuster decreases their
+     * replication throttles, and no new inter-broker replica movement to or from them starts, until they are back in sync. This check
+     * is independent of {@link ExecutorConfig#CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG}, and only affects the brokers that are
+     * behind -- i.e. it never stops the execution. Nothing is populated if
+     * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_MIN_ISR_CHECK_ENABLED_CONFIG} is disabled.
+     *
+     * @param brokersBehind A set to populate with the brokers that are behind.
+     */
+    void brokersBehindForThrottle(Set<Integer> brokersBehind) {
+      if (!_replicationThrottleMinIsrCheckEnabled) {
+        return;
+      }
+      Cluster cluster = _loadMonitor.kafkaCluster();
+      Set<String> topicsToCheck = new HashSet<>(cluster.topics());
+      topicsToCheck.removeAll(_topicMinIsrCache.minIsrWithTimeByTopic().keySet());
+      maybeRetrieveAndCacheTopicMinIsr(topicsToCheck);
+      brokersBehindOnMinIsrPartitions(cluster, _topicMinIsrCache.minIsrWithTimeByTopic(), inExecutionTasks(), brokersBehind);
+    }
+
+    /**
+     * Get the cluster capacity, which is cached for the ongoing execution and refreshed if it misses any of the given brokers.
+     *
+     * @param brokerIds Ids of brokers whose capacity is needed.
+     * @return Cluster capacity, or {@code null} if the capacity is unavailable.
+     */
+    private ClusterModel clusterCapacity(Set<Integer> brokerIds) {
+      if (_clusterCapacity == null || brokerIds.stream().anyMatch(brokerId -> _clusterCapacity.broker(brokerId) == null)) {
+        try {
+          _clusterCapacity = _loadMonitor.clusterCapacity();
+        } catch (TimeoutException | BrokerCapacityResolutionException e) {
+          LOG.warn("Concurrency adjuster failed to retrieve broker capacity for replication throttle adjustment.", e);
+        }
+      }
+      return _clusterCapacity;
+    }
+
+    /**
+     * @return The broker metrics to adjust the replication throttle with -- see
+     * {@link ExecutionUtils#brokerMetricsWithLastKnownFallback(Map, Map, long, long)}.
+     */
+    private Map<Integer, ValuesAndExtrapolations> brokerMetricsForReplicationThrottle() {
+      Map<Integer, ValuesAndExtrapolations> currentMetricsByBrokerId = new HashMap<>();
+      for (Map.Entry<BrokerEntity, ValuesAndExtrapolations> entry : _loadMonitor.currentBrokerMetricValues().entrySet()) {
+        currentMetricsByBrokerId.put(entry.getKey().brokerId(), entry.getValue());
+      }
+      Map<Integer, ValuesAndExtrapolations> metricsByBrokerId =
+          brokerMetricsWithLastKnownFallback(currentMetricsByBrokerId, _lastValidBrokerMetricsById, _time.milliseconds(),
+                                             _brokerMetricsWindowMs);
+      if (LOG.isDebugEnabled()) {
+        Set<Integer> brokersWithLastValidMetrics = new TreeSet<>(metricsByBrokerId.keySet());
+        brokersWithLastValidMetrics.removeIf(brokerId -> hasValidCurrentWindowValues(currentMetricsByBrokerId.get(brokerId)));
+        if (!brokersWithLastValidMetrics.isEmpty()) {
+          LOG.debug("Replication throttle adjustment uses the last valid metrics of brokers {}, whose current metric window has no "
+                    + "valid values yet.", brokersWithLastValidMetrics);
+        }
+      }
+      return metricsByBrokerId;
+    }
+
+    /**
+     * Get a fraction of the network headroom of the given brokers in each direction -- see
+     * {@link ExecutionUtils#initialReplicationThrottle(double, double, double)}: e.g. the replication throttles to start the brokers
+     * at, for an execution that was started without a replication throttle while replication throttle adjustment is enabled. Brokers
+     * whose capacity or metrics are unavailable are omitted.
+     *
+     * @param brokerIds Ids of the brokers.
+     * @param headroomFraction The fraction (in (0, 1]) of the network headroom.
+     * @param initialLeaderThrottleByBroker A map to populate with the leader throttle (bytes/sec) of each broker.
+     * @param initialFollowerThrottleByBroker A map to populate with the follower throttle (bytes/sec) of each broker.
+     */
+    synchronized void initialReplicationThrottles(Set<Integer> brokerIds,
+                                                  double headroomFraction,
+                                                  Map<Integer, Long> initialLeaderThrottleByBroker,
+                                                  Map<Integer, Long> initialFollowerThrottleByBroker) {
+      ClusterModel clusterCapacity = clusterCapacity(brokerIds);
+      if (clusterCapacity == null) {
+        return;
+      }
+      Map<Integer, ValuesAndExtrapolations> metricsByBrokerId = brokerMetricsForReplicationThrottle();
+      Map<TopicPartition, Double> writeRateKBpsByPartition = partitionWriteRatesKBps(_loadMonitor.currentPartitionMetricValues(),
+                                                                                     _lastKnownWriteRateKBpsByPartition);
+      Map<Integer, Double> inSyncFollowerInKBpsByBroker = new HashMap<>();
+      Map<Integer, Double> inSyncLeaderOutKBpsByBroker = new HashMap<>();
+      inSyncReplicationTrafficKBps(_metadataClient.cluster(), writeRateKBpsByPartition, inSyncFollowerInKBpsByBroker,
+                                   inSyncLeaderOutKBpsByBroker);
+      for (int brokerId : brokerIds) {
+        Broker broker = clusterCapacity.broker(brokerId);
+        ValuesAndExtrapolations metrics = metricsByBrokerId.get(brokerId);
+        Double leaderBytesIn = metrics == null ? null : latestBrokerMetricValue(metrics, KafkaMetricDef.LEADER_BYTES_IN);
+        Double leaderBytesOut = metrics == null ? null : latestBrokerMetricValue(metrics, KafkaMetricDef.LEADER_BYTES_OUT);
+        if (broker == null || leaderBytesIn == null || leaderBytesOut == null) {
+          continue;
+        }
+        initialLeaderThrottleByBroker.put(brokerId, initialReplicationThrottle(
+            broker.capacityFor(Resource.NW_OUT), leaderBytesOut + inSyncLeaderOutKBpsByBroker.getOrDefault(brokerId, 0.0),
+            headroomFraction));
+        initialFollowerThrottleByBroker.put(brokerId, initialReplicationThrottle(
+            broker.capacityFor(Resource.NW_IN), leaderBytesIn + inSyncFollowerInKBpsByBroker.getOrDefault(brokerId, 0.0),
+            headroomFraction));
+      }
+    }
+
+    /**
+     * Get what a throttle-aware replica movement strategy needs to admit inter-broker replica movements while replication throttle
+     * adjustment is enabled: the throttle that a new replica of each partition needs, including the escalation of movements that made
+     * no progress at it, and the throttle that the in-progress movements need on each broker -- the floor of its throttles, which also
+     * covers the replicas they keep that fell out of the ISR (see {@link ExecutionUtils#neededReplicationThrottles}). Movements are
+     * admitted against the live throttle of each broker: the adjuster raises a throttle only while the movements through it fill it,
+     * and charging each movement its need keeps the need floor from making room for more movements.
+     *
+     * @param neededThrottleByPartition A map to populate with the throttle (bytes/sec) that a new replica of each partition needs.
+     * @param neededLeaderThrottleByBroker A map to populate with the leader throttle (bytes/sec) needed by the in-progress movements of
+     *                                     each broker.
+     * @param neededFollowerThrottleByBroker A map to populate with the follower throttle (bytes/sec) needed by the in-progress movements
+     *                                       of each broker.
+     */
+    synchronized void admissionInputs(Map<TopicPartition, Double> neededThrottleByPartition,
+                                      Map<Integer, Long> neededLeaderThrottleByBroker,
+                                      Map<Integer, Long> neededFollowerThrottleByBroker) {
+      Map<TopicPartition, Double> writeRateKBpsByPartition = partitionWriteRatesKBps(_loadMonitor.currentPartitionMetricValues(),
+                                                                                     _lastKnownWriteRateKBpsByPartition);
+      Map<TopicPartition, Long> escalatedNeedByPartition = escalatedNeeds();
+      neededThrottleByPartition.putAll(neededReplicationThrottleByPartition(writeRateKBpsByPartition, escalatedNeedByPartition));
+      neededReplicationThrottles(inExecutionTasks(), writeRateKBpsByPartition, _metadataClient.cluster(), escalatedNeedByPartition,
+                                 neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+    }
+
+    /**
+     * @return The escalated throttle (bytes/sec) needed for each new replica, by partition of the escalated movements.
+     */
+    private Map<TopicPartition, Long> escalatedNeeds() {
+      Map<TopicPartition, Long> escalatedNeedByPartition = new HashMap<>();
+      _movementProgressByPartition.forEach((tp, progress) -> {
+        if (progress.escalatedNeed() > 0) {
+          escalatedNeedByPartition.put(tp, progress.escalatedNeed());
+        }
+      });
+      return escalatedNeedByPartition;
+    }
+
+    /**
+     * Count the consecutive metric-based checks at which the throttle of a broker in one direction was far above its use.
+     *
+     * @param farAboveUseChecksByBroker The number of consecutive checks by broker, to update.
+     * @param brokerId Broker id.
+     * @param farAboveUse {@code true} if the throttle is far above its (completely measured) use at this check.
+     */
+    private void countFarAboveUse(Map<Integer, Integer> farAboveUseChecksByBroker, int brokerId, boolean farAboveUse) {
+      if (farAboveUse) {
+        farAboveUseChecksByBroker.merge(brokerId, 1, Integer::sum);
+      } else {
+        farAboveUseChecksByBroker.remove(brokerId);
+      }
+    }
+
+    /**
+     * Track the progress of the out-of-sync replicas of the in-progress inter-broker replica movements (see {@link MovementProgress})
+     * from the log dir sizes of the brokers involved, and populate the replication traffic they measure through each throttle. A
+     * broker whose log dirs cannot be described contributes no lag at this run.
+     *
+     * <p>Escalate the needed throttle of a movement with a replica that made no progress if a throttle that replica fetches through --
+     * the leader throttle of the leader of the movement, or the follower throttle of the broker of the replica -- is at its need and in
+     * use (see {@link ExecutionUtils#throttleLimitsAtNeed}), i.e. if more throttle is what it lacks. A replica that made no progress through
+     * throttles that are mostly idle or above their need is
+     * reported once instead: something else holds it back (e.g. the disk or the network of a broker), which more throttle would not
+     * fix -- or the throttle is above its need, which the concurrency adjuster raises further while it is full and the network
+     * headroom allows.</p>
+     *
+     * @param tasks Execution tasks.
+     * @param cluster Kafka cluster.
+     * @param writeRateKBpsByPartition The write rate (KB/sec) by partition.
+     * @param throttleHelper The replication throttle helper of the ongoing inter-broker replica movements.
+     * @param neededLeaderThrottleByBroker The leader throttle (bytes/sec) needed by each broker.
+     * @param neededFollowerThrottleByBroker The follower throttle (bytes/sec) needed by each broker.
+     * @param throttleUse The replication traffic through the throttles of each broker, to populate.
+     * @return {@code true} if the needed throttle of any movement was escalated, {@code false} otherwise.
+     */
+    private boolean trackMovementProgress(Collection<ExecutionTask> tasks,
+                                          Cluster cluster,
+                                          Map<TopicPartition, Double> writeRateKBpsByPartition,
+                                          ReplicationThrottleHelper throttleHelper,
+                                          Map<Integer, Long> neededLeaderThrottleByBroker,
+                                          Map<Integer, Long> neededFollowerThrottleByBroker,
+                                          ReplicationThrottleUse throttleUse) {
+      Map<TopicPartition, ExecutionTask> taskByPartition = new HashMap<>();
+      Map<TopicPartition, List<Integer>> outOfSyncReplicasByPartition = new HashMap<>();
+      Set<Integer> brokersToDescribe = new HashSet<>();
+      for (ExecutionTask task : tasks) {
+        if (task.type() != ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION || task.state() != ExecutionTaskState.IN_PROGRESS) {
+          continue;
+        }
+        List<Integer> outOfSyncReplicas = outOfSyncReplicas(task.proposal(), cluster);
+        if (outOfSyncReplicas.isEmpty()) {
+          continue;
+        }
+        TopicPartition tp = task.proposal().topicPartition();
+        taskByPartition.put(tp, task);
+        outOfSyncReplicasByPartition.put(tp, outOfSyncReplicas);
+        brokersToDescribe.add(movementLeader(task.proposal(), cluster));
+        brokersToDescribe.addAll(outOfSyncReplicas);
+      }
+      _movementProgressByPartition.keySet().retainAll(taskByPartition.keySet());
+      if (taskByPartition.isEmpty()) {
+        return false;
+      }
+
+      // Record the lag of each out-of-sync replica, and the copy rate it gives.
+      Map<Integer, Map<TopicPartition, Long>> replicaSizeByBroker = replicaSizes(brokersToDescribe);
+      long nowMs = _time.milliseconds();
+      for (Map.Entry<TopicPartition, ExecutionTask> entry : taskByPartition.entrySet()) {
+        TopicPartition tp = entry.getKey();
+        int leader = movementLeader(entry.getValue().proposal(), cluster);
+        List<Integer> outOfSyncReplicas = outOfSyncReplicasByPartition.get(tp);
+        MovementProgress progress = _movementProgressByPartition.computeIfAbsent(tp, k -> new MovementProgress());
+        progress.track(entry.getValue().executionId());
+        progress.retainReplicas(outOfSyncReplicas);
+        Map<TopicPartition, Long> leaderSizes = replicaSizeByBroker.get(leader);
+        Long leaderSize = leaderSizes == null ? null : leaderSizes.get(tp);
+        double writeRateBytesPerSec = writeRateKBpsByPartition.getOrDefault(tp, 0.0) * BYTES_IN_KB;
+        ExecutionProposal proposal = entry.getValue().proposal();
+        for (int brokerId : outOfSyncReplicas) {
+          Map<TopicPartition, Long> sizes = replicaSizeByBroker.get(brokerId);
+          if (leaderSize != null && sizes != null) {
+            // A broker that was described without the replica has not created it yet: its size is 0.
+            long size = sizes.getOrDefault(tp, 0L);
+            progress.recordLag(brokerId, nowMs, leaderSize - size, size);
+          }
+          throttleUse.add(leader, brokerId, followerThrottled(proposal, brokerId), progress.copyRate(brokerId, writeRateBytesPerSec));
+        }
+        // Kafka counts what in-sync followers fetch against the throttle too.
+        for (int brokerId : inSyncFollowers(proposal, cluster)) {
+          throttleUse.add(leader, brokerId, followerThrottled(proposal, brokerId), writeRateBytesPerSec);
+        }
+      }
+
+      // Escalate the movements with a replica that made no progress through a throttle that is in use at its need.
+      boolean escalated = false;
+      for (Map.Entry<TopicPartition, ExecutionTask> entry : taskByPartition.entrySet()) {
+        TopicPartition tp = entry.getKey();
+        int leader = movementLeader(entry.getValue().proposal(), cluster);
+        MovementProgress progress = _movementProgressByPartition.get(tp);
+        long leaderThrottle = throttleHelper.leaderThrottleRate(leader);
+        boolean leaderLimitsAtNeed = throttleLimitsAtNeed(throttleUse.use(leader, true), leaderThrottle,
+                                              neededLeaderThrottleByBroker.getOrDefault(leader, 0L));
+        Set<Integer> replicasToRemove = new HashSet<>();
+        entry.getValue().proposal().replicasToRemove().forEach(r -> replicasToRemove.add(r.brokerId()));
+        for (int brokerId : outOfSyncReplicasByPartition.get(tp)) {
+          // A replica to remove uses its share of the throttle, but need not catch up: it is deleted once the reassignment completes.
+          if (replicasToRemove.contains(brokerId) || !progress.stalled(brokerId)) {
+            continue;
+          }
+          long followerThrottle = throttleHelper.followerThrottleRate(brokerId);
+          boolean followerLimitsAtNeed = followerThrottled(entry.getValue().proposal(), brokerId)
+                                         && throttleLimitsAtNeed(throttleUse.use(brokerId, false), followerThrottle,
+                                                                 neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L));
+          long lag = progress.lag(brokerId);
+          if (leaderLimitsAtNeed || followerLimitsAtNeed) {
+            long neededPerReplica = Math.max(neededReplicationThrottle(writeRateKBpsByPartition.getOrDefault(tp, 0.0)),
+                                             progress.escalatedNeed());
+            long escalatedNeed = progress.escalate(neededPerReplica);
+            LOG.info("The movement of {} made no progress over the last {} adjuster runs (lag of its replica on broker {}: {} bytes) "
+                     + "through the {} throttle of broker {}, which is in use at its need; its needed throttle is raised from {} to {} "
+                     + "bytes/sec per out-of-sync replica.", tp, REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS, brokerId, lag,
+                     leaderLimitsAtNeed ? "leader" : "follower", leaderLimitsAtNeed ? leader : brokerId, neededPerReplica, escalatedNeed);
+            escalated = true;
+            break;
+          }
+          if (progress.reportStall()) {
+            LOG.info("The movement of {} made no progress over the last {} adjuster runs (lag of its replica on broker {}: {} bytes), "
+                     + "but the throttles it fetches through are not in use at their need (leader throttle of broker {}: {} of {} "
+                     + "bytes/sec in use, follower throttle of broker {}: {} of {} bytes/sec in use): something other than the "
+                     + "replication throttle holds it back.", tp, REPLICATION_THROTTLE_PROGRESS_WINDOW_RUNS, brokerId, lag, leader,
+                     (long) throttleUse.use(leader, true), leaderThrottle, brokerId, (long) throttleUse.use(brokerId, false),
+                     followerThrottle);
+          }
+        }
+      }
+      return escalated;
+    }
+
+    /**
+     * @param brokerIds Ids of brokers.
+     * @return The size (bytes) of the current (i.e. non-future) replicas on each of the given brokers that could be described.
+     */
+    private Map<Integer, Map<TopicPartition, Long>> replicaSizes(Set<Integer> brokerIds) {
+      Map<Integer, Map<TopicPartition, Long>> replicaSizeByBroker = new HashMap<>();
+      Map<Integer, KafkaFuture<Map<String, LogDirDescription>>> descriptionsByBroker =
+          _adminClient.describeLogDirs(brokerIds).descriptions();
+      for (Map.Entry<Integer, KafkaFuture<Map<String, LogDirDescription>>> entry : descriptionsByBroker.entrySet()) {
+        Map<String, LogDirDescription> logDirs;
+        try {
+          logDirs = entry.getValue().get(ReplicationThrottleHelper.CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+          LOG.debug("Failed to describe the log dirs of broker {} to check the progress of replica movements.", entry.getKey(), e);
+          continue;
+        }
+        Map<TopicPartition, Long> sizeByPartition = new HashMap<>();
+        logDirs.values().forEach(logDir -> logDir.replicaInfos().forEach((tp, replicaInfo) -> {
+          if (!replicaInfo.isFuture()) {
+            sizeByPartition.merge(tp, replicaInfo.size(), Long::sum);
+          }
+        }));
+        replicaSizeByBroker.put(entry.getKey(), sizeByPartition);
+      }
+      return replicaSizeByBroker;
+    }
+
+    /**
+     * Warn once per execution about each broker and direction whose in-progress movements need more than the maximum replication
+     * throttle: their throttle cannot reach their needed throttle, so they may not complete.
+     *
+     * @param neededThrottleByBroker The throttle (bytes/sec) needed by each broker in one direction.
+     * @param direction The direction ("leader" or "follower").
+     */
+    private void warnIfNeededAboveMax(Map<Integer, Long> neededThrottleByBroker, String direction) {
+      neededThrottleByBroker.forEach((brokerId, needed) -> {
+        if (needed > maxReplicationThrottle() && _needAboveMaxWarnings.add(brokerId + "-" + direction)) {
+          LOG.warn("The in-progress replica movements of broker {} need a {} replication throttle of {} bytes/sec, above {} ({} "
+                   + "bytes/sec): they may not complete.", brokerId, direction, needed,
+                   ExecutorConfig.CONCURRENCY_ADJUSTER_MAX_REPLICATION_THROTTLE_CONFIG, maxReplicationThrottle());
+        }
+      });
+    }
+
+    /**
+     * Adjust the leader and follower replication throttles of the brokers that are throttled by the ongoing inter-broker replica
+     * movements. For each such broker:
+     * <ul>
+     *   <li>Decrease its throttles multiplicatively if (1) its replica of an (At/Under)MinISR partition without offline replicas is
+     *   out of sync -- see {@link #brokersBehindForThrottle(Set)}, checked at each run -- or (2) its metrics violate any concurrency
+     *   adjuster limit at two consecutive metric-based checks -- the log flush time only while it rises, see
+     *   {@link ExecutionUtils#withinReplicationThrottleAdjusterLimit(int, ValuesAndExtrapolations, Map, Map)}.</li>
+     *   <li>Leave its throttles unchanged if its metrics or capacity are unavailable -- i.e. neither the current metric window nor
+     *   the last valid metrics within one broker metric window have valid values -- unless they are below the needed throttle.</li>
+     *   <li>Otherwise, decrease its follower (leader) throttle at once to its inbound (outbound) network headroom if it is above it,
+     *   at each run. At metric-based checks, while replicas are being moved to (from) the broker, also raise it towards the headroom
+     *   if the replicas catching up through it fill it -- doubling it until its first decrease or concurrency adjuster limit violation
+     *   (slow start), by the additive increase after that -- and lower it to their traffic if it was far above it at consecutive
+     *   checks -- see {@link ExecutionUtils#recommendedReplicationThrottle(long, long, boolean, double, double, boolean, double,
+     *   boolean, boolean)}.</li>
+     * </ul>
+     * In all cases, a throttle is never decreased below, and is raised to, the throttle needed by the in-progress movements of the
+     * broker in that direction, which is escalated for movements that make no progress at it -- see
+     * {@link #trackMovementProgress}. The new throttles of all brokers are applied in a single batch, unless replication throttle
+     * adjustment is disabled meanwhile.
+     *
+     * @param canRunMetricsBasedCheck {@code true} if metric-based adjustment can be performed, {@code false} otherwise.
+     */
+    private synchronized void refreshReplicationThrottle(boolean canRunMetricsBasedCheck)
+        throws InterruptedException, ExecutionException, TimeoutException {
+      ReplicationThrottleHelper throttleHelper = _replicationThrottleHelper;
+      if (!canRefreshReplicationThrottle(throttleHelper)) {
+        return;
+      }
+      Set<Integer> throttledBrokers = throttleHelper.throttledBrokers();
+      if (throttledBrokers.isEmpty()) {
+        return;
+      }
+
+      Set<Integer> brokersBehind = new HashSet<>();
+      brokersBehindForThrottle(brokersBehind);
+      ClusterModel clusterCapacity = clusterCapacity(throttledBrokers);
+      Map<Integer, ValuesAndExtrapolations> metricsByBrokerId = brokerMetricsForReplicationThrottle();
+      Map<TopicPartition, Double> writeRateKBpsByPartition = partitionWriteRatesKBps(_loadMonitor.currentPartitionMetricValues(),
+                                                                                     _lastKnownWriteRateKBpsByPartition);
+      Cluster cluster = _metadataClient.cluster();
+      Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
+      Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
+      Set<ExecutionTask> tasks = inExecutionTasks();
+      neededReplicationThrottles(tasks, writeRateKBpsByPartition, cluster, escalatedNeeds(), neededLeaderThrottleByBroker,
+                                 neededFollowerThrottleByBroker);
+      ReplicationThrottleUse throttleUse = new ReplicationThrottleUse();
+      if (trackMovementProgress(tasks, cluster, writeRateKBpsByPartition, throttleHelper, neededLeaderThrottleByBroker,
+                                neededFollowerThrottleByBroker, throttleUse)) {
+        neededLeaderThrottleByBroker.clear();
+        neededFollowerThrottleByBroker.clear();
+        neededReplicationThrottles(tasks, writeRateKBpsByPartition, cluster, escalatedNeeds(), neededLeaderThrottleByBroker,
+                                   neededFollowerThrottleByBroker);
+      }
+      warnIfNeededAboveMax(neededLeaderThrottleByBroker, "leader");
+      warnIfNeededAboveMax(neededFollowerThrottleByBroker, "follower");
+      Map<Integer, Double> inSyncFollowerInKBpsByBroker = new HashMap<>();
+      Map<Integer, Double> inSyncLeaderOutKBpsByBroker = new HashMap<>();
+      inSyncReplicationTrafficKBps(cluster, writeRateKBpsByPartition, inSyncFollowerInKBpsByBroker, inSyncLeaderOutKBpsByBroker);
+      Map<String, StringBuilder> overLimitDetailsByMetricName = new HashMap<>();
+      if (canRunMetricsBasedCheck) {
+        for (String metricName : CONCURRENCY_ADJUSTER_LIMIT_BY_METRIC_NAME.keySet()) {
+          overLimitDetailsByMetricName.put(metricName, new StringBuilder());
+        }
+      }
+
+      Map<Integer, Long> newLeaderThrottleByBroker = new TreeMap<>();
+      Map<Integer, Long> newFollowerThrottleByBroker = new TreeMap<>();
+      Map<Integer, String> changeByBroker = new TreeMap<>();
+      for (int brokerId : throttledBrokers) {
+        long leaderThrottle = throttleHelper.leaderThrottleRate(brokerId);
+        long followerThrottle = throttleHelper.followerThrottleRate(brokerId);
+        long newLeaderThrottle;
+        long newFollowerThrottle;
+        String reason;
+        ValuesAndExtrapolations metrics = metricsByBrokerId.get(brokerId);
+        long neededLeaderThrottle = neededLeaderThrottleByBroker.getOrDefault(brokerId, 0L);
+        long neededFollowerThrottle = neededFollowerThrottleByBroker.getOrDefault(brokerId, 0L);
+        boolean overLimit = false;
+        if (canRunMetricsBasedCheck && metrics != null) {
+          overLimit = !withinReplicationThrottleAdjusterLimit(
+              brokerId, metrics, _lastRiseTriggeredLimitValuesByBroker.computeIfAbsent(brokerId, b -> new HashMap<>()),
+              overLimitDetailsByMetricName);
+          if (overLimit) {
+            _consecutiveOverLimitChecksByBroker.merge(brokerId, 1, Integer::sum);
+          } else {
+            _consecutiveOverLimitChecksByBroker.remove(brokerId);
+          }
+        }
+        Broker broker = clusterCapacity == null ? null : clusterCapacity.broker(brokerId);
+        Double leaderBytesIn = metrics == null ? null : latestBrokerMetricValue(metrics, KafkaMetricDef.LEADER_BYTES_IN);
+        Double leaderBytesOut = metrics == null ? null : latestBrokerMetricValue(metrics, KafkaMetricDef.LEADER_BYTES_OUT);
+        if (metrics == null || broker == null || leaderBytesIn == null || leaderBytesOut == null) {
+          // Without metrics or capacity, only enforce the throttle needed by the in-progress movements.
+          newLeaderThrottle = withNeededThrottleFloor(leaderThrottle, leaderThrottle, neededLeaderThrottle);
+          newFollowerThrottle = withNeededThrottleFloor(followerThrottle, followerThrottle, neededFollowerThrottle);
+          reason = String.format("the throttle needed by in-progress movements (no %s)",
+                                 metrics == null ? "metrics" : "capacity or network metrics");
+        } else if (overLimit && _consecutiveOverLimitChecksByBroker.getOrDefault(brokerId, 0) >= 2) {
+          // Over a concurrency adjuster limit at two consecutive metric-based checks, i.e. not a single latency spike.
+          newLeaderThrottle = decreasedReplicationThrottle(leaderThrottle, neededLeaderThrottle);
+          newFollowerThrottle = decreasedReplicationThrottle(followerThrottle, neededFollowerThrottle);
+          reason = "broker metrics over the concurrency adjuster limit at consecutive checks";
+        } else {
+          // The broker-level replication metrics are not used: they are always 0 -- see ExecutionUtils#inSyncReplicationTrafficKBps.
+          double nonThrottledInKBps = leaderBytesIn + inSyncFollowerInKBpsByBroker.getOrDefault(brokerId, 0.0);
+          double nonThrottledOutKBps = leaderBytesOut + inSyncLeaderOutKBpsByBroker.getOrDefault(brokerId, 0.0);
+          // A first check over a concurrency adjuster limit allows no increase, but does not decrease yet.
+          boolean canIncrease = canRunMetricsBasedCheck && !overLimit;
+          double leaderUse = throttleUse.use(brokerId, true);
+          double followerUse = throttleUse.use(brokerId, false);
+          boolean hasLeaderMovements = neededLeaderThrottleByBroker.containsKey(brokerId);
+          boolean hasFollowerMovements = neededFollowerThrottleByBroker.containsKey(brokerId);
+          if (canIncrease) {
+            countFarAboveUse(_leaderFarAboveUseChecksByBroker, brokerId, hasLeaderMovements && throttleUse.complete(brokerId, true)
+                                                                         && throttleFarAboveUse(leaderUse, leaderThrottle));
+            countFarAboveUse(_followerFarAboveUseChecksByBroker, brokerId, hasFollowerMovements && throttleUse.complete(brokerId, false)
+                                                                           && throttleFarAboveUse(followerUse, followerThrottle));
+          }
+          newLeaderThrottle = recommendedReplicationThrottle(
+              leaderThrottle, neededLeaderThrottle, hasLeaderMovements, broker.capacityFor(Resource.NW_OUT), nonThrottledOutKBps,
+              canIncrease, leaderUse, !_leaderSlowStartEndedBrokers.contains(brokerId),
+              _leaderFarAboveUseChecksByBroker.getOrDefault(brokerId, 0) >= REPLICATION_THROTTLE_LOW_USE_CHECKS_TO_LOWER);
+          newFollowerThrottle = recommendedReplicationThrottle(
+              followerThrottle, neededFollowerThrottle, hasFollowerMovements, broker.capacityFor(Resource.NW_IN), nonThrottledInKBps,
+              canIncrease, followerUse, !_followerSlowStartEndedBrokers.contains(brokerId),
+              _followerFarAboveUseChecksByBroker.getOrDefault(brokerId, 0) >= REPLICATION_THROTTLE_LOW_USE_CHECKS_TO_LOWER);
+          LOG.debug("Replication throttle adjustment for broker {} ({}): capacity in/out {}/{} KB/sec, non-throttled traffic in/out "
+                    + "{}/{} KB/sec, needed leader/follower throttle {}/{} bytes/sec, movements from/to the broker {}/{}, replication "
+                    + "traffic through the leader/follower throttle {}/{} bytes/sec, leader throttle {} -> {}, follower throttle {} -> "
+                    + "{} bytes/sec.", brokerId, canRunMetricsBasedCheck ? "metric-based check" : "decrease only",
+                    broker.capacityFor(Resource.NW_IN), broker.capacityFor(Resource.NW_OUT), nonThrottledInKBps, nonThrottledOutKBps,
+                    neededLeaderThrottle, neededFollowerThrottle, hasLeaderMovements, hasFollowerMovements, (long) leaderUse,
+                    (long) followerUse, leaderThrottle, newLeaderThrottle, followerThrottle, newFollowerThrottle);
+          reason = String.format("network headroom%s, the replication traffic through the throttle (leader: %d, follower: %d "
+                                 + "bytes/sec) and the throttle needed by in-progress movements (leader: %d, follower: %d bytes/sec)",
+                                 overLimit ? " (first check over a concurrency adjuster limit)" : "", (long) leaderUse,
+                                 (long) followerUse, neededLeaderThrottle, neededFollowerThrottle);
+        }
+        // The MinISR brake slows down the broker that is behind, in both directions, never below what its movements need -- see
+        // ExecutionUtils#brokersBehindOnMinIsrPartitions. The other brokers hosting its partitions are not slowed down for it.
+        if (brokersBehind.contains(brokerId)) {
+          newLeaderThrottle = decreasedReplicationThrottle(leaderThrottle, neededLeaderThrottle);
+          newFollowerThrottle = decreasedReplicationThrottle(followerThrottle, neededFollowerThrottle);
+          reason = "its replicas of (At/Under)MinISR partitions being out of sync";
+        }
+        // Slow start ends at the first sign of stress: a decrease, or a check over a concurrency adjuster limit.
+        if (overLimit || newLeaderThrottle < leaderThrottle) {
+          _leaderSlowStartEndedBrokers.add(brokerId);
+        }
+        if (overLimit || newFollowerThrottle < followerThrottle) {
+          _followerSlowStartEndedBrokers.add(brokerId);
+        }
+
+        if (newLeaderThrottle != leaderThrottle || newFollowerThrottle != followerThrottle) {
+          newLeaderThrottleByBroker.put(brokerId, newLeaderThrottle);
+          newFollowerThrottleByBroker.put(brokerId, newFollowerThrottle);
+          changeByBroker.put(brokerId, String.format("based on %s (leader: %d -> %d, follower: %d -> %d bytes/sec)", reason,
+                                                     leaderThrottle, newLeaderThrottle, followerThrottle, newFollowerThrottle));
+        } else {
+          // E.g. a decrease of a throttle that is already at (or below) the minimum throttle.
+          LOG.debug("Concurrency adjuster left the replication throttle of broker {} unchanged based on {} (leader: {}, follower: {} "
+                    + "bytes/sec).", brokerId, reason, leaderThrottle, followerThrottle);
+        }
+      }
+
+      if (!changeByBroker.isEmpty()) {
+        // Check the switch only once the throttle helper is available -- e.g. not while the execution sets or clears throttles -- and
+        // apply the updates under the update lock, so a disable request waits only for updates that are being applied.
+        synchronized (throttleHelper) {
+          synchronized (_replicationThrottleUpdateLock) {
+            if (!_replicationThrottleAdjusterEnabled) {
+              // Disabled while adjusting (e.g. via the admin endpoint): leave the throttles at their last values.
+              LOG.info("Replication throttle adjustment was disabled; the replication throttles are left unchanged.");
+              return;
+            }
+            if (_replicationThrottleHelper != throttleHelper) {
+              // The inter-broker replica movements ended meanwhile, and the end-of-execution sweep may have removed their throttles
+              // already: setting them again here would leave throttles behind that nothing records.
+              LOG.info("The inter-broker replica movements ended while adjusting; the replication throttles are left unchanged.");
+              return;
+            }
+            throttleHelper.updateThrottleRates(newLeaderThrottleByBroker, newFollowerThrottleByBroker);
+          }
+        }
+        changeByBroker.forEach((brokerId, change) ->
+            LOG.info("Concurrency adjuster changed the replication throttle of broker {} {}.", brokerId, change));
+      }
+
+      for (Map.Entry<String, StringBuilder> entry : overLimitDetailsByMetricName.entrySet()) {
+        if (entry.getValue().length() > 0) {
+          LOG.info("{} was over the acceptable limit for brokers with values: {}.", entry.getKey(), entry.getValue());
+        }
+      }
+    }
+
     @Override
     public void run() {
       try {
         if (_started) {
           boolean canRunMetricsBasedCheck = (_numChecks++ % _numMinIsrCheck) == 0;
           refreshConcurrency(canRunMetricsBasedCheck, ConcurrencyType.INTER_BROKER_REPLICA);
+          refreshReplicationThrottle(canRunMetricsBasedCheck);
           // Both broker and cluster leadership movement concurrency can be refreshed with call below.
           refreshConcurrency(canRunMetricsBasedCheck, ConcurrencyType.LEADERSHIP_BROKER);
         }
@@ -747,7 +1883,21 @@ public class Executor {
    * @return The current executor state.
    */
   public ExecutorState state() {
-    return _executorState;
+    // Attach the throttles in force rather than threading them through every ExecutorState factory: read from the live
+    // helpers (without their locks), so a rate changed by an admin request or by the concurrency adjuster is visible immediately
+    // instead of at the next progress check.
+    ReplicationThrottleHelper throttleHelper = _ongoingExecutionThrottleHelper;
+    LogDirThrottleHelper logDirThrottleHelper = _ongoingExecutionLogDirThrottleHelper;
+    ExecutorState executorState = _executorState.withThrottles(throttleHelper == null ? null : throttleHelper.throttleRate(),
+                                                               logDirThrottleHelper == null ? null
+                                                                                            : logDirThrottleHelper.appliedThrottleByBroker());
+    executorState = executorState.withReplicationThrottleByBroker(throttleHelper == null ? null : throttleHelper.throttleRateByBroker());
+    InterruptedExecutionRecovery recovery = _interruptedExecutionRecovery;
+    executorState = recovery == null ? executorState : executorState.withRecovery(recovery.getJsonStructure());
+    QueuedExecution queuedExecution = _queuedExecution;
+    // A queued execution that a stop request cancelled does not start, so it is not reported.
+    return queuedExecution == null || queuedExecution.isCancelled() ? executorState
+                                                                   : executorState.withQueuedExecution(queuedExecution.type());
   }
 
   /**
@@ -782,6 +1932,53 @@ public class Executor {
   }
 
   /**
+   * Enable or disable replication throttle adjustment by the concurrency adjuster. Disabling it waits for a throttle update that is
+   * already in progress (if any) to complete, so no throttle is changed by the concurrency adjuster once this method returns: during
+   * an execution, the replication throttles stay at their last values until the execution ends -- unless the operator set a
+   * replication throttle during the execution (see {@link #updateOngoingExecutionReplicationThrottle(long)}), which is then applied
+   * again on every throttled broker and holds for the rest of the execution (decision D2). The switch stays as set until it is
+   * set again (a restart reverts it to the config).
+   *
+   * @param isReplicationThrottleAdjusterEnabled {@code true} to enable replication throttle adjustment, {@code false} otherwise.
+   * @return {@code true} if replication throttle adjustment was enabled before, {@code false} otherwise.
+   */
+  public boolean setReplicationThrottleAdjusterEnabled(boolean isReplicationThrottleAdjusterEnabled) {
+    boolean oldValue = _replicationThrottleAdjusterEnabled;
+    _replicationThrottleAdjusterEnabled = isReplicationThrottleAdjusterEnabled;
+    if (_hasOngoingExecution) {
+      // A resumed execution switches the adjustment off again (D2); once the adjuster has managed the throttle, the per-broker rates
+      // no longer match a single value (see (Integration PR#15 -> PR#13)).
+      persistExecutionParameterChange(state -> state.toBuilder()
+                                                    .replicationThrottleAdjuster(isReplicationThrottleAdjusterEnabled
+                                                                                 ? PersistedExecutionState.ReplicationThrottleAdjuster.ON
+                                                                                 : state.replicationThrottleAdjuster().wasOn()
+                                                                                   ? PersistedExecutionState.ReplicationThrottleAdjuster.TURNED_OFF
+                                                                                   : PersistedExecutionState.ReplicationThrottleAdjuster.OFF)
+                                                    .build());
+    }
+    if (!isReplicationThrottleAdjusterEnabled) {
+      // The concurrency adjuster checks this flag under the update lock before applying updates, so once the lock is available, no
+      // update is in progress and none will be applied.
+      synchronized (_replicationThrottleUpdateLock) {
+        LOG.debug("No replication throttle update is in progress.");
+      }
+      Long operatorReplicationThrottle = _operatorReplicationThrottle;
+      if (operatorReplicationThrottle != null && updateOngoingExecutionReplicationThrottle(operatorReplicationThrottle)) {
+        LOG.info("Replication throttle adjustment is disabled: the replication throttle {} bytes/sec set during the ongoing execution "
+                 + "is applied again, and holds for the rest of the execution.", operatorReplicationThrottle);
+      }
+    }
+    return oldValue;
+  }
+
+  /**
+   * @return {@code true} if replication throttle adjustment by the concurrency adjuster is enabled, {@code false} otherwise.
+   */
+  public boolean isReplicationThrottleAdjusterEnabled() {
+    return _replicationThrottleAdjusterEnabled;
+  }
+
+  /**
    * Initialize proposal execution and start execution.
    *
    * @param proposals Proposals to be executed.
@@ -803,6 +2000,8 @@ public class Executor {
    * @param replicaMovementStrategy The strategy used to determine the execution order of generated replica movement tasks.
    * @param replicationThrottle The replication throttle (bytes/second) to apply to both leaders and followers
    *                            when executing a proposal (if null, no throttling is applied).
+   * @param logDirThrottle The throttle (bytes/second) to apply to intra-broker replica movements -- i.e. moving replicas
+   *                       between the logdirs of a broker (if null, no throttling is applied).
    * @param isTriggeredByUserRequest Whether the execution is triggered by a user request.
    * @param uuid UUID of the execution.
    * @param isKafkaAssignerMode {@code true} if kafka assigner mode, {@code false} otherwise.
@@ -821,26 +2020,112 @@ public class Executor {
                                             Long requestedExecutionProgressCheckIntervalMs,
                                             ReplicaMovementStrategy replicaMovementStrategy,
                                             Long replicationThrottle,
+                                            Long logDirThrottle,
                                             boolean isTriggeredByUserRequest,
                                             String uuid,
                                             boolean isKafkaAssignerMode,
                                             boolean skipInterBrokerReplicaConcurrencyAdjustment) throws OngoingExecutionException {
+    executeProposals(proposals, unthrottledBrokers, removedBrokers, loadMonitor, requestedInterBrokerPartitionMovementConcurrency,
+                     requestedMaxClusterPartitionMovements, requestedIntraBrokerPartitionMovementConcurrency,
+                     requestedClusterLeadershipMovementConcurrency, requestedBrokerLeadershipMovementConcurrency,
+                     requestedExecutionProgressCheckIntervalMs, replicaMovementStrategy, replicationThrottle, logDirThrottle,
+                     isTriggeredByUserRequest, uuid, isKafkaAssignerMode, skipInterBrokerReplicaConcurrencyAdjustment, false);
+  }
+
+  /**
+   * Initialize proposal execution and start execution.
+   * Same as {@link #executeProposals(Collection, Set, Set, LoadMonitor, Integer, Integer, Integer, Integer, Integer, Long,
+   * ReplicaMovementStrategy, Long, Long, boolean, String, boolean, boolean)}, but additionally allows executing intra-broker
+   * replica movements one broker at a time.
+   *
+   * @param proposals Proposals to be executed.
+   * @param unthrottledBrokers Brokers that are not throttled in terms of the number of in/out replica movements.
+   * @param removedBrokers Removed brokers, null if no brokers has been removed.
+   * @param loadMonitor Load monitor.
+   * @param requestedInterBrokerPartitionMovementConcurrency The maximum number of concurrent inter-broker partition movements
+   *                                                         per broker(if null, use num.concurrent.partition.movements.per.broker).
+   * @param requestedMaxClusterPartitionMovements The upper bound of concurrent inter broker partition movements in cluster
+   *                                              (if null, use max.num.cluster.partition.movements).
+   * @param requestedIntraBrokerPartitionMovementConcurrency The maximum number of concurrent intra-broker partition movements
+   *                                                         (if null, use num.concurrent.intra.broker.partition.movements).
+   * @param requestedClusterLeadershipMovementConcurrency The maximum number of concurrent leader movements in a cluster
+   *                                               (if null, use num.concurrent.leader.movements).
+   * @param requestedBrokerLeadershipMovementConcurrency The maximum number of concurrent leader movements involved in a broker
+   *                                               (if null, use num.concurrent.leader.movements.per.broker).
+   * @param requestedExecutionProgressCheckIntervalMs The interval between checking and updating the progress of an initiated
+   *                                                  execution (if null, use execution.progress.check.interval.ms).
+   * @param replicaMovementStrategy The strategy used to determine the execution order of generated replica movement tasks.
+   * @param replicationThrottle The replication throttle (bytes/second) to apply to both leaders and followers
+   *                            when executing a proposal (if null, no throttling is applied).
+   * @param logDirThrottle The throttle (bytes/second) to apply to intra-broker replica movements -- i.e. moving replicas
+   *                       between the logdirs of a broker (if null, no throttling is applied).
+   * @param isTriggeredByUserRequest Whether the execution is triggered by a user request.
+   * @param uuid UUID of the execution.
+   * @param isKafkaAssignerMode {@code true} if kafka assigner mode, {@code false} otherwise.
+   * @param skipInterBrokerReplicaConcurrencyAdjustment {@code true} to skip auto adjusting concurrency of inter-broker
+   * replica movements even if the concurrency adjuster is enabled, {@code false} otherwise.
+   * @param intraBrokerMovementsBrokerByBroker {@code true} to execute intra-broker replica movements one broker at a time,
+   * {@code false} to execute them on all brokers in parallel.
+   */
+  public synchronized void executeProposals(Collection<ExecutionProposal> proposals,
+                                            Set<Integer> unthrottledBrokers,
+                                            Set<Integer> removedBrokers,
+                                            LoadMonitor loadMonitor,
+                                            Integer requestedInterBrokerPartitionMovementConcurrency,
+                                            Integer requestedMaxClusterPartitionMovements,
+                                            Integer requestedIntraBrokerPartitionMovementConcurrency,
+                                            Integer requestedClusterLeadershipMovementConcurrency,
+                                            Integer requestedBrokerLeadershipMovementConcurrency,
+                                            Long requestedExecutionProgressCheckIntervalMs,
+                                            ReplicaMovementStrategy replicaMovementStrategy,
+                                            Long replicationThrottle,
+                                            Long logDirThrottle,
+                                            boolean isTriggeredByUserRequest,
+                                            String uuid,
+                                            boolean isKafkaAssignerMode,
+                                            boolean skipInterBrokerReplicaConcurrencyAdjustment,
+                                            boolean intraBrokerMovementsBrokerByBroker) throws OngoingExecutionException {
     setExecutionMode(isKafkaAssignerMode);
     sanityCheckExecuteProposals(loadMonitor, uuid);
+    if (isQueuedExecutionCancelled(uuid)) {
+      throw new IllegalStateException(String.format("The queued %s was stopped before it started.", _queuedExecution.type()));
+    }
     _skipInterBrokerReplicaConcurrencyAdjustment = skipInterBrokerReplicaConcurrencyAdjustment;
+    _executionTaskManager.setIntraBrokerMovementsBrokerByBroker(intraBrokerMovementsBrokerByBroker);
+    _executionStateToPersist = executionStateToPersist(PersistedExecutionState.Operation.EXECUTE_PROPOSALS, isTriggeredByUserRequest)
+        .removedBrokers(removedBrokers)
+        .brokersToSkipConcurrencyCheck(unthrottledBrokers)
+        .interBrokerPartitionMovementConcurrency(requestedInterBrokerPartitionMovementConcurrency)
+        .maxInterBrokerPartitionMovements(requestedMaxClusterPartitionMovements)
+        .intraBrokerPartitionMovementConcurrency(requestedIntraBrokerPartitionMovementConcurrency)
+        .clusterLeadershipMovementConcurrency(requestedClusterLeadershipMovementConcurrency)
+        .brokerLeadershipMovementConcurrency(requestedBrokerLeadershipMovementConcurrency)
+        .executionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs)
+        .replicaMovementStrategy(replicaMovementStrategy == null ? null : replicaMovementStrategy.name())
+        .replicationThrottle(replicationThrottle)
+        .logDirThrottle(logDirThrottle)
+        .intraBrokerMovementsBrokerByBroker(intraBrokerMovementsBrokerByBroker)
+        // A queued execution not handed off yet starts after this one -- also after a resumed execution, which queues it again.
+        .queuedExecution(_queuedExecution != null && !_queuedExecution.isHandedOff() ? _queuedExecution.type() : null)
+        .queuedExecutionParameters(_queuedExecution != null && !_queuedExecution.isHandedOff() ? _queuedExecution.parameters() : null)
+        .kafkaAssignerMode(isKafkaAssignerMode)
+        .skipInterBrokerReplicaConcurrencyAdjustment(skipInterBrokerReplicaConcurrencyAdjustment)
+        .build();
     try {
+      sanityCheckNoOfflineLogDirs(proposals);
       initProposalExecution(proposals, unthrottledBrokers, requestedInterBrokerPartitionMovementConcurrency, requestedMaxClusterPartitionMovements,
                             requestedIntraBrokerPartitionMovementConcurrency, requestedClusterLeadershipMovementConcurrency,
                             requestedBrokerLeadershipMovementConcurrency, requestedExecutionProgressCheckIntervalMs, replicaMovementStrategy,
                             isTriggeredByUserRequest, loadMonitor);
-      startExecution(loadMonitor, null, removedBrokers, replicationThrottle, isTriggeredByUserRequest);
+      startExecution(loadMonitor, null, removedBrokers, replicationThrottle, logDirThrottle, isTriggeredByUserRequest);
     } catch (Exception e) {
       if (e instanceof OngoingExecutionException) {
         LOG.info("User task {}: Broker removal operation aborted due to ongoing execution", uuid);
       } else {
         LOG.error("User task {}: Broker removal operation failed due to exception", uuid, e);
       }
-      processExecuteProposalsFailure();
+      // E.g. a queued disk rebalance refused by the offline logdir check: the reason goes to the notification of its end.
+      processExecuteProposalsFailure(String.format("the execution failed to start: %s", e.getMessage()));
       throw e;
     }
   }
@@ -862,6 +2147,63 @@ public class Executor {
     }
   }
 
+  /**
+   * Refuse to execute replica movements between the disks of a broker that has an offline logdir. Kafka refuses every
+   * such movement (KafkaStorageException), so these tasks would only end up dead. Only the brokers that the proposals
+   * move replicas between disks on are checked, and their logdirs are read from Kafka, not from the cluster model.
+   *
+   * @param proposals Proposals to be executed.
+   */
+  private void sanityCheckNoOfflineLogDirs(Collection<ExecutionProposal> proposals) {
+    Set<Integer> brokersWithIntraBrokerMovements = proposals.stream()
+                                                            .flatMap(p -> p.replicasToMoveBetweenDisksByBroker().keySet().stream())
+                                                            .collect(Collectors.toSet());
+    if (brokersWithIntraBrokerMovements.isEmpty()) {
+      return;
+    }
+    Map<Integer, Set<String>> offlineLogDirs;
+    try {
+      offlineLogDirs = offlineLogDirsByBroker(brokersWithIntraBrokerMovements, _adminClient, _config);
+    } catch (TimeoutException | InterruptedException | ExecutionException e) {
+      // This may indicate transient (e.g. network) issues.
+      throw new IllegalStateException(String.format("Failed to retrieve the logdirs of brokers %s, which have replica movements"
+                                                    + " between their disks.", brokersWithIntraBrokerMovements), e);
+    }
+    if (!offlineLogDirs.isEmpty()) {
+      throw new IllegalStateException(String.format(
+          "Cannot move replicas between the disks of brokers %s: they have offline logdirs %s. Kafka refuses every replica"
+          + " movement between the disks of a broker with an offline logdir. Replace the failed disk, or remove it from the"
+          + " broker's log.dirs and restart the broker, then retry. To rebalance the disks of the other brokers now, leave"
+          + " these brokers out via destination_broker_ids.", offlineLogDirs.keySet(), offlineLogDirs));
+    }
+  }
+
+  /**
+   * @param operation The operation that starts the execution.
+   * @param isTriggeredByUserRequest Whether the execution is triggered by a user request.
+   * @return A builder of the execution state to persist for the execution that is about to start -- i.e. a new execution,
+   * or the continuation of the interrupted execution that is being resumed.
+   */
+  private PersistedExecutionState.Builder executionStateToPersist(PersistedExecutionState.Operation operation,
+                                                                  boolean isTriggeredByUserRequest) {
+    if (_recoveryPlanToResume != null) {
+      PersistedExecutionState interruptedExecutionState = _recoveryPlanToResume.state();
+      return interruptedExecutionState.toBuilder()
+                                      .resumeCount(interruptedExecutionState.resumeCount() + 1)
+                                      .queuedExecution(null)
+                                      .executorState(null)
+                                      .proposals(Collections.emptyList())
+                                      .tasks(Collections.emptyList());
+    }
+    return new PersistedExecutionState.Builder(_uuid, operation)
+        .reason(_reasonSupplier.get())
+        .triggeredByUserRequest(isTriggeredByUserRequest)
+        .startTimeMs(System.currentTimeMillis())
+        // Recorded either way: a resumed execution switches the adjustment off again unless it was on (see bug 2).
+        .replicationThrottleAdjuster(_replicationThrottleAdjusterEnabled ? PersistedExecutionState.ReplicationThrottleAdjuster.ON
+                                                                         : PersistedExecutionState.ReplicationThrottleAdjuster.OFF);
+  }
+
   private synchronized void initProposalExecution(Collection<ExecutionProposal> proposals,
                                                   Collection<Integer> brokersToSkipConcurrencyCheck,
                                                   Integer requestedInterBrokerPartitionMovementConcurrency,
@@ -877,16 +2219,123 @@ public class Executor {
                                                                recentlyRemovedBrokers(), isTriggeredByUserRequest);
     _executionTaskManager.setExecutionModeForTaskTracker(_isKafkaAssignerMode);
     // Get a snapshot of (1) cluster and (2) minIsr with time by topic name.
-    StrategyOptions strategyOptions = new StrategyOptions.Builder(_metadataClient.cluster())
+    Cluster cluster = _metadataClient.cluster();
+    _latestClusterOfExecution = cluster;
+    StrategyOptions strategyOptions = new StrategyOptions.Builder(cluster)
         .minIsrWithTimeByTopic(_topicMinIsrCache.minIsrWithTimeByTopic()).build();
+    if (_recoveryPlanToResume != null) {
+      // The tasks of the interrupted execution keep their execution ids; new ones get ids after all of them.
+      keepExecutionIdsOfInterruptedExecution(_recoveryPlanToResume);
+    }
     _executionTaskManager.addExecutionProposals(proposals, brokersToSkipConcurrencyCheck, strategyOptions, replicaMovementStrategy);
+    if (_recoveryPlanToResume != null) {
+      // Tasks that were submitted to Kafka before the restart and are still being executed are only monitored until completion, from
+      // the time they started.
+      Map<String, Long> startTimeByTask = new HashMap<>();
+      _recoveryPlanToResume.actionByTask().forEach((task, action) -> {
+        if (action == ExecutionRecoveryUtils.RecoveryAction.ADOPT) {
+          startTimeByTask.put(ExecutionTaskPlanner.taskKey(task.type(), task.topicPartition(), task.brokerId()), task.startTimeMs());
+        }
+      });
+      List<ExecutionTask> adoptedTasks = _executionTaskManager.adoptInProgressTasks(_recoveryPlanToResume.adoptedInterBrokerPartitions(),
+                                                                                    _recoveryPlanToResume.adoptedIntraBrokerReplicas(),
+                                                                                    startTimeByTask);
+      LOG.info("User task {}: Adopted {} in-progress task(s) of the interrupted execution: {}", _uuid, adoptedTasks.size(), adoptedTasks);
+      // The progress of the resumed execution counts the tasks the interrupted execution had finished.
+      List<ExecutionTask> finishedTasks = finishedTasksOfInterruptedExecution(_recoveryPlanToResume);
+      _executionTaskManager.restoreFinishedTasks(finishedTasks);
+      LOG.info("User task {}: Restored {} task(s) that the interrupted execution had finished.", _uuid, finishedTasks.size());
+    }
     _concurrencyAdjuster.initAdjustment(loadMonitor,
                                         requestedInterBrokerPartitionMovementConcurrency,
                                         requestedIntraBrokerPartitionMovementConcurrency,
                                         requestedClusterLeadershipMovementConcurrency,
                                         requestedBrokerLeadershipMovementConcurrency);
+    if (_recoveryPlanToResume != null) {
+      restoreAdjusterState(_recoveryPlanToResume.state().adjusterState());
+    }
     setRequestedMaxInterBrokerPartitionMovements(requestedMaxInterBrokerPartitionMovements);
     setRequestedExecutionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs);
+  }
+
+  /**
+   * Make the tasks of a resumed execution keep the execution ids they had before the restart -- see {@link PersistedTask#executionId()}.
+   *
+   * @param recoveryPlan The recovery plan of the interrupted execution.
+   */
+  private void keepExecutionIdsOfInterruptedExecution(ExecutionRecoveryUtils.RecoveryPlan recoveryPlan) {
+    Map<String, Long> executionIdByTask = new HashMap<>();
+    long maxExecutionId = -1L;
+    for (Map.Entry<PersistedTask, ExecutionRecoveryUtils.RecoveryAction> entry : recoveryPlan.actionByTask().entrySet()) {
+      PersistedTask task = entry.getKey();
+      maxExecutionId = Math.max(maxExecutionId, task.executionId());
+      if (task.executionId() != PersistedTask.UNKNOWN_EXECUTION_ID
+          && (entry.getValue() == ExecutionRecoveryUtils.RecoveryAction.PENDING || entry.getValue() == ExecutionRecoveryUtils.RecoveryAction.ADOPT)) {
+        executionIdByTask.put(ExecutionTaskPlanner.taskKey(task.type(), task.topicPartition(), task.brokerId()), task.executionId());
+      }
+    }
+    _executionTaskManager.keepExecutionIds(executionIdByTask, maxExecutionId + 1);
+  }
+
+  /**
+   * @param recoveryPlan The recovery plan of the interrupted execution.
+   * @return The tasks that the interrupted execution finished (i.e. completed, or ended with an error) before the restart -- or that
+   * Kafka completed during the restart -- in their final state, with their persisted execution ids and times.
+   */
+  private List<ExecutionTask> finishedTasksOfInterruptedExecution(ExecutionRecoveryUtils.RecoveryPlan recoveryPlan) {
+    List<ExecutionTask> finishedTasks = new ArrayList<>();
+    long now = _time.milliseconds();
+    PersistedExecutionState state = recoveryPlan.state();
+    recoveryPlan.actionByTask().forEach((task, action) -> {
+      if (action != ExecutionRecoveryUtils.RecoveryAction.COMPLETED && action != ExecutionRecoveryUtils.RecoveryAction.FINISHED_WITH_ERROR) {
+        return;
+      }
+      ExecutionProposal proposal = state.proposals().get(task.topicPartition());
+      long executionId = task.executionId() != PersistedTask.UNKNOWN_EXECUTION_ID ? task.executionId()
+                                                                                    : _executionTaskManager.newExecutionId();
+      ExecutionTask finishedTask = task.type() == INTRA_BROKER_REPLICA_ACTION
+                                   ? new ExecutionTask(executionId, proposal, task.brokerId(), task.type(), _taskExecutionAlertingThresholdMs)
+                                   : new ExecutionTask(executionId, proposal, task.type(), _taskExecutionAlertingThresholdMs);
+      long endTimeMs = task.endTimeMs() > 0 ? task.endTimeMs() : now;
+      finishedTask.inProgress(task.startTimeMs() > 0 ? task.startTimeMs() : endTimeMs);
+      if (action == ExecutionRecoveryUtils.RecoveryAction.COMPLETED) {
+        finishedTask.completed(endTimeMs);
+      } else if (task.state() == ExecutionTaskState.DEAD) {
+        finishedTask.kill(endTimeMs);
+      } else {
+        finishedTask.abort();
+        finishedTask.aborted(endTimeMs);
+      }
+      finishedTasks.add(finishedTask);
+    });
+    return finishedTasks;
+  }
+
+  /**
+   * Continue the concurrency adjustment of a resumed execution from where it was before the restart: the inter-broker partition movement
+   * concurrency of each broker, and which brokers are past slow start. The replication throttles of the brokers are restored once the
+   * inter-broker replica movements start (see {@link ProposalExecutionRunnable}).
+   *
+   * @param adjusterState The state of the concurrency adjuster as of the last checkpoint before the restart, or {@code null} if none.
+   */
+  private void restoreAdjusterState(PersistedAdjusterState adjusterState) {
+    if (adjusterState == null) {
+      return;
+    }
+    ExecutionConcurrencyManager concurrencyManager = _executionTaskManager.getExecutionConcurrencyManager();
+    Set<Integer> brokers = concurrencyManager.getExecutionConcurrencyPerBroker(ConcurrencyType.INTER_BROKER_REPLICA).keySet();
+    Map<Integer, Integer> restoredConcurrency = new TreeMap<>();
+    adjusterState.interBrokerConcurrencyByBroker().forEach((brokerId, concurrency) -> {
+      if (brokers.contains(brokerId)) {
+        concurrencyManager.setExecutionConcurrencyForBroker(brokerId, concurrency, ConcurrencyType.INTER_BROKER_REPLICA);
+        restoredConcurrency.put(brokerId, concurrency);
+      }
+    });
+    _concurrencyAdjuster.restoreSlowStartEndedBrokers(adjusterState.leaderSlowStartEndedBrokers(),
+                                                      adjusterState.followerSlowStartEndedBrokers());
+    LOG.info("User task {}: Resumed execution continues the concurrency adjustment from before the restart: inter-broker partition movement "
+             + "concurrency {}, leader / follower throttles past slow start on brokers {} / {}.", _uuid, restoredConcurrency,
+             adjusterState.leaderSlowStartEndedBrokers(), adjusterState.followerSlowStartEndedBrokers());
   }
 
   /**
@@ -922,11 +2371,24 @@ public class Executor {
     setExecutionMode(false);
     sanityCheckExecuteProposals(loadMonitor, uuid);
     _skipInterBrokerReplicaConcurrencyAdjustment = true;
+    _executionStateToPersist = executionStateToPersist(PersistedExecutionState.Operation.DEMOTE_BROKERS, isTriggeredByUserRequest)
+        .demotedBrokers(demotedBrokers)
+        .brokersToSkipConcurrencyCheck(demotedBrokers)
+        .interBrokerPartitionMovementConcurrency(concurrentSwaps)
+        .intraBrokerPartitionMovementConcurrency(0)
+        .clusterLeadershipMovementConcurrency(requestedClusterLeadershipMovementConcurrency)
+        .brokerLeadershipMovementConcurrency(requestedBrokerLeadershipMovementConcurrency)
+        .executionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs)
+        .replicaMovementStrategy(replicaMovementStrategy == null ? null : replicaMovementStrategy.name())
+        .replicationThrottle(replicationThrottle)
+        .kafkaAssignerMode(false)
+        .skipInterBrokerReplicaConcurrencyAdjustment(true)
+        .build();
     try {
       initProposalExecution(proposals, demotedBrokers, concurrentSwaps, null, 0,
                             requestedClusterLeadershipMovementConcurrency, requestedBrokerLeadershipMovementConcurrency,
                             requestedExecutionProgressCheckIntervalMs, replicaMovementStrategy, isTriggeredByUserRequest, loadMonitor);
-      startExecution(loadMonitor, demotedBrokers, null, replicationThrottle, isTriggeredByUserRequest);
+      startExecution(loadMonitor, demotedBrokers, null, replicationThrottle, null, isTriggeredByUserRequest);
     } catch (Exception e) {
       processExecuteProposalsFailure();
       throw e;
@@ -941,6 +2403,20 @@ public class Executor {
    */
   public synchronized void setExecutionConcurrencyForAllBrokersOrCluster(Integer concurrency, ConcurrencyType concurrencyType) {
     _executionTaskManager.getExecutionConcurrencyManager().setExecutionConcurrencyForAllBrokersOrCluster(concurrency, concurrencyType);
+    if (_hasOngoingExecution) {
+      // An execution resumed after a restart uses the concurrency in force, not the one it was started with.
+      persistExecutionParameterChange(state -> {
+        PersistedExecutionState.Builder builder = state.toBuilder();
+        switch (concurrencyType) {
+          case INTER_BROKER_REPLICA -> builder.interBrokerPartitionMovementConcurrency(concurrency);
+          case INTRA_BROKER_REPLICA -> builder.intraBrokerPartitionMovementConcurrency(concurrency);
+          case LEADERSHIP_CLUSTER -> builder.clusterLeadershipMovementConcurrency(concurrency);
+          case LEADERSHIP_BROKER -> builder.brokerLeadershipMovementConcurrency(concurrency);
+          default -> throw new IllegalArgumentException("Unsupported concurrency type " + concurrencyType + " is provided.");
+        }
+        return builder.build();
+      });
+    }
   }
 
   /**
@@ -963,6 +2439,143 @@ public class Executor {
   public void setRequestedMaxInterBrokerPartitionMovements(Integer requestedMaxInterBrokerPartitionMovements) {
     _executionTaskManager.getExecutionConcurrencyManager().
         setClusterInterBrokerPartitionMovementConcurrency(requestedMaxInterBrokerPartitionMovements);
+    if (_hasOngoingExecution) {
+      persistExecutionParameterChange(state -> state.toBuilder().maxInterBrokerPartitionMovements(requestedMaxInterBrokerPartitionMovements)
+                                                    .build());
+    }
+  }
+
+  /**
+   * Dynamically update the replication throttle of the ongoing execution. The new throttle rate is applied to
+   * (1) the brokers participating in the in-progress inter-broker replica movements right away and (2) the brokers
+   * participating in the upcoming inter-broker replica movements of the ongoing execution as their tasks start.
+   *
+   * @param newThrottleRate The new replication throttle rate in bytes per second.
+   * @return {@code true} if the replication throttle of the ongoing execution has been updated, {@code false} if
+   * there is no ongoing execution with remaining inter-broker replica movements to throttle.
+   */
+  public boolean updateOngoingExecutionReplicationThrottle(long newThrottleRate) {
+    if (newThrottleRate < 0) {
+      throw new IllegalArgumentException(String.format("Requested replication throttle must be non-negative (Requested: %d).",
+                                                       newThrottleRate));
+    }
+    ReplicationThrottleHelper throttleHelper = _ongoingExecutionThrottleHelper;
+    if (!_hasOngoingExecution || throttleHelper == null) {
+      LOG.info("Skip updating replication throttle to {} bytes/sec since there is no ongoing inter-broker replica movement.",
+               newThrottleRate);
+      return false;
+    }
+    // Make upcoming inter-broker replica movement tasks of the ongoing execution pick up the new throttle rate, and apply it
+    // to the brokers participating in the in-progress inter-broker replica movements.
+    try {
+      throttleHelper.updateThrottleRate(newThrottleRate, () -> inExecutionTasks().stream()
+          .filter(task -> task.state() == ExecutionTaskState.IN_PROGRESS && task.type() == INTER_BROKER_REPLICA_ACTION)
+          .map(ExecutionTask::proposal)
+          .collect(Collectors.toList()));
+    } catch (ExecutionException | InterruptedException | TimeoutException e) {
+      throw new IllegalStateException(String.format("Failed to apply the updated replication throttle [%d bytes/sec] to the "
+                                                    + "in-progress inter-broker replica movements. Upcoming inter-broker replica "
+                                                    + "movements use the new rate, while the brokers of the in-progress ones may "
+                                                    + "still carry the previous rate.", newThrottleRate), e);
+    }
+    LOG.info("Replication throttle of the ongoing execution is updated to {} bytes/sec.", newThrottleRate);
+    _operatorReplicationThrottle = newThrottleRate;
+    persistExecutionParameterChange(state -> state.toBuilder().replicationThrottle(newThrottleRate).build());
+    return true;
+  }
+
+  /**
+   * Remove the replication throttle of the ongoing execution: the brokers of the in-progress inter-broker replica movements
+   * stop being throttled right away, and the upcoming inter-broker replica movements of this execution are not throttled.
+   *
+   * @return {@link DynamicThrottleResult#REMOVED} if the throttle has been removed, {@link DynamicThrottleResult#NOT_THROTTLED}
+   * if the ongoing inter-broker replica movements are not throttled, {@link DynamicThrottleResult#NO_ONGOING_MOVEMENT} if there
+   * is no ongoing inter-broker replica movement.
+   */
+  public DynamicThrottleResult removeOngoingExecutionReplicationThrottle() {
+    ReplicationThrottleHelper throttleHelper = _ongoingExecutionThrottleHelper;
+    if (!_hasOngoingExecution || throttleHelper == null) {
+      LOG.info("Skip removing the replication throttle since there is no ongoing inter-broker replica movement.");
+      return DynamicThrottleResult.NO_ONGOING_MOVEMENT;
+    }
+    if (_replicationThrottleAdjusterEnabled) {
+      // The adjuster sets a throttle on every throttled broker, and its updates fail once the execution is not throttled.
+      LOG.info("Skip removing the replication throttle since replication throttle adjustment is enabled.");
+      return DynamicThrottleResult.ADJUSTER_ENABLED;
+    }
+    boolean removed;
+    try {
+      removed = throttleHelper.removeThrottleRate(() -> inExecutionTasks().stream()
+          .filter(task -> task.state() == ExecutionTaskState.IN_PROGRESS && task.type() == INTER_BROKER_REPLICA_ACTION)
+          .map(ExecutionTask::proposal)
+          .collect(Collectors.toList()));
+    } catch (InterruptedException | IllegalStateException e) {
+      // The removal goes through the record of applied throttles: what could not be removed stays recorded, and the sweeper
+      // removes it later.
+      throw new IllegalStateException("Failed to remove the replication throttle of the in-progress inter-broker replica"
+                                      + " movements. The upcoming inter-broker replica movements are not throttled.", e);
+    }
+    _operatorReplicationThrottle = null;
+    if (removed) {
+      LOG.info("Replication throttle of the ongoing execution is removed.");
+      persistExecutionParameterChange(state -> state.toBuilder().replicationThrottle(null).build());
+      return DynamicThrottleResult.REMOVED;
+    }
+    return DynamicThrottleResult.NOT_THROTTLED;
+  }
+
+  /**
+   * Remove the log dir throttle of the ongoing execution: the original per-broker value of the log dir throttle config is
+   * restored on every broker this execution has throttled, and the upcoming intra-broker replica movements of this execution
+   * are not throttled.
+   *
+   * @return {@link DynamicThrottleResult#REMOVED} if the throttle has been removed, {@link DynamicThrottleResult#NOT_THROTTLED}
+   * if the ongoing intra-broker replica movements are not throttled, {@link DynamicThrottleResult#NO_ONGOING_MOVEMENT} if there
+   * is no ongoing intra-broker replica movement.
+   */
+  public DynamicThrottleResult removeOngoingExecutionLogDirThrottle() {
+    LogDirThrottleHelper logDirThrottleHelper = _ongoingExecutionLogDirThrottleHelper;
+    if (!_hasOngoingExecution || logDirThrottleHelper == null) {
+      LOG.info("Skip removing the log dir throttle since there is no ongoing intra-broker replica movement.");
+      return DynamicThrottleResult.NO_ONGOING_MOVEMENT;
+    }
+    if (logDirThrottleHelper.removeThrottleRate()) {
+      LOG.info("Log dir throttle of the ongoing execution is removed.");
+      persistExecutionParameterChange(state -> state.toBuilder().logDirThrottle(null).build());
+      return DynamicThrottleResult.REMOVED;
+    }
+    return DynamicThrottleResult.NOT_THROTTLED;
+  }
+
+  /**
+   * Dynamically update the log dir throttle of the ongoing execution. The new throttle rate is applied to (1) the brokers
+   * participating in the in-progress intra-broker replica movements right away and (2) the brokers participating in the
+   * upcoming intra-broker replica movements of the ongoing execution as their tasks start.
+   *
+   * @param newThrottleRate The new log dir throttle rate in bytes per second.
+   * @return {@code true} if the log dir throttle of the ongoing execution has been updated, {@code false} if there is no
+   * ongoing execution with remaining intra-broker replica movements to throttle.
+   */
+  public boolean updateOngoingExecutionLogDirThrottle(long newThrottleRate) {
+    if (newThrottleRate < 1) {
+      throw new IllegalArgumentException(String.format("Requested log dir throttle must be positive (Requested: %d).",
+                                                       newThrottleRate));
+    }
+    LogDirThrottleHelper logDirThrottleHelper = _ongoingExecutionLogDirThrottleHelper;
+    if (!_hasOngoingExecution || logDirThrottleHelper == null) {
+      LOG.info("Skip updating log dir throttle to {} bytes/sec since there is no ongoing intra-broker replica movement.",
+               newThrottleRate);
+      return false;
+    }
+    List<ExecutionTask> inProgressTasks = inExecutionTasks().stream()
+        .filter(task -> task.state() == ExecutionTaskState.IN_PROGRESS && task.type() == INTRA_BROKER_REPLICA_ACTION)
+        .collect(Collectors.toList());
+    boolean updated = logDirThrottleHelper.updateThrottleRate(newThrottleRate, inProgressTasks);
+    if (updated) {
+      LOG.info("Log dir throttle of the ongoing execution is updated to {} bytes/sec.", newThrottleRate);
+      persistExecutionParameterChange(state -> state.toBuilder().logDirThrottle(newThrottleRate).build());
+    }
+    return updated;
   }
 
   /**
@@ -1007,15 +2620,24 @@ public class Executor {
    * @param removedBrokers Brokers to be removed, null if no broker has been removed.
    * @param replicationThrottle The replication throttle (bytes/second) to apply to both leaders and followers
    *                            while moving partitions (if null, no throttling is applied).
+   * @param logDirThrottle The throttle (bytes/second) to apply to intra-broker replica movements -- i.e. moving replicas
+   *                       between the logdirs of a broker (if null, no throttling is applied).
    * @param isTriggeredByUserRequest Whether the execution is triggered by a user request.
    */
   private void startExecution(LoadMonitor loadMonitor,
                               Collection<Integer> demotedBrokers,
                               Collection<Integer> removedBrokers,
                               Long replicationThrottle,
+                              Long logDirThrottle,
                               boolean isTriggeredByUserRequest) throws OngoingExecutionException {
     _executionStoppedByUser.set(false);
-    sanityCheckOngoingMovement();
+    if (_recoveryPlanToResume != null) {
+      // Ongoing movements of the interrupted execution are adopted by the resumed execution.
+      sanityCheckOngoingMovement(_recoveryPlanToResume.adoptedInterBrokerPartitions(),
+                                 !_recoveryPlanToResume.adoptedIntraBrokerReplicas().isEmpty());
+    } else {
+      sanityCheckOngoingMovement(Collections.emptySet(), false);
+    }
 
     try {
       _flipOngoingExecutionMutex.acquire();
@@ -1047,19 +2669,298 @@ public class Executor {
     } else {
       _numExecutionStartedInNonKafkaAssignerMode.incrementAndGet();
     }
-    _proposalExecutor.execute(
-        new ProposalExecutionRunnable(loadMonitor, demotedBrokers, removedBrokers, replicationThrottle, isTriggeredByUserRequest));
+    ProposalExecutionRunnable proposalExecutionRunnable = new ProposalExecutionRunnable(loadMonitor, demotedBrokers, removedBrokers,
+                                                                                        replicationThrottle, logDirThrottle,
+                                                                                        isTriggeredByUserRequest,
+                                                                                        _recoveryPlanToResume != null,
+                                                                                        _recoveryPlanToResume == null ? null
+                                                                                        : _recoveryPlanToResume.state().adjusterState());
+    if (_recoveryPlanToResume == null) {
+      // A new execution -- the recovery of an earlier interrupted execution is no longer reported.
+      _interruptedExecutionRecovery = null;
+    }
+    fingerprintLogDirsOfExecution(true);
+    _numCompletedTasksAtStart = (int) _executionTaskManager.allTasks().stream().filter(t -> t.state() == ExecutionTaskState.COMPLETED)
+                                                          .count();
+    // Persist the initial state of the execution before starting it.
+    synchronized (_executionStateStoreLock) {
+      _lastPersistedTaskStateVersion = -1L;
+      _lastPersistedExecutorState = null;
+      _lastCheckpointTimeMs = -1L;
+      _lastPersistedAdjusterState = null;
+      _executionStatePersisted = false;
+      _executionStatePersistenceFailureReported = false;
+    }
+    checkpointExecutionState();
+    _proposalExecutor.execute(proposalExecutionRunnable);
+  }
+
+  private void checkpointExecutionState() {
+    checkpointExecutionState(false);
+  }
+
+  /**
+   * Persist the state of the ongoing execution if it has changed since it was last persisted -- i.e. a task was added or
+   * changed its state, or the executor state has changed -- or if it was last persisted {@link #_executionStateCheckpointIntervalMs}
+   * ago: the time of the last checkpoint is when the execution was last known to be running, and its fingerprints are what the rest
+   * of the cluster looked like then (see {@link #reasonToNotResume}), so a long execution is checkpointed also while its tasks take
+   * long. Failure to persist the state does not affect the execution.
+   *
+   * <p>The state is not persisted after a shutdown is requested, unless {@code lastCheckpoint}: a shutdown that stops the ongoing
+   * execution (i.e. marks the in-progress tasks as dead and rolls back their reassignments) keeps the state as it was before the
+   * shutdown, so that it can be recovered upon restart; a shutdown that leaves the in-flight movements of the execution to Kafka
+   * persists the state one last time, as it leaves them (see {@link #shutdown()}).</p>
+   *
+   * <p>A resumed execution that has completed a task since it resumed has made progress: its resume count starts over, so that
+   * {@link ExecutorConfig#RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG} bounds the restarts in a row without progress.</p>
+   *
+   * @param lastCheckpoint {@code true} to persist the state even if nothing has changed or a shutdown is requested.
+   */
+  private void checkpointExecutionState(boolean lastCheckpoint) {
+    if (_executionStateToPersist == null || (_shutdownRequested && !lastCheckpoint)) {
+      return;
+    }
+    synchronized (_executionStateStoreLock) {
+      PersistedExecutionState executionStateToPersist = _executionStateToPersist;
+      if (executionStateToPersist == null) {
+        return;
+      }
+      long now = System.currentTimeMillis();
+      long taskStateVersion = _executionTaskManager.taskStateVersion();
+      ExecutorState.State executorState = _executorState.state();
+      if (!lastCheckpoint && !isCheckpointDue(now) && taskStateVersion == _lastPersistedTaskStateVersion
+          && executorState == _lastPersistedExecutorState) {
+        return;
+      }
+      List<ExecutionTask> tasks = _executionTaskManager.allTasks();
+      Map<TopicPartition, ExecutionProposal> proposals = new LinkedHashMap<>();
+      List<PersistedTask> persistedTasks = new ArrayList<>(tasks.size());
+      int numCompletedTasks = 0;
+      for (ExecutionTask task : tasks) {
+        proposals.putIfAbsent(task.proposal().topicPartition(), task.proposal());
+        persistedTasks.add(PersistedTask.of(task));
+        if (task.state() == ExecutionTaskState.COMPLETED) {
+          numCompletedTasks++;
+        }
+      }
+      if (executionStateToPersist.resumeCount() > 0 && numCompletedTasks > _numCompletedTasksAtStart) {
+        LOG.info("User task {}: The resumed execution has completed a task, so its resume count ({}) starts over.",
+                 executionStateToPersist.uuid(), executionStateToPersist.resumeCount());
+        executionStateToPersist = executionStateToPersist.toBuilder().resumeCount(0).build();
+        _executionStateToPersist = executionStateToPersist;
+      }
+      PersistedExecutionState.Builder stateBuilder = executionStateToPersist.toBuilder()
+                                                                            .executorState(executorState)
+                                                                            .lastUpdateTimeMs(now)
+                                                                            .adjusterState(adjusterStateToPersist(executionStateToPersist))
+                                                                            .proposals(proposals.values())
+                                                                            .tasks(persistedTasks);
+      Cluster cluster = _latestClusterOfExecution;
+      if (cluster != null) {
+        stateBuilder.outsideExecutionFingerprint(ReplicaPlacementFingerprint.of(cluster, proposals.keySet()));
+      }
+      PersistedExecutionState state = stateBuilder.build();
+      try {
+        _executionStateStore.save(state);
+        _lastPersistedAdjusterState = state.adjusterState();
+        _lastPersistedTaskStateVersion = taskStateVersion;
+        _lastPersistedExecutorState = executorState;
+        _lastCheckpointTimeMs = now;
+        _executionStatePersisted = true;
+        // The original log dir throttles that the execution has borrowed (PR #26) are known only in memory: a crash would leave the
+        // execution's rate on the brokers for good, and the next execution would take it for the original.
+        persistRetainedThrottles();
+      } catch (IOException | RuntimeException e) {
+        _executionStatePersisted = false;
+        LOG.warn("User task {}: Failed to persist the execution state.", state.uuid(), e);
+        if (!_executionStatePersistenceFailureReported) {
+          _executionStatePersistenceFailureReported = true;
+          _executorNotifier.sendAlert(String.format("Task [%s] failed to persist the execution state, so the execution may not be "
+                                                    + "recoverable if Cruise Control restarts: %s", state.uuid(), e.getMessage()));
+        }
+      }
+    }
+  }
+
+  /**
+   * Must be called while holding {@link #_executionStateStoreLock}.
+   *
+   * @param nowMs The current time.
+   * @return {@code true} if the ongoing execution was last checkpointed {@link #_executionStateCheckpointIntervalMs} ago (or never).
+   */
+  private boolean isCheckpointDue(long nowMs) {
+    return _lastCheckpointTimeMs < 0 || nowMs - _lastCheckpointTimeMs >= _executionStateCheckpointIntervalMs;
+  }
+
+  /**
+   * Called by the execution thread at every progress check: if the periodic checkpoint is due, refresh the fingerprint of the logdirs
+   * outside the execution first (it asks the brokers, so it is not refreshed at every checkpoint), then checkpoint.
+   */
+  private void checkpointExecutionStateAtProgressCheck() {
+    boolean due;
+    synchronized (_executionStateStoreLock) {
+      due = _executionStateToPersist != null && isCheckpointDue(System.currentTimeMillis());
+    }
+    if (due) {
+      fingerprintLogDirsOfExecution(false);
+    }
+    checkpointExecutionState();
+  }
+
+  /**
+   * @param state The state of the ongoing execution to persist.
+   * @return What the concurrency adjuster has changed during the ongoing execution -- the replication throttles it set on each broker
+   * (PR #13), the brokers past slow start, and the inter-broker partition movement concurrency of the brokers whose concurrency is not
+   * the execution's -- so that a resumed execution continues from there; or {@code null} if nothing has changed.
+   */
+  private PersistedAdjusterState adjusterStateToPersist(PersistedExecutionState state) {
+    Map<Integer, Long> leaderThrottleByBroker = Collections.emptyMap();
+    Map<Integer, Long> followerThrottleByBroker = Collections.emptyMap();
+    ReplicationThrottleHelper throttleHelper = _replicationThrottleHelper;
+    PersistedAdjusterState persisted = state.adjusterState();
+    if (throttleHelper != null) {
+      if (state.replicationThrottleAdjusted() && throttleHelper.throttlingEnabled()) {
+        // The rates set per broker, and the rate in force on every throttled broker -- also those at the default rate of the helper
+        // (e.g. a broker whose network headroom was unknown when the execution started).
+        leaderThrottleByBroker = new TreeMap<>(throttleHelper.leaderThrottleRateByBroker());
+        followerThrottleByBroker = new TreeMap<>(throttleHelper.followerThrottleRateByBroker());
+        for (Map.Entry<Integer, ExecutorState.BrokerReplicationThrottle> entry : throttleHelper.throttleRateByBroker().entrySet()) {
+          leaderThrottleByBroker.put(entry.getKey(), entry.getValue().leader());
+          followerThrottleByBroker.put(entry.getKey(), entry.getValue().follower());
+        }
+      }
+    } else {
+      // Not moving replicas between brokers: keep the throttles as of the last checkpoint -- e.g. of a shutdown that detaches the
+      // execution -- or, for a resumed execution that has not restored them yet, the persisted ones.
+      PersistedAdjusterState last = _lastPersistedAdjusterState != null ? _lastPersistedAdjusterState : persisted;
+      if (last != null) {
+        leaderThrottleByBroker = last.leaderThrottleByBroker();
+        followerThrottleByBroker = last.followerThrottleByBroker();
+      }
+    }
+    Set<Integer> leaderSlowStartEndedBrokers = new TreeSet<>();
+    Set<Integer> followerSlowStartEndedBrokers = new TreeSet<>();
+    _concurrencyAdjuster.slowStartEndedBrokers(leaderSlowStartEndedBrokers, followerSlowStartEndedBrokers);
+    int concurrency = state.interBrokerPartitionMovementConcurrency() != null
+                      ? state.interBrokerPartitionMovementConcurrency()
+                      : _config.getInt(ExecutorConfig.NUM_CONCURRENT_PARTITION_MOVEMENTS_PER_BROKER_CONFIG);
+    Map<Integer, Integer> concurrencyByBroker = new TreeMap<>();
+    ExecutionConcurrencyManager concurrencyManager = _executionTaskManager.getExecutionConcurrencyManager();
+    synchronized (concurrencyManager) {
+      concurrencyManager.getExecutionConcurrencyPerBroker(ConcurrencyType.INTER_BROKER_REPLICA).forEach((brokerId, brokerConcurrency) -> {
+        if (brokerConcurrency != concurrency) {
+          concurrencyByBroker.put(brokerId, brokerConcurrency);
+        }
+      });
+    }
+    PersistedAdjusterState adjusterState = new PersistedAdjusterState(leaderThrottleByBroker, followerThrottleByBroker,
+                                                                      leaderSlowStartEndedBrokers, followerSlowStartEndedBrokers,
+                                                                      concurrencyByBroker);
+    return adjusterState.isEmpty() ? null : adjusterState;
+  }
+
+  /**
+   * Persist a change of the parameters of the ongoing execution right away -- e.g. a replication throttle changed by an admin
+   * request (PR #17) -- so that an execution resumed after a restart uses it rather than the value the execution started with.
+   *
+   * @param change Applies the change to the persisted state of the ongoing execution.
+   */
+  private void persistExecutionParameterChange(Function<PersistedExecutionState, PersistedExecutionState> change) {
+    synchronized (_executionStateStoreLock) {
+      PersistedExecutionState executionStateToPersist = _executionStateToPersist;
+      if (executionStateToPersist == null) {
+        return;
+      }
+      _executionStateToPersist = change.apply(executionStateToPersist);
+      // Persist even if no task has changed since the last checkpoint.
+      _lastPersistedTaskStateVersion = -1L;
+    }
+    checkpointExecutionState();
+  }
+
+  /**
+   * If the ongoing execution moves replicas between logdirs, record the logdirs of the other replicas of its brokers, so that upon
+   * recovery, Cruise Control can tell whether replicas were moved between those logdirs while it was not running. Recorded when the
+   * execution starts, and refreshed with the periodic checkpoints (see {@link #checkpointExecutionState(boolean)}). Failing to retrieve
+   * the logdirs when the execution starts only prevents resuming the execution after a restart; failing to refresh them keeps the
+   * fingerprint from before.
+   *
+   * @param atStart {@code true} if the execution is about to start.
+   */
+  private void fingerprintLogDirsOfExecution(boolean atStart) {
+    if (_executionStateToPersist == null) {
+      return;
+    }
+    Set<Integer> brokers = new TreeSet<>();
+    Set<TopicPartition> partitionsOfExecution = new HashSet<>();
+    for (ExecutionTask task : _executionTaskManager.allTasks()) {
+      partitionsOfExecution.add(task.proposal().topicPartition());
+      if (task.type() == INTRA_BROKER_REPLICA_ACTION) {
+        brokers.add(task.brokerId());
+      }
+    }
+    if (brokers.isEmpty() && !atStart) {
+      return;
+    }
+    Map<Integer, Long> logDirFingerprintByBroker = null;
+    if (!brokers.isEmpty()) {
+      try {
+        logDirFingerprintByBroker = ExecutionRecoveryUtils.logDirFingerprintByBroker(describeLogDirs(brokers), brokers, partitionsOfExecution);
+      } catch (InterruptedException | ExecutionException | TimeoutException e) {
+        if (!atStart) {
+          LOG.warn("User task {}: Failed to refresh the logdirs of brokers {} -- keeping their fingerprint from before.", _uuid, brokers, e);
+          return;
+        }
+        LOG.warn("User task {}: Failed to retrieve the logdirs of brokers {} -- the execution cannot be resumed after a restart.", _uuid,
+                 brokers, e);
+      }
+    }
+    synchronized (_executionStateStoreLock) {
+      PersistedExecutionState executionStateToPersist = _executionStateToPersist;
+      if (executionStateToPersist != null) {
+        _executionStateToPersist = executionStateToPersist.toBuilder().logDirFingerprintByBroker(logDirFingerprintByBroker).build();
+      }
+    }
+  }
+
+  /**
+   * Delete the persisted execution state if it belongs to the execution with the given UUID.
+   *
+   * @param uuid UUID of the execution whose persisted state is to be deleted.
+   */
+  private void deletePersistedExecutionState(String uuid) {
+    synchronized (_executionStateStoreLock) {
+      try {
+        Optional<PersistedExecutionState> persistedState = _executionStateStore.load();
+        if (persistedState.isPresent() && !persistedState.get().uuid().equals(uuid)) {
+          LOG.warn("Skip deleting the persisted state of execution {}, which is not the state of execution {}.",
+                   persistedState.get().uuid(), uuid);
+          return;
+        }
+        _executionStateStore.delete();
+      } catch (IOException | RuntimeException e) {
+        LOG.warn("Failed to delete the persisted state of execution {}.", uuid, e);
+        _executorNotifier.sendAlert(String.format("Task [%s] failed to delete its persisted execution state, so the next restart of "
+                                                  + "Cruise Control will recover it as an interrupted execution: %s", uuid, e.getMessage()));
+      }
+    }
   }
 
   /**
    * Sanity check whether there are ongoing inter-broker or intra-broker replica movements.
    * This check ensures lack of ongoing movements started by external agents -- i.e. not started by this Executor.
+   *
+   * @param toleratedPartitionReassignments Partitions whose ongoing reassignment is tolerated -- i.e. reassignments that were
+   *                                        started by this Executor before a restart.
+   * @param tolerateIntraBrokerReplicaMovement {@code true} to tolerate ongoing intra-broker replica movements.
    */
-  private void sanityCheckOngoingMovement() throws OngoingExecutionException {
+  private void sanityCheckOngoingMovement(Set<TopicPartition> toleratedPartitionReassignments,
+                                          boolean tolerateIntraBrokerReplicaMovement) throws OngoingExecutionException {
     boolean hasOngoingPartitionReassignments;
     Map<TopicPartition, PartitionReassignment> ongoingPartitionReassignments;
     try {
-       ongoingPartitionReassignments = ExecutionUtils.ongoingPartitionReassignments(_adminClient);
+       ongoingPartitionReassignments = new HashMap<>(ExecutionUtils.ongoingPartitionReassignments(_adminClient));
+       ongoingPartitionReassignments.keySet().removeAll(toleratedPartitionReassignments);
        hasOngoingPartitionReassignments = !ongoingPartitionReassignments.isEmpty();
     } catch (TimeoutException | InterruptedException | ExecutionException e) {
       // This may indicate transient (e.g. network) issues.
@@ -1068,7 +2969,7 @@ public class Executor {
     // Note that in case there is an ongoing partition reassignment, we do not unpause metric sampling.
     if (hasOngoingPartitionReassignments) {
       throw new OngoingExecutionException("There are ongoing inter-broker partition movements: " + ongoingPartitionReassignments);
-    } else {
+    } else if (!tolerateIntraBrokerReplicaMovement) {
       boolean hasOngoingIntraBrokerReplicaMovement;
       try {
         hasOngoingIntraBrokerReplicaMovement = hasOngoingIntraBrokerReplicaMovement(_adminClient, _config);
@@ -1083,10 +2984,170 @@ public class Executor {
   }
 
   private void processExecuteProposalsFailure() {
+    processExecuteProposalsFailure("the execution failed to start");
+  }
+
+  /**
+   * @param reason Why the execution failed to start, reported if it was a queued execution.
+   */
+  private void processExecuteProposalsFailure(String reason) {
+    _executionStateToPersist = null;
     _executionTaskManager.clear();
+    endQueuedExecution(true, reason);
     _uuid = null;
     _reasonSupplier = null;
     _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());
+  }
+
+  /**
+   * Queue an execution to start after the execution about to start for the given user task completes -- e.g. a disk rebalance
+   * after a rebalance. The executor must be generating proposals for execution for the given UUID.
+   * <ul>
+   *   <li>If that execution completes (i.e. it is not stopped and does not fail), the executor stays reserved for the same UUID, as
+   *   when generating proposals for execution, so no other execution (e.g. a self-healing one) can start in between, and runs
+   *   {@code start} on a separate thread. {@code start} must then either execute proposals with the same UUID, or call
+   *   {@link #finishQueuedExecution(String, boolean, String)}.</li>
+   *   <li>If that execution is stopped or fails, or a stop is requested before the queued execution starts, the queued execution is
+   *   dropped.</li>
+   * </ul>
+   * The user task stays in execution from the first execution until the queued one finishes.
+   *
+   * @param uuid UUID of the user task whose execution is about to start.
+   * @param type The type of the queued execution, as reported in the executor state (e.g. REBALANCE_DISK).
+   * @param start Generates the proposals of the queued execution and executes them.
+   */
+  public synchronized void queueExecution(String uuid, String type, Runnable start) {
+    queueExecution(uuid, type, start, null);
+  }
+
+  /**
+   * Queue an execution as {@link #queueExecution(String, String, Runnable)} does, with the parameters to rebuild it from (see
+   * {@link #setQueuedExecutionFactory(QueuedExecutionFactory)}) if Cruise Control restarts before it starts: they are persisted with the
+   * state of the execution before it, and a restart that resumes that execution queues this one again.
+   *
+   * @param uuid UUID of the user task whose execution is about to start.
+   * @param type The type of the queued execution, as reported in the executor state (e.g. REBALANCE_DISK).
+   * @param start Generates the proposals of the queued execution and executes them.
+   * @param parameters The parameters to rebuild the queued execution from, or {@code null} if it is not rebuilt after a restart.
+   */
+  public synchronized void queueExecution(String uuid, String type, Runnable start, Map<String, String> parameters) {
+    if (_executorState.state() != GENERATING_PROPOSALS_FOR_EXECUTION || !Objects.equals(uuid, _uuid)) {
+      throw new IllegalStateException(String.format("Cannot queue an execution for %s while the executor is in %s state for %s.", uuid,
+                                                    _executorState.state(), _uuid));
+    }
+    _queuedExecution = new QueuedExecution(type, start, parameters);
+    LOG.info("User task {}: Queued a {} to start after the execution completes.", uuid, type);
+  }
+
+  /**
+   * Start the execution queued for the given user task right away, without an execution before it -- e.g. because the rebalance
+   * before it has nothing to move. The executor stays reserved for the same UUID.
+   *
+   * @param uuid UUID of the user task.
+   */
+  public synchronized void startQueuedExecutionNow(String uuid) {
+    QueuedExecution queuedExecution = _queuedExecution;
+    if (queuedExecution == null || queuedExecution.isHandedOff() || _executorState.state() != GENERATING_PROPOSALS_FOR_EXECUTION
+        || !Objects.equals(uuid, _uuid)) {
+      throw new IllegalStateException(String.format("No execution is queued for %s.", uuid));
+    }
+    // The user task is not in execution yet: the queued execution starts it.
+    queuedExecution.handOff(false);
+    reserveForQueuedExecution(queuedExecution, _executorState.isTriggeredByUserRequest());
+    startQueuedExecution(queuedExecution);
+  }
+
+  /**
+   * @param uuid UUID of the user task.
+   * @return {@code true} if a stop was requested while the execution queued for the given user task was about to start.
+   */
+  public boolean isQueuedExecutionCancelled(String uuid) {
+    QueuedExecution queuedExecution = _queuedExecution;
+    return queuedExecution != null && queuedExecution.isCancelled() && Objects.equals(uuid, _uuid);
+  }
+
+  /**
+   * Finish the execution queued for the given user task without executing it -- e.g. because there is nothing to move, the
+   * cluster model is not ready, or a stop was requested. Releases the executor and finishes the user task.
+   *
+   * @param uuid UUID of the user task.
+   * @param completedWithError {@code true} if the queued execution could not run, {@code false} if it had nothing to do.
+   * @param message Why the queued execution finished without executing.
+   */
+  public synchronized void finishQueuedExecution(String uuid, boolean completedWithError, String message) {
+    QueuedExecution queuedExecution = _queuedExecution;
+    if (queuedExecution == null || !queuedExecution.isHandedOff() || !Objects.equals(uuid, _uuid)) {
+      LOG.warn("User task {}: No queued execution to finish ({}).", uuid, message);
+      return;
+    }
+    endQueuedExecution(completedWithError, message);
+    if (!_shutdownRequested) {
+      // The state persisted when the execution before it completed (see ProposalExecutionRunnable#run) carried it to a restart.
+      deletePersistedExecutionState(uuid);
+    }
+    _uuid = null;
+    _reasonSupplier = null;
+    _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());
+  }
+
+  /**
+   * Keep the executor reserved for the user task of the given queued execution, as when generating proposals for execution.
+   *
+   * @param queuedExecution The queued execution about to start.
+   * @param isTriggeredByUserRequest Whether the execution is triggered by a user request.
+   */
+  private void reserveForQueuedExecution(QueuedExecution queuedExecution, boolean isTriggeredByUserRequest) {
+    String reason = String.format("%s (queued %s)", _reasonSupplier.get(), queuedExecution.type());
+    _reasonSupplier = () -> reason;
+    _executorState = ExecutorState.generatingProposalsForExecution(_uuid, reason, recentlyDemotedBrokers(), recentlyRemovedBrokers(),
+                                                                   isTriggeredByUserRequest);
+  }
+
+  /**
+   * Run the start of the given queued execution on a separate thread. Not synchronized: also called by the execution thread, which
+   * {@link #shutdown()} waits for while holding the lock.
+   *
+   * @param queuedExecution The queued execution, already reserved for.
+   */
+  private void startQueuedExecution(QueuedExecution queuedExecution) {
+    LOG.info("User task {}: Starting the queued {}.", _uuid, queuedExecution.type());
+    try {
+      _queuedExecutionStarter.execute(queuedExecution.start());
+    } catch (RejectedExecutionException ree) {
+      endQueuedExecution(true, "Cruise Control is shutting down");
+      _uuid = null;
+      _reasonSupplier = null;
+      _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());
+    }
+  }
+
+  /**
+   * End the queued execution (if any) without executing it: drop it if the execution before it has not completed yet, or finish it
+   * (and its user task, if in execution) if it was handed over.
+   *
+   * Not synchronized: also called by the execution thread, which {@link #shutdown()} waits for while holding the lock.
+   *
+   * @param completedWithError {@code true} if the queued execution could not run.
+   * @param message Why the queued execution ends.
+   */
+  private void endQueuedExecution(boolean completedWithError, String message) {
+    QueuedExecution queuedExecution = _queuedExecution;
+    if (queuedExecution == null) {
+      return;
+    }
+    _queuedExecution = null;
+    String notification = String.format("Task [%s] queued %s %s: %s", _uuid, queuedExecution.type(),
+                                        queuedExecution.isHandedOff() ? "finished without executing" : "is dropped", message);
+    if (queuedExecution.isHandedOff() && queuedExecution.isUserTaskInExecution()) {
+      _userTaskManager.markTaskExecutionFinished(_uuid, completedWithError);
+    }
+    if (completedWithError) {
+      _executorNotifier.sendAlert(notification);
+      OPERATION_LOG.warn(notification);
+    } else {
+      _executorNotifier.sendNotification(notification);
+      OPERATION_LOG.info(notification);
+    }
   }
 
   /**
@@ -1128,6 +3189,7 @@ public class Executor {
     if (_executorState.state() == GENERATING_PROPOSALS_FOR_EXECUTION) {
       if (uuid != null && uuid.equals(_uuid)) {
         LOG.warn("Failed to generate proposals for execution (UUID: {} reason: {}).", uuid, _reasonSupplier.get());
+        endQueuedExecution(true, "failed to generate proposals for execution");
         _uuid = null;
         _reasonSupplier = null;
         _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());
@@ -1143,6 +3205,11 @@ public class Executor {
    * @param stopExternalAgent Whether to stop ongoing execution started by external agents.
    */
   public synchronized void userTriggeredStopExecution(boolean stopExternalAgent) {
+    QueuedExecution queuedExecution = _queuedExecution;
+    if (queuedExecution != null && !queuedExecution.isCancelled()) {
+      queuedExecution.cancel();
+      LOG.info("User task {}: User requested to stop, hence the queued {} does not start.", _uuid, queuedExecution.type());
+    }
     if (stopExecution()) {
       LOG.info("User task {}: User requested to stop the ongoing proposal execution.", _uuid);
       _numExecutionStoppedByUser.incrementAndGet();
@@ -1172,16 +3239,40 @@ public class Executor {
 
   /**
    * Shutdown the executor.
+   * Not synchronized: an ongoing execution calls synchronized methods of the executor until it stops, so holding the lock
+   * while waiting for the execution to stop would deadlock -- leaving its replica movements and throttles behind.
+   *
+   * <p>The persisted state of the ongoing execution (if any) is retained, to recover the execution upon restart. If
+   * {@link ExecutorConfig#RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG} is enabled and the execution is not being stopped already,
+   * the execution is detached rather than stopped: its in-flight movements and their throttles are left to Kafka, as a crash would
+   * leave them, so that the restart adopts them instead of copying them again. Otherwise, the execution is stopped -- i.e. its
+   * in-flight movements are rolled back. Either way, stop the execution before the shutdown to end it for good.</p>
    */
-  public synchronized void shutdown() {
+  public void shutdown() {
     LOG.info("Shutting down executor.");
+    // Retain the persisted state of the ongoing execution (if any) to recover it upon restart.
+    _shutdownRequested = true;
+    QueuedExecution queuedExecution = _queuedExecution;
+    if (queuedExecution != null) {
+      queuedExecution.cancel();
+    }
+    _queuedExecutionStarter.shutdownNow();
 
     try {
       _flipOngoingExecutionMutex.acquire();
       try {
         if (_hasOngoingExecution) {
-          LOG.warn("Shutdown executor may take long because execution is still in progress.");
-          stopExecution();
+          if (canDetachOngoingExecution()) {
+            LOG.info("User task {}: Leaving the in-flight movements of the ongoing execution and their throttles to Kafka, so that the "
+                     + "restart resumes the execution ({} is enabled).", _uuid, ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG);
+            _detachRequested = true;
+            synchronized (_progressCheckWaitLock) {
+              _progressCheckWaitLock.notifyAll();
+            }
+          } else {
+            LOG.warn("Shutdown executor may take long because execution is still in progress.");
+            stopExecution();
+          }
         }
         try {
           LOG.info("Waiting for ongoing execution to stop completely if any.");
@@ -1207,9 +3298,51 @@ public class Executor {
     }
     KafkaCruiseControlUtils.closeAdminClientWithTimeout(_adminClient);
     _executionHistoryScannerExecutor.shutdownNow();
+    _leftoverReplicationThrottleCleanerExecutor.shutdownNow();
+    _leftoverLogDirThrottleCleanerExecutor.shutdownNow();
     _concurrencyAdjusterExecutor.shutdownNow();
     _topicMinIsrCache.shutdown();
+    _executionStateStore.close();
     LOG.info("Executor shutdown completed.");
+  }
+
+  /**
+   * @return {@code true} if a shutdown can leave the in-flight movements of the ongoing execution to Kafka for the restart to resume
+   * it: resuming is enabled, the state of the execution was persisted at its last checkpoint, and the execution is moving replicas or
+   * leaderships -- not being stopped, nor cleaning up an execution interrupted by an earlier restart.
+   */
+  private boolean canDetachOngoingExecution() {
+    if (!_resumeInterruptedExecutionOnStartup || _stopSignal.get() != NO_STOP_EXECUTION || _executionStateToPersist == null) {
+      return false;
+    }
+    synchronized (_executionStateStoreLock) {
+      if (!_executionStatePersisted) {
+        return false;
+      }
+    }
+    return switch (_executorState.state()) {
+      case STARTING_EXECUTION, INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS, INTRA_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS,
+           LEADER_MOVEMENT_TASK_IN_PROGRESS -> true;
+      default -> false;
+    };
+  }
+
+  /**
+   * Thrown in the execution thread at its next progress check once a shutdown detaches the ongoing execution (see {@link #shutdown()}).
+   */
+  private static final class ExecutionDetachedException extends RuntimeException {
+    ExecutionDetachedException() {
+      super("The execution is left to Kafka by a shutdown.");
+    }
+  }
+
+  /**
+   * @throws ExecutionDetachedException If a shutdown detaches the ongoing execution.
+   */
+  private void throwIfDetached() {
+    if (_detachRequested) {
+      throw new ExecutionDetachedException();
+    }
   }
 
   /**
@@ -1221,6 +3354,24 @@ public class Executor {
    */
   public boolean modifyOngoingExecution(boolean modify) {
     return _ongoingExecutionIsBeingModified.compareAndSet(!modify, modify);
+  }
+
+  /**
+   * @return A description of the ongoing execution if it is the recovery of an execution interrupted by a Cruise Control restart
+   * (i.e. its cleanup or its resumption), {@code null} otherwise.
+   */
+  public String ongoingRecoveryDescription() {
+    InterruptedExecutionRecovery recovery = _interruptedExecutionRecovery;
+    if (!_hasOngoingExecution || recovery == null) {
+      return null;
+    }
+    if (_executorState.state() == ExecutorState.State.RECOVERING_INTERRUPTED_EXECUTION) {
+      return String.format("Cruise Control is cleaning up the execution %s that was interrupted by a restart", recovery.uuid());
+    }
+    if (recovery.status() == InterruptedExecutionRecovery.Status.RESUMED && recovery.uuid().equals(_uuid)) {
+      return String.format("the ongoing execution %s is resumed after a Cruise Control restart", recovery.uuid());
+    }
+    return null;
   }
 
   /**
@@ -1273,6 +3424,923 @@ public class Executor {
   }
 
   /**
+   * Recover the execution that was interrupted by a Cruise Control restart (if any) based on its persisted state -- see
+   * {@link ExecutorConfig#EXECUTOR_STATE_STORE_CLASS_CONFIG}. This is expected to be called once upon startup, before any
+   * other execution is started.
+   *
+   * <ul>
+   *   <li>The persisted state is reconciled with the current state of the cluster (see
+   *   {@link ExecutionRecoveryUtils#reconcile}) -- e.g. a task that was in progress before the restart is checked for
+   *   whether it is still being executed by Kafka, has completed, or has not started.</li>
+   *   <li>If {@link ExecutorConfig#RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG} is enabled, the execution is resumed with its
+   *   original parameters -- unless it is older than {@link ExecutorConfig#RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG}, was
+   *   resumed {@link ExecutorConfig#RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG} times already, or the cluster has changed
+   *   since it was interrupted in any way the execution itself cannot explain (see {@link #divergences}). Tasks that are still
+   *   being executed by Kafka are adopted -- i.e. monitored until completion without being submitted again.</li>
+   *   <li>Otherwise, the interrupted execution is cleaned up (see {@link InterruptedExecutionCleanupRunnable}): the executor
+   *   reports {@link ExecutorState.State#RECOVERING_INTERRUPTED_EXECUTION} while it waits (for at most
+   *   {@link ExecutorConfig#INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG}) for the in-flight reassignments of the interrupted
+   *   execution to finish, and removes the replication throttles that the interrupted execution left behind.</li>
+   * </ul>
+   * Either way, the executor state reports what happened (see {@link ExecutorState#recovery()}) until the next execution starts.
+   *
+   * @param loadMonitor Load monitor.
+   */
+  public synchronized void recoverInterruptedExecution(LoadMonitor loadMonitor) {
+    loadRetainedReplicationThrottles();
+    Optional<PersistedExecutionState> persistedState;
+    synchronized (_executionStateStoreLock) {
+      try {
+        persistedState = _executionStateStore.load();
+      } catch (IOException | RuntimeException e) {
+        LOG.error("Failed to load the persisted execution state.", e);
+        _executorNotifier.sendAlert("Failed to load the persisted execution state to recover an interrupted execution: " + e.getMessage());
+        return;
+      }
+    }
+    if (persistedState.isEmpty()) {
+      LOG.info("There is no interrupted execution to recover.");
+      return;
+    }
+    PersistedExecutionState state = persistedState.get();
+    if (_hasOngoingExecution || _executorState.state() != NO_TASK_IN_PROGRESS) {
+      LOG.warn("Skip recovering the interrupted execution {} due to executor state {}.", state, _executorState.state());
+      return;
+    }
+    LOG.info("Recovering the interrupted execution {}.", state);
+    InterruptedExecutionRecovery recovery = new InterruptedExecutionRecovery(state);
+    _interruptedExecutionRecovery = recovery;
+
+    ExecutionRecoveryUtils.RecoveryPlan recoveryPlan;
+    Cluster cluster = null;
+    Map<TopicPartition, PartitionReassignment> ongoingReassignments = null;
+    try {
+      // The reassignments first, the replicas second (each call fetches them from the cluster): a reassignment of the execution that
+      // finishes in between is then either listed (adopted, then seen done) or not (its new replicas are what the metadata shows). The
+      // other way round, the metadata may still show the replicas of both sides of a reassignment that is not listed anymore -- which
+      // reads as a partition moved by someone else and prevents the resume.
+      ongoingReassignments = ExecutionUtils.ongoingPartitionReassignments(_adminClient);
+      cluster = _metadataClient.cluster();
+      recoveryPlan = ExecutionRecoveryUtils.reconcile(state, cluster, ongoingReassignments, logDirInfoForIntraBrokerReplicaTasks(state));
+      recovery.setTasksByAction(recoveryPlan.numTasksByAction());
+    } catch (Exception e) {
+      LOG.error("Failed to reconcile the interrupted execution {} with the cluster state.", state.uuid(), e);
+      recoveryPlan = null;
+    }
+
+    String summary = String.format("Task [%s] execution (reason: %s) was interrupted by a Cruise Control restart (started: %s, last "
+                                   + "checkpoint: %s, executor state: %s). Recovered task states: %s.", state.uuid(), state.reason(),
+                                   utcDateFor(state.startTimeMs()), utcDateFor(state.lastUpdateTimeMs()), state.executorState(),
+                                   recoveryPlan == null ? "unknown" : recoveryPlan.numTasksByAction());
+    String reasonToNotResume;
+    if (recoveryPlan != null && recoveryPlan.isFinished() && state.queuedExecution() != null) {
+      // The execution completed, and the execution queued after it had not started yet when Cruise Control stopped: start it now.
+      reasonToNotResume = reasonToNotResumeQueuedExecution(state);
+      if (reasonToNotResume == null) {
+        try {
+          startRecoveredQueuedExecution(state, recovery);
+          String message = String.format("%s The execution had completed; starting the %s queued after it.", summary, state.queuedExecution());
+          OPERATION_LOG.info(message);
+          _executorNotifier.sendNotification(message);
+          return;
+        } catch (Exception e) {
+          LOG.error("Failed to start the {} queued after the interrupted execution {}.", state.queuedExecution(), state.uuid(), e);
+          failGeneratingProposalsForExecution(state.uuid());
+          recoverFinishedUserTask(state.uuid(), true);
+          reasonToNotResume = String.format("failed to start the queued %s: %s", state.queuedExecution(), e.getMessage());
+        }
+      }
+    } else {
+      reasonToNotResume = reasonToNotResume(state, recoveryPlan, cluster, ongoingReassignments, recovery);
+    }
+    if (reasonToNotResume == null) {
+      try {
+        resumeInterruptedExecution(recoveryPlan, loadMonitor, recovery);
+        recovery.setStatus(InterruptedExecutionRecovery.Status.RESUMED);
+        String message = summary + " Resuming the execution" + (_queuedExecution != null
+                                                                ? String.format(", and the %s queued after it.", _queuedExecution.type())
+                                                                : ".");
+        OPERATION_LOG.info(message);
+        _executorNotifier.sendNotification(message);
+        return;
+      } catch (Exception e) {
+        LOG.error("Failed to resume the interrupted execution {}.", state.uuid(), e);
+        failGeneratingProposalsForExecution(state.uuid());
+        recoverFinishedUserTask(state.uuid(), true);
+        reasonToNotResume = "failed to resume the execution: " + e.getMessage();
+      }
+    }
+    if (state.queuedExecution() != null) {
+      recovery.setQueuedExecutionNotResumed(state.queuedExecution());
+      String message = String.format("Task [%s] queued %s is not resumed after the restart: request it again once the interrupted"
+                                     + " execution is recovered.", state.uuid(), state.queuedExecution());
+      _executorNotifier.sendAlert(message);
+      OPERATION_LOG.warn(message);
+    }
+    recovery.setReasonNotResumed(reasonToNotResume);
+    String message = String.format("%s Not resuming the execution because %s. Removing the leftover throttles of the interrupted "
+                                   + "execution after its in-flight partition reassignments and log dir movements (if any) finish.",
+                                   summary, reasonToNotResume);
+    if (recoveryPlan != null && recoveryPlan.isFinished()) {
+      // E.g. the execution finished, but its state could not be deleted -- nothing to alert about.
+      OPERATION_LOG.info(message);
+      _executorNotifier.sendNotification(message);
+    } else {
+      OPERATION_LOG.warn(message);
+      _executorNotifier.sendAlert(message);
+    }
+    startInterruptedExecutionCleanup(state, recovery);
+  }
+
+  /**
+   * @param state Persisted state of the interrupted execution.
+   * @param recoveryPlan The recovery plan of the interrupted execution, or {@code null} if reconciling it failed.
+   * @param cluster The cluster metadata used to reconcile the interrupted execution.
+   * @param ongoingReassignments The ongoing partition reassignments used to reconcile the interrupted execution.
+   * @param recovery The recovery of the interrupted execution to report the divergences (if any) in.
+   * @return The reason to not resume the interrupted execution, or {@code null} if it can be resumed.
+   */
+  private String reasonToNotResume(PersistedExecutionState state,
+                                   ExecutionRecoveryUtils.RecoveryPlan recoveryPlan,
+                                   Cluster cluster,
+                                   Map<TopicPartition, PartitionReassignment> ongoingReassignments,
+                                   InterruptedExecutionRecovery recovery) {
+    if (recoveryPlan == null) {
+      return "failed to reconcile the interrupted execution with the cluster state";
+    }
+    if (!_resumeInterruptedExecutionOnStartup) {
+      return ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG + " is disabled";
+    }
+    if (state.cleanupOnly()) {
+      return "an earlier start of Cruise Control already decided not to resume it";
+    }
+    if (state.outsideExecutionFingerprint() == null) {
+      return "its state does not tell whether the cluster has changed since -- e.g. it was persisted by an older version";
+    }
+    String reason = reasonToNotResumeOldOrRepeated(state);
+    if (reason != null) {
+      return reason;
+    }
+    reason = recoveryPlan.reasonToNotResume();
+    if (reason != null) {
+      return reason;
+    }
+    List<String> divergences;
+    try {
+      divergences = divergences(state, recoveryPlan, cluster, ongoingReassignments);
+    } catch (Exception e) {
+      LOG.error("Failed to check whether the cluster has changed since the execution {} was interrupted.", state.uuid(), e);
+      return "failed to check whether the cluster has changed since the execution was interrupted: " + e.getMessage();
+    }
+    if (!divergences.isEmpty()) {
+      recovery.setDivergences(divergences);
+      return String.format("the cluster has changed since the execution was interrupted (%d difference(s), e.g. %s)",
+                           divergences.size(), divergences.get(0));
+    }
+    return null;
+  }
+
+  /**
+   * @param state Persisted state of the interrupted execution.
+   * @return The reason to not resume the interrupted execution because it is too old or resumed too often in a row, or {@code null}.
+   */
+  private String reasonToNotResumeOldOrRepeated(PersistedExecutionState state) {
+    long ageMs = System.currentTimeMillis() - state.lastUpdateTimeMs();
+    if (ageMs > _resumeInterruptedExecutionMaxAgeMs) {
+      return String.format("it was last checkpointed %d seconds ago, more than %s (%d ms)", TimeUnit.MILLISECONDS.toSeconds(ageMs),
+                           ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_AGE_MS_CONFIG, _resumeInterruptedExecutionMaxAgeMs);
+    }
+    if (state.resumeCount() >= _resumeInterruptedExecutionMaxCount) {
+      return String.format("it has already been resumed %d times in a row without completing a task (%s)", state.resumeCount(),
+                           ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_MAX_COUNT_CONFIG);
+    }
+    return null;
+  }
+
+  /**
+   * @param state Persisted state of an execution that completed before the restart, with an execution queued after it that had not
+   *              started yet.
+   * @return The reason to not start the queued execution, or {@code null} if it can be started. Its proposals are generated from the
+   * cluster as it is now, so the cluster having changed since does not matter.
+   */
+  private String reasonToNotResumeQueuedExecution(PersistedExecutionState state) {
+    if (!_resumeInterruptedExecutionOnStartup) {
+      return ExecutorConfig.RESUME_INTERRUPTED_EXECUTION_ON_STARTUP_CONFIG + " is disabled";
+    }
+    if (state.cleanupOnly()) {
+      return "an earlier start of Cruise Control already decided not to resume it";
+    }
+    String reason = reasonToNotResumeOldOrRepeated(state);
+    if (reason != null) {
+      return reason;
+    }
+    return canRebuildQueuedExecution(state) ? null
+                                            : String.format("the queued %s cannot be rebuilt from its persisted state", state.queuedExecution());
+  }
+
+  /**
+   * @param state Persisted state of an interrupted execution.
+   * @return {@code true} if the execution queued after the interrupted one can be rebuilt (see {@link QueuedExecutionFactory}): it was
+   * persisted with its parameters, and the user task it runs for can be reported again (see {@link #recoverUserTask}).
+   */
+  private boolean canRebuildQueuedExecution(PersistedExecutionState state) {
+    return state.queuedExecution() != null && state.queuedExecutionParameters() != null && _queuedExecutionFactory != null
+           && (!state.triggeredByUserRequest() || canRecoverUserTask(state));
+  }
+
+  /**
+   * @param state Persisted state of an interrupted execution.
+   * @return The execution queued after the interrupted one, rebuilt from its persisted parameters, or {@code null} if it cannot be.
+   */
+  private QueuedExecution rebuildQueuedExecution(PersistedExecutionState state) {
+    if (!canRebuildQueuedExecution(state)) {
+      return null;
+    }
+    try {
+      Runnable start = _queuedExecutionFactory.create(state.queuedExecution(), state.uuid(), state.queuedExecutionParameters());
+      return start == null ? null : new QueuedExecution(state.queuedExecution(), start, state.queuedExecutionParameters());
+    } catch (RuntimeException e) {
+      LOG.warn("Interrupted execution {}: Failed to rebuild the queued {} from {}.", state.uuid(), state.queuedExecution(),
+               state.queuedExecutionParameters(), e);
+      return null;
+    }
+  }
+
+  /**
+   * Start the execution queued after an execution that completed before the restart (e.g. the disk rebalance after a rebalance, PR #39),
+   * as {@link #startQueuedExecutionNow(String)} does for a rebalance that has nothing to move.
+   *
+   * @param state Persisted state of the completed execution.
+   * @param recovery The recovery of the interrupted execution.
+   */
+  private void startRecoveredQueuedExecution(PersistedExecutionState state, InterruptedExecutionRecovery recovery)
+      throws OngoingExecutionException {
+    QueuedExecution queuedExecution = rebuildQueuedExecution(state);
+    if (queuedExecution == null) {
+      throw new IllegalStateException(String.format("the queued %s cannot be rebuilt", state.queuedExecution()));
+    }
+    boolean userTaskRecovered = recoverUserTask(state);
+    setGeneratingProposalsForExecution(state.uuid(), () -> ExecutionRecoveryUtils.resumedReason(state.reason()), userTaskRecovered);
+    // A restart before the queued execution starts counts as a resume.
+    synchronized (_executionStateStoreLock) {
+      try {
+        _executionStateStore.save(state.toBuilder().resumeCount(state.resumeCount() + 1).lastUpdateTimeMs(System.currentTimeMillis())
+                                       .build());
+      } catch (IOException | RuntimeException e) {
+        LOG.warn("Interrupted execution {}: Failed to persist that its queued {} is started.", state.uuid(), state.queuedExecution(), e);
+      }
+    }
+    _queuedExecution = queuedExecution;
+    recovery.setQueuedExecutionResumed(state.queuedExecution());
+    recovery.setStatus(InterruptedExecutionRecovery.Status.RESUMED);
+    startQueuedExecutionNow(state.uuid());
+  }
+
+  /**
+   * @param state Persisted state of an interrupted execution.
+   * @return {@code true} if the user task that started the interrupted execution can be reported again.
+   */
+  private boolean canRecoverUserTask(PersistedExecutionState state) {
+    return state.triggeredByUserRequest() && state.userTask() != null && _userTaskManager != null;
+  }
+
+  /**
+   * Report the execution recovered after a restart under the user task that started it before the restart: the user task is in
+   * execution until the recovered execution finishes.
+   *
+   * @param state Persisted state of the interrupted execution.
+   * @return {@code true} if the user task is reported again.
+   */
+  private boolean recoverUserTask(PersistedExecutionState state) {
+    if (!canRecoverUserTask(state)) {
+      return false;
+    }
+    try {
+      return _userTaskManager.recoverUserTask(state.uuid(), state.userTask());
+    } catch (RuntimeException e) {
+      LOG.warn("Interrupted execution {}: Failed to report it under its user task {}.", state.uuid(), state.userTask(), e);
+      return false;
+    }
+  }
+
+  /**
+   * Finish the user task of a recovered execution that did not start.
+   *
+   * @param uuid UUID of the interrupted execution.
+   * @param completedWithError {@code true} if the user task completed with an error.
+   */
+  private void recoverFinishedUserTask(String uuid, boolean completedWithError) {
+    if (_userTaskManager != null) {
+      _userTaskManager.finishRecoveredUserTask(uuid, completedWithError);
+    }
+  }
+
+  /**
+   * Find the differences between the cluster as the interrupted execution left it and the cluster now, which the execution itself
+   * cannot explain -- i.e. changes made by someone else while Cruise Control was not running. Resuming an execution planned for a
+   * different cluster could e.g. move replicas to a broker that has been filled up since, so any difference prevents the resume:
+   * <ul>
+   *   <li>a partition of the execution is not where the execution left it -- see {@link ExecutionRecoveryUtils#taskDivergences};</li>
+   *   <li>a broker that the execution moves replicas to is not alive;</li>
+   *   <li>a replica outside the execution was moved to another broker, or partitions were created or deleted -- see
+   *   {@link ReplicaPlacementFingerprint};</li>
+   *   <li>a replica is being moved between logdirs by someone else, or (if the execution moves replicas between logdirs) a
+   *   replica outside the execution was moved between the logdirs of a broker of the execution;</li>
+   *   <li>a throttled rate of a broker of the execution is not what the execution left behind;</li>
+   *   <li>a destination of the pending movements does not have enough usable space for them.</li>
+   * </ul>
+   *
+   * @param state Persisted state of the interrupted execution.
+   * @param recoveryPlan The recovery plan of the interrupted execution.
+   * @param cluster Current cluster metadata.
+   * @param ongoingReassignments Ongoing partition reassignments in the cluster.
+   * @return Human-readable differences, or an empty list if the cluster is as the interrupted execution left it.
+   */
+  private List<String> divergences(PersistedExecutionState state,
+                                   ExecutionRecoveryUtils.RecoveryPlan recoveryPlan,
+                                   Cluster cluster,
+                                   Map<TopicPartition, PartitionReassignment> ongoingReassignments)
+      throws InterruptedException, ExecutionException, TimeoutException {
+    List<String> divergences = new ArrayList<>(ExecutionRecoveryUtils.taskDivergences(state, cluster, ongoingReassignments,
+                                                                                      logDirInfoForIntraBrokerReplicaTasks(state)));
+    divergences.addAll(ExecutionRecoveryUtils.deadDestinationBrokers(state, cluster));
+    Set<TopicPartition> partitionsOfExecution = state.proposals().keySet();
+    divergences.addAll(state.outsideExecutionFingerprint().differencesTo(ReplicaPlacementFingerprint.of(cluster, partitionsOfExecution)));
+
+    Set<Integer> aliveBrokers = cluster.nodes().stream().map(Node::id).collect(Collectors.toSet());
+    Map<Integer, Map<String, LogDirDescription>> logDirsByBroker = describeLogDirs(aliveBrokers);
+    Set<TopicPartitionReplica> intraBrokerReplicas = new HashSet<>();
+    for (PersistedTask task : state.tasks()) {
+      if (task.type() == INTRA_BROKER_REPLICA_ACTION) {
+        intraBrokerReplicas.add(new TopicPartitionReplica(task.topicPartition().topic(), task.topicPartition().partition(), task.brokerId()));
+      }
+    }
+    divergences.addAll(ExecutionRecoveryUtils.foreignIntraBrokerReplicaMovements(logDirsByBroker, intraBrokerReplicas));
+    if (!intraBrokerReplicas.isEmpty()) {
+      Map<Integer, Long> persistedLogDirFingerprints = state.logDirFingerprintByBroker();
+      if (persistedLogDirFingerprints == null) {
+        divergences.add("the logdirs of the replicas outside the execution were unknown when the execution started");
+      } else {
+        divergences.addAll(ExecutionRecoveryUtils.logDirFingerprintDivergences(
+            persistedLogDirFingerprints,
+            ExecutionRecoveryUtils.logDirFingerprintByBroker(logDirsByBroker, persistedLogDirFingerprints.keySet(), partitionsOfExecution)));
+      }
+    }
+    // The concurrency adjuster sets per-broker rates that no single value matches, and overrides an operator's rate anyway (D2).
+    if (state.replicationThrottle() != null && !state.replicationThrottleAdjusted()) {
+      Set<Integer> brokers = new TreeSet<>();
+      recoveryPlan.actionByTask().forEach((task, action) -> {
+        if (task.type() == INTER_BROKER_REPLICA_ACTION
+            && (action == ExecutionRecoveryUtils.RecoveryAction.PENDING || action == ExecutionRecoveryUtils.RecoveryAction.ADOPT)) {
+          brokers.addAll(ExecutionRecoveryUtils.participatingBrokers(state.proposals().get(task.topicPartition())));
+        }
+      });
+      brokers.retainAll(aliveBrokers);
+      divergences.addAll(ExecutionRecoveryUtils.throttleDivergences(state, recoveryPlan, describeBrokerConfigs(brokers)));
+    }
+    divergences.addAll(ExecutionRecoveryUtils.freeSpaceShortfalls(state, recoveryPlan, logDirsByBroker));
+    return divergences;
+  }
+
+  private Map<Integer, Map<String, LogDirDescription>> describeLogDirs(Set<Integer> brokers)
+      throws InterruptedException, ExecutionException, TimeoutException {
+    if (brokers.isEmpty()) {
+      return Collections.emptyMap();
+    }
+    return _adminClient.describeLogDirs(brokers).allDescriptions()
+                       .get(_config.getLong(ExecutorConfig.LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS);
+  }
+
+  private Map<Integer, Config> describeBrokerConfigs(Set<Integer> brokers) throws InterruptedException, ExecutionException, TimeoutException {
+    Map<Integer, Config> configByBroker = new HashMap<>();
+    if (brokers.isEmpty()) {
+      return configByBroker;
+    }
+    List<ConfigResource> resources = brokers.stream().map(b -> new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(b)))
+                                            .collect(Collectors.toList());
+    _adminClient.describeConfigs(resources).all().get(ReplicationThrottleHelper.CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .forEach((resource, config) -> configByBroker.put(Integer.parseInt(resource.name()), config));
+    return configByBroker;
+  }
+
+  /**
+   * Resume the interrupted execution in the given recovery plan with its original parameters.
+   *
+   * @param recoveryPlan The recovery plan of the interrupted execution.
+   * @param loadMonitor Load monitor.
+   * @param recovery The recovery of the interrupted execution, to report the queued execution in.
+   */
+  private void resumeInterruptedExecution(ExecutionRecoveryUtils.RecoveryPlan recoveryPlan,
+                                          LoadMonitor loadMonitor,
+                                          InterruptedExecutionRecovery recovery)
+      throws OngoingExecutionException {
+    PersistedExecutionState state = recoveryPlan.state();
+    ReplicaMovementStrategy replicaMovementStrategy = ExecutionRecoveryUtils.replicaMovementStrategy(state.replicaMovementStrategy(), _config);
+    List<ExecutionProposal> proposalsToResume = recoveryPlan.proposalsToResume();
+    // Remove leftover throttles of the finished inter-broker replica tasks (the resumed execution manages the throttles of the rest).
+    Set<TopicPartition> partitionsToResume = proposalsToResume.stream().map(ExecutionProposal::topicPartition).collect(Collectors.toSet());
+    List<ExecutionProposal> finishedProposals = interBrokerReplicaProposals(state, partitionsToResume);
+    List<ExecutionProposal> adoptedProposals = recoveryPlan.adoptedInterBrokerPartitions().stream().map(tp -> state.proposals().get(tp))
+                                                           .collect(Collectors.toList());
+    if (isReplicationThrottled(state) && !finishedProposals.isEmpty()) {
+      _proposalExecutor.execute(new FinishedMovementThrottleCleanupRunnable(state.uuid(), state.replicationThrottle(),
+                                                                           state.replicationThrottleAdjusted(), finishedProposals,
+                                                                           adoptedProposals));
+    }
+
+    if (!_recoveredAppliedLogDirThrottleByBroker.isEmpty()) {
+      // The resumed execution reads the current log dir throttle of a broker as its original: restore the original first.
+      _proposalExecutor.execute(this::restoreRecoveredLogDirThrottles);
+    }
+    if (state.replicationThrottleAdjuster() != PersistedExecutionState.ReplicationThrottleAdjuster.ON && _replicationThrottleAdjusterEnabled) {
+      // Decision D2: the operator switched the adjustment off during (or before) the execution, so that its replication throttle holds.
+      // A restart reverts the switch to the config; the resumed execution switches it off again (it stays off until switched on).
+      LOG.info("Interrupted execution {}: Replication throttle adjustment was {} -- disabling it again, so that the replication throttle "
+               + "of the execution ({} bytes/sec) holds.", state.uuid(),
+               state.replicationThrottleAdjuster() == PersistedExecutionState.ReplicationThrottleAdjuster.TURNED_OFF
+               ? "disabled during the execution" : "disabled for the whole execution", state.replicationThrottle());
+      setReplicationThrottleAdjusterEnabled(false);
+    }
+    // Reported under the user task that started it, if known; the execution queued after it (if any) is queued again.
+    QueuedExecution queuedExecution = rebuildQueuedExecution(state);
+    boolean userTaskRecovered = recoverUserTask(state);
+    setGeneratingProposalsForExecution(state.uuid(), () -> ExecutionRecoveryUtils.resumedReason(state.reason()), userTaskRecovered);
+    if (queuedExecution != null) {
+      _queuedExecution = queuedExecution;
+      recovery.setQueuedExecutionResumed(queuedExecution.type());
+    } else if (state.queuedExecution() != null) {
+      // E.g. persisted by an earlier version, without its parameters.
+      recovery.setQueuedExecutionNotResumed(state.queuedExecution());
+      String message = String.format("Task [%s] queued %s is not resumed after the restart: request it again once the resumed"
+                                     + " execution finishes.", state.uuid(), state.queuedExecution());
+      _executorNotifier.sendAlert(message);
+      OPERATION_LOG.warn(message);
+    }
+    _recoveryPlanToResume = recoveryPlan;
+    try {
+      if (state.operation() == PersistedExecutionState.Operation.DEMOTE_BROKERS) {
+        executeDemoteProposals(proposalsToResume,
+                               state.demotedBrokers() == null ? Collections.emptySet() : state.demotedBrokers(),
+                               loadMonitor,
+                               state.interBrokerPartitionMovementConcurrency(),
+                               state.clusterLeadershipMovementConcurrency(),
+                               state.brokerLeadershipMovementConcurrency(),
+                               state.executionProgressCheckIntervalMs(),
+                               replicaMovementStrategy,
+                               state.replicationThrottle(),
+                               userTaskRecovered,
+                               state.uuid());
+      } else {
+        executeProposals(proposalsToResume,
+                         state.brokersToSkipConcurrencyCheck(),
+                         state.removedBrokers(),
+                         loadMonitor,
+                         state.interBrokerPartitionMovementConcurrency(),
+                         state.maxInterBrokerPartitionMovements(),
+                         state.intraBrokerPartitionMovementConcurrency(),
+                         state.clusterLeadershipMovementConcurrency(),
+                         state.brokerLeadershipMovementConcurrency(),
+                         state.executionProgressCheckIntervalMs(),
+                         replicaMovementStrategy,
+                         state.replicationThrottle(),
+                         state.logDirThrottle(),
+                         userTaskRecovered,
+                         state.uuid(),
+                         state.kafkaAssignerMode(),
+                         state.skipInterBrokerReplicaConcurrencyAdjustment(),
+                         state.intraBrokerMovementsBrokerByBroker());
+      }
+    } finally {
+      _recoveryPlanToResume = null;
+    }
+  }
+
+  /**
+   * Start cleaning up the given interrupted execution, which is not resumed. The cleanup is reported as an ongoing execution in
+   * {@link ExecutorState.State#RECOVERING_INTERRUPTED_EXECUTION} state: a new execution (or self-healing) cannot start before the
+   * cleanup finishes or is stopped -- stopping it cancels the in-flight reassignments of the interrupted execution right away.
+   *
+   * @param state Persisted state of the interrupted execution.
+   * @param recovery The recovery of the interrupted execution.
+   */
+  private void startInterruptedExecutionCleanup(PersistedExecutionState state, InterruptedExecutionRecovery recovery) {
+    // The brokers that the interrupted execution was demoting or removing were not done yet, so new executions must not move
+    // leaderships or replicas back to them.
+    long now = _time.milliseconds();
+    if (state.demotedBrokers() != null) {
+      state.demotedBrokers().forEach(id -> _latestDemoteStartTimeMsByBrokerId.merge(id, now, Executor::keepPermanentTimestamp));
+    }
+    if (state.removedBrokers() != null) {
+      state.removedBrokers().forEach(id -> _latestRemoveStartTimeMsByBrokerId.merge(id, now, Executor::keepPermanentTimestamp));
+    }
+    // Later restarts must not resume an execution that this restart decided not to resume.
+    if (!state.cleanupOnly()) {
+      synchronized (_executionStateStoreLock) {
+        try {
+          _executionStateStore.save(state.toBuilder().cleanupOnly(true).build());
+        } catch (IOException | RuntimeException e) {
+          LOG.warn("Interrupted execution {}: Failed to persist that it is only to be cleaned up.", state.uuid(), e);
+        }
+      }
+    }
+    try {
+      _flipOngoingExecutionMutex.acquire();
+      try {
+        _hasOngoingExecution = true;
+        _stopSignal.set(NO_STOP_EXECUTION);
+        _executionStoppedByUser.set(false);
+        // Block Executor from shutting down until the cleanup stopped.
+        _noOngoingExecutionSemaphore.acquire();
+      } catch (InterruptedException ie) {
+        _hasOngoingExecution = false;
+        throw ie;
+      } finally {
+        _flipOngoingExecutionMutex.release();
+      }
+    } catch (InterruptedException ie) {
+      LOG.warn("Interrupted execution {}: Interrupted before the cleanup started -- it is retried upon the next restart.", state.uuid());
+      recovery.setStatus(InterruptedExecutionRecovery.Status.RETAINED_FOR_RESTART);
+      Thread.currentThread().interrupt();
+      return;
+    }
+    _uuid = state.uuid();
+    String reason = ExecutionRecoveryUtils.cleanupReason(state.reason());
+    _reasonSupplier = () -> reason;
+    _executorState = ExecutorState.recoveringInterruptedExecution(_uuid, reason, recentlyDemotedBrokers(), recentlyRemovedBrokers(),
+                                                                  state.triggeredByUserRequest());
+    recovery.setStatus(InterruptedExecutionRecovery.Status.WAITING_FOR_IN_FLIGHT_MOVEMENTS);
+    _proposalExecutor.execute(new InterruptedExecutionCleanupRunnable(state, recovery));
+  }
+
+  private static Long keepPermanentTimestamp(Long existingTimestamp, Long newTimestamp) {
+    return existingTimestamp == ExecutionUtils.PERMANENT_TIMESTAMP ? existingTimestamp : newTimestamp;
+  }
+
+  /**
+   * @param state Persisted execution state.
+   * @param partitionsToExclude Partitions to exclude, or {@code null} to not exclude any partitions.
+   * @return Proposals of the inter-broker replica tasks in the given execution state (i.e. proposals with potential throttles).
+   */
+  private static List<ExecutionProposal> interBrokerReplicaProposals(PersistedExecutionState state, Set<TopicPartition> partitionsToExclude) {
+    Set<TopicPartition> partitions = new LinkedHashSet<>();
+    for (PersistedTask task : state.tasks()) {
+      if (task.type() == INTER_BROKER_REPLICA_ACTION && (partitionsToExclude == null || !partitionsToExclude.contains(task.topicPartition()))) {
+        partitions.add(task.topicPartition());
+      }
+    }
+    return partitions.stream().map(tp -> state.proposals().get(tp)).collect(Collectors.toList());
+  }
+
+  /**
+   * @param state Persisted execution state.
+   * @return Current log directory information of the replicas of the intra-broker replica tasks in the given execution state.
+   * Replicas whose log directory information cannot be retrieved are omitted.
+   */
+  private Map<TopicPartitionReplica, ReplicaLogDirInfo> logDirInfoForIntraBrokerReplicaTasks(PersistedExecutionState state) {
+    Set<TopicPartitionReplica> replicas = new HashSet<>();
+    for (PersistedTask task : state.tasks()) {
+      if (task.type() == INTRA_BROKER_REPLICA_ACTION) {
+        replicas.add(new TopicPartitionReplica(task.topicPartition().topic(), task.topicPartition().partition(), task.brokerId()));
+      }
+    }
+    return describeReplicaLogDirs(replicas);
+  }
+
+  /**
+   * @param replicas Replicas.
+   * @return Current log directory information of the given replicas. Replicas whose log directory information cannot be retrieved are
+   * omitted.
+   */
+  private Map<TopicPartitionReplica, ReplicaLogDirInfo> describeReplicaLogDirs(Set<TopicPartitionReplica> replicas) {
+    Map<TopicPartitionReplica, ReplicaLogDirInfo> logDirInfoByReplica = new HashMap<>();
+    if (replicas.isEmpty()) {
+      return logDirInfoByReplica;
+    }
+    long timeoutMs = _config.getLong(ExecutorConfig.LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG);
+    for (Map.Entry<TopicPartitionReplica, KafkaFuture<ReplicaLogDirInfo>> entry
+        : _adminClient.describeReplicaLogDirs(replicas).values().entrySet()) {
+      try {
+        logDirInfoByReplica.put(entry.getKey(), entry.getValue().get(timeoutMs, TimeUnit.MILLISECONDS));
+      } catch (InterruptedException | ExecutionException | TimeoutException e) {
+        LOG.warn("Failed to retrieve the log directory information of replica {}.", entry.getKey(), e);
+      }
+    }
+    return logDirInfoByReplica;
+  }
+
+  /**
+   * @param state Persisted state of an execution.
+   * @return {@code true} if the execution throttled its inter-broker replica movements: with a replication throttle, or through
+   * the concurrency adjuster (which throttles an execution without one, see PR #13).
+   */
+  private static boolean isReplicationThrottled(PersistedExecutionState state) {
+    return state.replicationThrottle() != null || state.replicationThrottleAdjusted();
+  }
+
+  /**
+   * @param proposals Inter-broker replica proposals.
+   * @return The given proposals that move data -- i.e. whose replicas are throttled (see {@link ReplicationThrottleHelper#hasDataMovement}).
+   */
+  private static List<ExecutionProposal> dataMovementProposals(List<ExecutionProposal> proposals) {
+    return proposals.stream().filter(ReplicationThrottleHelper::hasDataMovement).collect(Collectors.toList());
+  }
+
+  private static Set<Integer> participatingBrokers(List<ExecutionProposal> proposals) {
+    Set<Integer> brokers = new HashSet<>();
+    proposals.forEach(p -> brokers.addAll(ExecutionRecoveryUtils.participatingBrokers(p)));
+    return brokers;
+  }
+
+  /**
+   * Removes the replication throttles that a resumed execution no longer needs -- i.e. of the movements of the interrupted execution
+   * that finished (or were dropped) before the restart. Runs in the proposal executor thread before the resumed execution starts.
+   */
+  private class FinishedMovementThrottleCleanupRunnable implements Runnable {
+    private final String _interruptedExecutionUuid;
+    private final Long _replicationThrottle;
+    private final boolean _replicationThrottleAdjusted;
+    private final List<ExecutionProposal> _finishedProposals;
+    private final List<ExecutionProposal> _adoptedProposals;
+
+    FinishedMovementThrottleCleanupRunnable(String interruptedExecutionUuid,
+                                            Long replicationThrottle,
+                                            boolean replicationThrottleAdjusted,
+                                            List<ExecutionProposal> finishedProposals,
+                                            List<ExecutionProposal> adoptedProposals) {
+      _interruptedExecutionUuid = interruptedExecutionUuid;
+      _replicationThrottle = replicationThrottle;
+      _replicationThrottleAdjusted = replicationThrottleAdjusted;
+      _finishedProposals = finishedProposals;
+      _adoptedProposals = adoptedProposals;
+    }
+
+    @Override
+    public void run() {
+      try {
+        LOG.info("Interrupted execution {}: Removing leftover replication throttles of {} finished partition movement(s).",
+                 _interruptedExecutionUuid, _finishedProposals.size());
+        // Throttles are set only for movements with data movement (PR #5), and the resumed execution throttles the brokers of
+        // the adopted movements itself.
+        List<ExecutionProposal> finishedProposals = dataMovementProposals(_finishedProposals);
+        Set<Integer> brokers = participatingBrokers(finishedProposals);
+        brokers.removeAll(participatingBrokers(dataMovementProposals(_adoptedProposals)));
+        ReplicationThrottleHelper.AppliedThrottles finishedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
+        finishedThrottles.add(brokers, finishedProposals);
+        List<String> keptThrottles = removeThrottlesOfInterruptedExecution(_interruptedExecutionUuid, _replicationThrottle,
+                                                                           _replicationThrottleAdjusted, finishedThrottles);
+        if (!keptThrottles.isEmpty()) {
+          LOG.info("Interrupted execution {}: Throttled rates that were not removed: {}", _interruptedExecutionUuid, keptThrottles);
+        }
+      } catch (InterruptedException e) {
+        LOG.warn("Interrupted execution {}: Interrupted while removing leftover replication throttles.", _interruptedExecutionUuid);
+        Thread.currentThread().interrupt();
+      } catch (Exception e) {
+        LOG.error("Interrupted execution {}: Failed to remove leftover replication throttles.", _interruptedExecutionUuid, e);
+        _executorNotifier.sendAlert(String.format("Task [%s] resumed execution failed to remove the leftover replication throttles of "
+                                                  + "its finished partition movements: %s", _interruptedExecutionUuid, e.getMessage()));
+      }
+    }
+  }
+
+  /**
+   * Cleans up an execution that was interrupted by a Cruise Control restart and is not resumed (see
+   * {@link #startInterruptedExecutionCleanup}): waits for the in-flight reassignments and log dir movements of the interrupted
+   * execution to finish, then removes the replication throttles that the interrupted execution left behind, restores the log dir
+   * throttles it changed, and deletes its persisted state.
+   *
+   * <ul>
+   *   <li>The wait is bounded by {@link ExecutorConfig#INTERRUPTED_EXECUTION_CLEANUP_TIMEOUT_MS_CONFIG}; a stop request (e.g.
+   *   {@code stop_proposal_execution}, or a new request with {@code stop_ongoing_execution=true}) ends it right away. Either way,
+   *   the in-flight reassignments and log dir movements of the interrupted execution are cancelled before its throttles are
+   *   removed -- a log dir movement by moving the replica back to its current logdir, which removes its future replica (PR #2).</li>
+   *   <li>If the Kafka cluster cannot be reached, the cleanup retries with a backoff until the timeout.</li>
+   *   <li>A throttled rate is removed only if it is still the throttle of the interrupted execution -- see
+   *   {@link ReplicationThrottleHelper#forInterruptedExecution}.</li>
+   *   <li>If Cruise Control shuts down, or the cleanup fails, the persisted state is kept, so that the cleanup is retried upon the
+   *   next restart.</li>
+   * </ul>
+   */
+  private class InterruptedExecutionCleanupRunnable implements Runnable {
+    private final PersistedExecutionState _state;
+    private final InterruptedExecutionRecovery _recovery;
+
+    InterruptedExecutionCleanupRunnable(PersistedExecutionState state, InterruptedExecutionRecovery recovery) {
+      _state = state;
+      _recovery = recovery;
+    }
+
+    @Override
+    public void run() {
+      String uuid = _state.uuid();
+      try {
+        List<ExecutionProposal> proposals = interBrokerReplicaProposals(_state, null);
+        long deadlineMs = System.currentTimeMillis() + _interruptedExecutionCleanupTimeoutMs;
+        _recovery.setCleanupDeadlineMs(deadlineMs);
+        if (!waitForOrCancelInFlightPartitionReassignments(proposals, deadlineMs)
+            || !waitForOrCancelInFlightLogDirMovements(deadlineMs)) {
+          LOG.info("Interrupted execution {}: Retaining the persisted execution state to clean it up upon restart.", uuid);
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.RETAINED_FOR_RESTART);
+          return;
+        }
+        if (isReplicationThrottled(_state) && !proposals.isEmpty()) {
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.REMOVING_THROTTLES);
+          LOG.info("Interrupted execution {}: Removing leftover replication throttles of {} partition(s).", uuid, proposals.size());
+          // What cannot be removed now (e.g. of a broker that is not alive) is retained and removed later, also across restarts.
+          // Throttles are set only for movements with data movement (PR #5).
+          List<ExecutionProposal> throttledProposals = dataMovementProposals(proposals);
+          ReplicationThrottleHelper.AppliedThrottles interruptedThrottles = new ReplicationThrottleHelper.AppliedThrottles();
+          interruptedThrottles.add(participatingBrokers(throttledProposals), throttledProposals);
+          _recovery.setKeptThrottles(removeThrottlesOfInterruptedExecution(uuid, _state.replicationThrottle(),
+                                                                           _state.replicationThrottleAdjusted(), interruptedThrottles));
+        }
+        // The log dir throttles that the interrupted execution changed throttled its in-flight log dir movements until now. What cannot
+        // be restored now is retried by the leftover log dir throttle cleaner.
+        restoreRecoveredLogDirThrottles();
+        deletePersistedExecutionState(uuid);
+        _recovery.setStatus(InterruptedExecutionRecovery.Status.CLEANED_UP);
+        List<String> keptThrottles = _recovery.keptThrottles();
+        String message = String.format("Task [%s] interrupted execution is cleaned up.%s", uuid, keptThrottles.isEmpty()
+            ? "" : " Throttled rates that were not removed: " + keptThrottles);
+        OPERATION_LOG.info(message);
+        if (keptThrottles.stream().anyMatch(t -> t.contains("retained"))) {
+          _executorNotifier.sendAlert(message);
+        } else {
+          _executorNotifier.sendNotification(message);
+        }
+      } catch (InterruptedException e) {
+        LOG.warn("Interrupted execution {}: Interrupted while cleaning up -- it is retried upon the next restart.", uuid);
+        _recovery.setStatus(InterruptedExecutionRecovery.Status.RETAINED_FOR_RESTART);
+        Thread.currentThread().interrupt();
+      } catch (Exception e) {
+        LOG.error("Interrupted execution {}: Failed to clean up.", uuid, e);
+        _recovery.setFailed(e.getMessage());
+        _executorNotifier.sendAlert(String.format("Task [%s] interrupted execution failed to remove its leftover replication throttles: "
+                                                  + "%s. It is retried upon the next restart.", uuid, e.getMessage()));
+      } finally {
+        finishInterruptedExecutionCleanup();
+      }
+    }
+
+    /**
+     * Wait for the in-flight reassignments of the given proposals to finish. If the cleanup is stopped by a request or times out,
+     * cancel them.
+     *
+     * @param proposals Inter-broker replica proposals of the interrupted execution.
+     * @param deadlineMs The time to cancel the reassignments that are still in flight.
+     * @return {@code true} if there are no in-flight reassignments of the given proposals anymore, {@code false} if the wait ended
+     * due to a shutdown.
+     */
+    private boolean waitForOrCancelInFlightPartitionReassignments(List<ExecutionProposal> proposals, long deadlineMs)
+        throws InterruptedException {
+      Set<TopicPartition> partitions = proposals.stream().map(ExecutionProposal::topicPartition).collect(Collectors.toSet());
+      if (partitions.isEmpty()) {
+        return true;
+      }
+      long retryBackoffMs = executionProgressCheckIntervalMs();
+      int numCancellations = 0;
+      while (true) {
+        if (_shutdownRequested) {
+          return false;
+        }
+        Set<TopicPartition> inFlight;
+        try {
+          inFlight = new HashSet<>(ExecutionUtils.partitionsBeingReassigned(_adminClient));
+          retryBackoffMs = executionProgressCheckIntervalMs();
+        } catch (ExecutionException | TimeoutException e) {
+          if (System.currentTimeMillis() >= deadlineMs || _stopSignal.get() != NO_STOP_EXECUTION) {
+            throw new IllegalStateException("Failed to retrieve the ongoing partition reassignments of the interrupted execution.", e);
+          }
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.WAITING_FOR_KAFKA);
+          LOG.warn("Interrupted execution {}: Failed to retrieve the ongoing partition reassignments -- retrying in {} ms.", _state.uuid(),
+                   retryBackoffMs, e);
+          Thread.sleep(retryBackoffMs);
+          retryBackoffMs = Math.min(retryBackoffMs * 2, MAX_INTERRUPTED_EXECUTION_CLEANUP_RETRY_BACKOFF_MS);
+          continue;
+        }
+        inFlight.retainAll(partitions);
+        _recovery.setInFlightMovements(inFlight);
+        if (inFlight.isEmpty()) {
+          return true;
+        }
+        boolean stopRequested = _stopSignal.get() != NO_STOP_EXECUTION;
+        if (stopRequested || System.currentTimeMillis() >= deadlineMs) {
+          if (numCancellations++ >= MAX_INTERRUPTED_EXECUTION_CANCELLATIONS) {
+            throw new IllegalStateException(String.format("Failed to cancel the in-flight partition reassignments %s.", inFlight));
+          }
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.CANCELLING_IN_FLIGHT_MOVEMENTS);
+          LOG.warn("Interrupted execution {}: Cancelling {} in-flight partition reassignment(s) because {}: {}", _state.uuid(),
+                   inFlight.size(), stopRequested ? "the cleanup was stopped" : "the cleanup timed out", inFlight);
+          cancelPartitionReassignments(inFlight);
+        } else {
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.WAITING_FOR_IN_FLIGHT_MOVEMENTS);
+          LOG.info("Interrupted execution {}: Waiting for {} in-flight partition reassignment(s) to finish: {}", _state.uuid(),
+                   inFlight.size(), inFlight);
+        }
+        Thread.sleep(executionProgressCheckIntervalMs());
+      }
+    }
+
+    /**
+     * Wait for the in-flight log dir movements of the interrupted execution to finish -- i.e. its replicas with a future replica on the
+     * target logdir of their task, which Kafka keeps copying after the restart. If the cleanup is stopped by a request or times out,
+     * cancel them by moving each replica back to its current logdir, which removes its future replica (as a stopped execution rolls them
+     * back, PR #2). A replica whose logdirs cannot be retrieved (e.g. its broker is down) is not waited for.
+     *
+     * @param deadlineMs The time to cancel the movements that are still in flight.
+     * @return {@code true} if there are no in-flight log dir movements of the interrupted execution anymore, {@code false} if the wait
+     * ended due to a shutdown.
+     */
+    private boolean waitForOrCancelInFlightLogDirMovements(long deadlineMs) throws InterruptedException {
+      Map<TopicPartitionReplica, String> targetLogDirByReplica = new HashMap<>();
+      for (PersistedTask task : _state.tasks()) {
+        ReplicaPlacementInfo target = task.type() == INTRA_BROKER_REPLICA_ACTION && task.state() != ExecutionTaskState.COMPLETED
+                                      ? _state.proposals().get(task.topicPartition()).replicasToMoveBetweenDisksByBroker().get(task.brokerId())
+                                      : null;
+        if (target != null && target.logdir() != null) {
+          targetLogDirByReplica.put(new TopicPartitionReplica(task.topicPartition().topic(), task.topicPartition().partition(),
+                                                              task.brokerId()), target.logdir());
+        }
+      }
+      if (targetLogDirByReplica.isEmpty()) {
+        return true;
+      }
+      int numCancellations = 0;
+      while (true) {
+        if (_shutdownRequested) {
+          return false;
+        }
+        // Each in-flight movement, mapped to the current logdir of its replica.
+        Map<TopicPartitionReplica, String> inFlight = new HashMap<>();
+        describeReplicaLogDirs(targetLogDirByReplica.keySet()).forEach((replica, info) -> {
+          if (info.getCurrentReplicaLogDir() != null && targetLogDirByReplica.get(replica).equals(info.getFutureReplicaLogDir())) {
+            inFlight.put(replica, info.getCurrentReplicaLogDir());
+          }
+        });
+        _recovery.setInFlightLogDirMovements(inFlight.keySet());
+        if (inFlight.isEmpty()) {
+          return true;
+        }
+        boolean stopRequested = _stopSignal.get() != NO_STOP_EXECUTION;
+        if (stopRequested || System.currentTimeMillis() >= deadlineMs) {
+          if (numCancellations++ >= MAX_INTERRUPTED_EXECUTION_CANCELLATIONS) {
+            throw new IllegalStateException(String.format("Failed to cancel the in-flight log dir movements %s.", inFlight.keySet()));
+          }
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.CANCELLING_IN_FLIGHT_MOVEMENTS);
+          LOG.warn("Interrupted execution {}: Cancelling {} in-flight log dir movement(s) because {}: {}", _state.uuid(), inFlight.size(),
+                   stopRequested ? "the cleanup was stopped" : "the cleanup timed out", inFlight.keySet());
+          _adminClient.alterReplicaLogDirs(inFlight).values().forEach((replica, future) -> {
+            try {
+              future.get(_config.getLong(ExecutorConfig.LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+            } catch (ExecutionException | TimeoutException e) {
+              // E.g. the movement finished in the meantime -- the next check tells.
+              LOG.warn("Interrupted execution {}: Failed to cancel the log dir movement of {}.", _state.uuid(), replica, e);
+            }
+          });
+        } else {
+          _recovery.setStatus(InterruptedExecutionRecovery.Status.WAITING_FOR_IN_FLIGHT_MOVEMENTS);
+          LOG.info("Interrupted execution {}: Waiting for {} in-flight log dir movement(s) to finish: {}", _state.uuid(), inFlight.size(),
+                   inFlight.keySet());
+        }
+        Thread.sleep(executionProgressCheckIntervalMs());
+      }
+    }
+
+    private void cancelPartitionReassignments(Set<TopicPartition> partitions) {
+      Map<TopicPartition, Optional<NewPartitionReassignment>> cancellations = new HashMap<>();
+      partitions.forEach(tp -> cancellations.put(tp, ExecutionUtils.cancelReassignmentValue()));
+      _adminClient.alterPartitionReassignments(cancellations).values().forEach((tp, future) -> {
+        try {
+          future.get(ReplicationThrottleHelper.CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        } catch (ExecutionException | TimeoutException e) {
+          // E.g. the reassignment finished in the meantime -- the next check tells.
+          LOG.warn("Interrupted execution {}: Failed to cancel the reassignment of {}.", _state.uuid(), tp, e);
+        }
+      });
+    }
+
+    /**
+     * Report that the cleanup is over -- the counterpart of marking it as an ongoing execution in
+     * {@link #startInterruptedExecutionCleanup}. It must not call a synchronized method of the executor: a shutdown holds the
+     * executor's lock while it waits for the cleanup to stop.
+     */
+    private void finishInterruptedExecutionCleanup() {
+      // Resets the stop request (if any) that the cleanup received -- the task manager has no tasks of the cleanup.
+      _executionTaskManager.clear();
+      _uuid = null;
+      _reasonSupplier = null;
+      _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());
+      _hasOngoingExecution = false;
+      _stopSignal.set(NO_STOP_EXECUTION);
+      _executionStoppedByUser.set(false);
+      _noOngoingExecutionSemaphore.release();
+    }
+  }
+
+  /**
    * Check if the concurrency manager is initialized
    * @return true if concurrency manager is initialized
    */
@@ -1294,30 +4362,83 @@ public class Executor {
    * Note that once the thread for {@link ProposalExecutionRunnable} is submitted for running, the variable
    * _executionTaskManager can only be written within this inner class, but not from the outer Executor class.
    */
+  /**
+   * The brokers to or from which no new inter-broker replica movement starts: while replication throttle adjustment is enabled, the
+   * brokers that are behind on an (At/Under)MinISR partition -- see {@link ConcurrencyAdjuster#brokersBehindForThrottle(Set)} -- so that
+   * a broker whose replicas fall behind gets no more movements until it is back in sync. Their movements stay pending, and start once
+   * they are. A change of these brokers is logged.
+   *
+   * @return The brokers to or from which no new inter-broker replica movement starts.
+   */
+  private Set<Integer> brokersNotToStartMovementsOn() {
+    Set<Integer> brokersBehind = new TreeSet<>();
+    if (_replicationThrottleAdjusterEnabled) {
+      try {
+        _concurrencyAdjuster.brokersBehindForThrottle(brokersBehind);
+      } catch (RuntimeException e) {
+        LOG.warn("Failed to check which brokers are behind on (At/Under)MinISR partitions; not holding back any movement.", e);
+        brokersBehind.clear();
+      }
+    }
+    if (!brokersBehind.equals(_brokersNotToStartMovementsOn)) {
+      if (brokersBehind.isEmpty()) {
+        LOG.info("User task {}: no broker is behind on (At/Under)MinISR partitions anymore; inter-broker replica movements to and from "
+                 + "brokers {} can start again.", _uuid, _brokersNotToStartMovementsOn);
+      } else {
+        LOG.info("User task {}: starting no new inter-broker replica movement to or from brokers {} while their replicas of "
+                 + "(At/Under)MinISR partitions are out of sync.", _uuid, brokersBehind);
+      }
+      _brokersNotToStartMovementsOn = brokersBehind;
+    }
+    return brokersBehind;
+  }
+
   private class ProposalExecutionRunnable implements Runnable {
     private final LoadMonitor _loadMonitor;
     private final Set<Integer> _recentlyDemotedBrokers;
     private final Set<Integer> _recentlyRemovedBrokers;
     private final Long _replicationThrottle;
+    private final PartitionWriteRateCache _partitionWriteRateCache;
+    private final LogDirThrottleHelper _logDirThrottleHelper;
     private Throwable _executionException;
+    // Whether a shutdown detached the execution (see #shutdown()), which leaves its in-flight movements to Kafka.
+    private boolean _detached;
+    // Whether the execution queued after this one starts once this one is cleared (see #notifyFinishedTask).
+    private boolean _startsQueuedExecution;
     private final boolean _isTriggeredByUserRequest;
+    // Whether this execution resumes an execution interrupted by a Cruise Control restart.
+    private final boolean _isResumedExecution;
+    // The state of the concurrency adjuster before the restart, if this execution resumes an execution interrupted by a restart.
+    private final PersistedAdjusterState _resumedAdjusterState;
     private long _lastSlowTaskReportingTimeMs;
+    private int _numIntraBrokerProgressChecksUponStop;
+    // The start time of the ongoing inter-broker or intra-broker replica movement phase.
+    private long _replicaMovementStartTimeMs;
     private static final boolean FORCE_PAUSE_SAMPLING = true;
     private final Timer _executionTimerInvolveBrokerRemovalOrDemotion;
 
     private final Collection<Integer> _demotedBrokers;
 
     private final Collection<Integer> _removedBrokers;
+    // Limits the replica movements on each logdir, or null if num.concurrent.partition.movements.per.logdir is 0.
+    private final LogDirMovementLimit _logDirMovementLimit;
 
     ProposalExecutionRunnable(LoadMonitor loadMonitor,
                               Collection<Integer> demotedBrokers,
                               Collection<Integer> removedBrokers,
                               Long replicationThrottle,
-                              boolean isTriggeredByUserRequest) {
+                              Long logDirThrottle,
+                              boolean isTriggeredByUserRequest,
+                              boolean isResumedExecution,
+                              PersistedAdjusterState resumedAdjusterState) {
       _loadMonitor = loadMonitor;
+      _partitionWriteRateCache = new PartitionWriteRateCache(_time, _metricSamplingIntervalMs,
+                                                             () -> _loadMonitor.currentPartitionMetricValues());
       _demotedBrokers = demotedBrokers;
       _removedBrokers = removedBrokers;
       _executionException = null;
+      int maxMovementsPerLogDir = _config.getInt(ExecutorConfig.NUM_CONCURRENT_PARTITION_MOVEMENTS_PER_LOGDIR_CONFIG);
+      _logDirMovementLimit = maxMovementsPerLogDir > 0 ? new LogDirMovementLimit(_adminClient, _config, maxMovementsPerLogDir) : null;
       if (isTriggeredByUserRequest && _userTaskManager == null) {
         processExecuteProposalsFailure();
         _hasOngoingExecution = false;
@@ -1348,7 +4469,11 @@ public class Executor {
       _recentlyDemotedBrokers = recentlyDemotedBrokers();
       _recentlyRemovedBrokers = recentlyRemovedBrokers();
       _replicationThrottle = replicationThrottle;
+      _operatorReplicationThrottle = null;
+      _logDirThrottleHelper = new LogDirThrottleHelper(_adminClient, logDirThrottle, _appliedLogDirThrottles);
       _isTriggeredByUserRequest = isTriggeredByUserRequest;
+      _isResumedExecution = isResumedExecution;
+      _resumedAdjusterState = resumedAdjusterState;
       _lastSlowTaskReportingTimeMs = -1L;
       if (_removedBrokers != null && !_removedBrokers.isEmpty()) {
         _executionTimerInvolveBrokerRemovalOrDemotion = _proposalExecutionTimerInvolveBrokerRemoval;
@@ -1378,13 +4503,53 @@ public class Executor {
                                                _demotedBrokers,
                                                duration
                                                );
-        if (_executionException != null) {
+        if (_detached) {
+          LOG.info("User task {}: Execution left to Kafka by the shutdown: {}.", _uuid, executionStatusString);
+        } else if (_executionException != null) {
           LOG.info("User task {}: Execution failed: {}. Exception: {}", _uuid, executionStatusString, _executionException.getMessage());
         } else {
           LOG.info("User task {}: Execution succeeded: {}. ", _uuid, executionStatusString);
         }
+        // The execution has finished (i.e. completed, stopped, or failed), unless it has been interrupted by a shutdown -- in which
+        // case its persisted state is retained to recover it upon restart.
+        if (_shutdownRequested) {
+          LOG.info("User task {}: Retaining the persisted execution state to recover the execution upon restart.", _uuid);
+        } else if (_startsQueuedExecution) {
+          // Until the queued execution starts (or finishes without executing), a restart starts it (see #recoverInterruptedExecution).
+          checkpointExecutionState(true);
+        } else {
+          deletePersistedExecutionState(_uuid);
+        }
+        _executionStateToPersist = null;
+        _latestClusterOfExecution = null;
         // Clear completed execution.
         clearCompletedExecution();
+      }
+    }
+
+    /**
+     * Persist the user task of the execution with it, so that an execution resumed after a restart is reported under the same user task.
+     *
+     * @param userTaskInfo The user task of the execution.
+     */
+    private void persistUserTask(UserTaskManager.UserTaskInfo userTaskInfo) {
+      if (userTaskInfo == null) {
+        return;
+      }
+      PersistedUserTask userTask;
+      try {
+        userTask = new PersistedUserTask(userTaskInfo.endPoint().toString(), userTaskInfo.requestWithParams(),
+                                         userTaskInfo.clientIdentity(), userTaskInfo.startMs());
+      } catch (RuntimeException e) {
+        // Only reporting the resumed execution under the same user task depends on it -- not the execution.
+        LOG.warn("User task {}: Failed to record the user task with the execution state.", _uuid, e);
+        return;
+      }
+      synchronized (_executionStateStoreLock) {
+        PersistedExecutionState executionStateToPersist = _executionStateToPersist;
+        if (executionStateToPersist != null && !userTask.equals(executionStateToPersist.userTask())) {
+          _executionStateToPersist = executionStateToPersist.toBuilder().userTask(userTask).build();
+        }
       }
     }
 
@@ -1394,6 +4559,12 @@ public class Executor {
       // retrieve the associated user task information.
       if (_isTriggeredByUserRequest) {
         userTaskInfo = _userTaskManager.markTaskExecutionBegan(_uuid);
+        persistUserTask(userTaskInfo);
+      }
+      QueuedExecution queuedExecution = _queuedExecution;
+      if (queuedExecution != null && queuedExecution.isHandedOff()) {
+        // The queued execution is the one starting now.
+        _queuedExecution = null;
       }
       String reason = _reasonSupplier.get();
       _executorState = ExecutorState.executionStarting(_uuid, reason, _recentlyDemotedBrokers, _recentlyRemovedBrokers, _isTriggeredByUserRequest);
@@ -1420,6 +4591,7 @@ public class Executor {
           _loadMonitor.setSamplingMode(ONGOING_EXECUTION);
           break;
         } catch (IllegalStateException e) {
+          throwIfDetached();
           Thread.sleep(executionProgressCheckIntervalMs());
           LOG.debug("Waiting for the load monitor to be ready to adjust sampling mode.", e);
         }
@@ -1443,6 +4615,16 @@ public class Executor {
         // Ensure that sampling mode is adjusted properly to avoid the loss of partition metric accuracy
         // and enable the collection of broker metric samples during an ongoing execution.
         adjustSamplingModeBeforeExecution();
+
+        if (_clearReplicationThrottlesBeforeExecution) {
+          try {
+            new ReplicationThrottleHelper(_adminClient, null, ReplicationThrottleHelper.RETRIES, Collections.emptySet(),
+                                          _appliedReplicationThrottles)
+                .clearAllThrottles(ExecutionUtils.ongoingPartitionReassignments(_adminClient));
+          } finally {
+            persistRetainedReplicationThrottles();
+          }
+        }
 
         // 1. Inter-broker move replicas if possible.
         if (_executorState.state() == STARTING_EXECUTION) {
@@ -1491,26 +4673,91 @@ public class Executor {
           moveLeaderships();
           updateOngoingExecutionState();
         }
+      } catch (ExecutionDetachedException e) {
+        _detached = true;
       } catch (Throwable t) {
-        LOG.error("User task {}: Executor got exception during execution", _uuid, t);
-        _executionException = t;
+        if (_detachRequested) {
+          // E.g. a request to Kafka failed while the shutdown was detaching the execution: it is detached all the same.
+          LOG.warn("User task {}: Executor got exception while the execution was being detached by the shutdown.", _uuid, t);
+          _detached = true;
+        } else {
+          LOG.error("User task {}: Executor got exception during execution", _uuid, t);
+          _executionException = t;
+        }
       } finally {
-        notifyFinishedTask(userTaskInfo);
+        if (_detached) {
+          leaveExecutionToKafka();
+        } else {
+          finishExecution(userTaskInfo);
+        }
       }
+    }
+
+    /**
+     * Remove the throttles of the execution, which has finished (i.e. completed, stopped, or failed), and report it as finished.
+     *
+     * @param userTaskInfo The task information if the task is triggered from a user request, {@code null} otherwise.
+     */
+    private void finishExecution(UserTaskManager.UserTaskInfo userTaskInfo) {
+      // Remove the replication throttles that the execution could not remove (e.g. upon failure), before the execution
+      // is reported as finished. Throttles of replica movements that Kafka carries on with are removed once they finish.
+      removeLeftoverReplicationThrottles();
+      if (!_appliedReplicationThrottles.isEmpty()) {
+        LOG.warn("User task {}: Retaining the replication throttles of brokers {} and of {} partition movements until the "
+                 + "movements finish and the brokers are available.", _uuid, _appliedReplicationThrottles.brokers(),
+                 _appliedReplicationThrottles.proposals().size());
+      }
+      // Restore the log dir throttles (if any) on all exit paths, before the execution is reported as finished.
+      _logDirThrottleHelper.clearAllThrottles();
+      // What could not be restored is retained, and persisted so that it outlives a restart (Integration PR#15 -> PR#26).
+      _lastAppliedLogDirThrottleByBroker.putAll(_logDirThrottleHelper.appliedThrottleByBroker());
+      persistRetainedReplicationThrottles();
+      notifyFinishedTask(userTaskInfo);
+    }
+
+    /**
+     * Leave the ongoing execution to Kafka, as a shutdown detached it (see {@link #shutdown()}): its in-flight movements and the
+     * throttles they need stay as they are -- they belong to the persisted state of the execution, which the restart recovers -- and
+     * the state is persisted one last time. Neither the user task nor the anomaly detector is told that the execution finished.
+     */
+    private void leaveExecutionToKafka() {
+      // Not swept, nor persisted as retained: the in-flight movements need these throttles, and the restart recovers them with the
+      // execution (resumed: adopted; not resumed: removed once the movements finish or are cancelled).
+      checkpointExecutionState(true);
+      Set<ExecutionTask> inExecutionTasks = inExecutionTasks();
+      String message = String.format("Task [%s] execution is left to Kafka by the Cruise Control shutdown: %d in-flight movement(s) carry "
+                                     + "on with their throttles, and the restart resumes the execution or cleans it up.", _uuid,
+                                     inExecutionTasks.size());
+      LOG.info("{} In-flight movements: {}", message, inExecutionTasks);
+      OPERATION_LOG.info(message);
+      _executorNotifier.sendNotification(message);
     }
 
     private void notifyFinishedTask(UserTaskManager.UserTaskInfo userTaskInfo) {
       // If the finished task was triggered by a user request, update task status in user task manager; if task is triggered
       // by an anomaly self-healing, update the task status in anomaly detector.
       boolean completeWithError = (_executorState.state() == STOPPING_EXECUTION || _executionException != null);
+      QueuedExecution queuedExecution = _queuedExecution;
+      boolean startsQueuedExecution = queuedExecution != null && !completeWithError && !queuedExecution.isCancelled();
+      _startsQueuedExecution = startsQueuedExecution;
+      if (queuedExecution != null && !startsQueuedExecution) {
+        endQueuedExecution(true, "the execution before it did not complete");
+      }
       if (userTaskInfo != null) {
-        _userTaskManager.markTaskExecutionFinished(_uuid, completeWithError);
+        // Also a resumed execution, which the restart reports under the user task that started it (see #recoverUserTask).
+        if (!startsQueuedExecution) {
+          // Otherwise, the user task stays in execution until the queued execution finishes.
+          _userTaskManager.markTaskExecutionFinished(_uuid, completeWithError);
+        }
+      } else if (_isResumedExecution) {
+        // A resumed self-healing execution is not known by the anomaly detector of this Cruise Control instance.
+        LOG.debug("User task {}: The resumed execution finished (with error: {}).", _uuid, completeWithError);
       } else {
         _anomalyDetectorManager.markSelfHealingFinished(_uuid, completeWithError);
       }
 
       String prefix = String.format("Task [%s] %s execution is ", _uuid,
-                                    userTaskInfo != null ? ("user" + userTaskInfo.requestUrl()) : "self-healing");
+                                    _isResumedExecution ? "resumed" : userTaskInfo != null ? ("user" + userTaskInfo.requestUrl()) : "self-healing");
 
       if (_executorState.state() == STOPPING_EXECUTION) {
         notifyExecutionFinished(String.format("%sstopped by %s.", prefix, _executionStoppedByUser.get() ? "user" : "Cruise Control"),
@@ -1519,7 +4766,9 @@ public class Executor {
         notifyExecutionFinished(String.format("%sinterrupted with exception %s.", prefix, _executionException.getMessage()),
                                 true);
       } else {
-        notifyExecutionFinished(String.format("%sfinished.", prefix), false);
+        notifyExecutionFinished(String.format("%sfinished.%s", prefix, startsQueuedExecution
+                                                                      ? String.format(" The queued %s starts next.", queuedExecution.type())
+                                                                      : ""), false);
       }
     }
 
@@ -1535,9 +4784,28 @@ public class Executor {
 
     private void clearCompletedExecution() {
       _executionTaskManager.clear();
-      _uuid = null;
-      _reasonSupplier = null;
-      _executorState = ExecutorState.noTaskInProgress(_recentlyDemotedBrokers, _recentlyRemovedBrokers);
+      if (_detached) {
+        // Shutting down: a queued execution was cancelled, and the persisted state carries it to the restart (if it can be rebuilt).
+        _queuedExecution = null;
+      }
+      // A queued execution is still set only if this execution completed (see #notifyFinishedTask).
+      QueuedExecution queuedExecution = _queuedExecution;
+      if (queuedExecution != null) {
+        // The user task stayed in execution for the queued execution.
+        queuedExecution.handOff(_isTriggeredByUserRequest);
+        if (queuedExecution.isCancelled()) {
+          endQueuedExecution(true, "a stop was requested before it started");
+          queuedExecution = null;
+        } else {
+          // Reserve the executor for the same user task before releasing it below, so no other execution can start in between.
+          reserveForQueuedExecution(queuedExecution, _isTriggeredByUserRequest);
+        }
+      }
+      if (queuedExecution == null) {
+        _uuid = null;
+        _reasonSupplier = null;
+        _executorState = ExecutorState.noTaskInProgress(_recentlyDemotedBrokers, _recentlyRemovedBrokers);
+      }
       _hasOngoingExecution = false;
       _noOngoingExecutionSemaphore.release();
       _stopSignal.set(NO_STOP_EXECUTION);
@@ -1545,6 +4813,10 @@ public class Executor {
       // Ensure that sampling mode is adjusted properly to continue collecting partition metrics after execution.
       _loadMonitor.setSamplingMode(ALL);
       _concurrencyAdjuster.clearAdjustment();
+      _brokersNotToStartMovementsOn = Collections.emptySet();
+      if (queuedExecution != null) {
+        startQueuedExecution(queuedExecution);
+      }
     }
 
     private void updateOngoingExecutionState() {
@@ -1601,50 +4873,165 @@ public class Executor {
                                                            _recentlyRemovedBrokers,
                                                            _isTriggeredByUserRequest);
       }
+      // Persist the progress of the execution (if any).
+      checkpointExecutionStateAtProgressCheck();
+    }
+
+    /**
+     * Create the throttle helper of an execution that was started without a replication throttle while replication throttle
+     * adjustment is enabled: each broker starts at a fraction of its network headroom (see
+     * {@link ExecutorConfig#CONCURRENCY_ADJUSTER_REPLICATION_THROTTLE_INITIAL_HEADROOM_FRACTION_CONFIG}), and brokers whose headroom
+     * is unknown start at that fraction of the maximum replication throttle of the concurrency adjuster, which then adjusts them as
+     * usual -- doubling the throttles that the movements fill until the first sign of stress (slow start).
+     *
+     * @param deadBrokersWithReplicas Dead brokers with replicas.
+     * @return The throttle helper of the execution.
+     */
+    private ReplicationThrottleHelper throttleHelperStartingAtHeadroom(Set<Integer> deadBrokersWithReplicas)
+        throws InterruptedException, ExecutionException, TimeoutException {
+      double headroomFraction = initialReplicationThrottleHeadroomFraction();
+      long defaultThrottle = Math.max(1L, (long) (headroomFraction * maxReplicationThrottle()));
+      // Record its throttles like any other, so they are removed after a stop, failure or shutdown (see #30).
+      ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, defaultThrottle,
+                                                                               ReplicationThrottleHelper.RETRIES,
+                                                                               deadBrokersWithReplicas, _appliedReplicationThrottles);
+      Map<Integer, Long> initialLeaderThrottleByBroker = new TreeMap<>();
+      Map<Integer, Long> initialFollowerThrottleByBroker = new TreeMap<>();
+      try {
+        Set<Integer> brokerIds = _metadataClient.cluster().nodes().stream().map(Node::id).collect(Collectors.toSet());
+        _concurrencyAdjuster.initialReplicationThrottles(brokerIds, headroomFraction, initialLeaderThrottleByBroker,
+                                                         initialFollowerThrottleByBroker);
+      } catch (RuntimeException e) {
+        LOG.warn("Failed to compute the network headroom of brokers; they start at {} bytes/sec.", defaultThrottle, e);
+      }
+      // No broker is throttled yet, so this only sets the rates to apply when the brokers participate in a batch of movements.
+      throttleHelper.updateThrottleRates(initialLeaderThrottleByBroker, initialFollowerThrottleByBroker);
+      LOG.info("User task {}: No replication throttle was requested; the replication throttle adjuster starts brokers at {} of their "
+               + "network headroom (leader: {}, follower: {} bytes/sec), and the others at {} bytes/sec.", _uuid, headroomFraction,
+               initialLeaderThrottleByBroker, initialFollowerThrottleByBroker, defaultThrottle);
+      return throttleHelper;
+    }
+
+    /**
+     * A resumed execution continues from the replication throttles that the concurrency adjuster had set on each broker before the
+     * restart (as of the last checkpoint), rather than from the start -- which right after a restart, before any broker metrics are
+     * sampled, is the initial fraction of the maximum replication throttle on every broker. No broker is throttled yet, so this only
+     * sets the rates to apply when the brokers participate in a batch of movements.
+     *
+     * @param throttleHelper The throttle helper of the inter-broker replica movements.
+     */
+    private void maybeRestoreAdjustedReplicationThrottles(ReplicationThrottleHelper throttleHelper)
+        throws InterruptedException, ExecutionException, TimeoutException {
+      PersistedAdjusterState adjusterState = _resumedAdjusterState;
+      if (adjusterState == null || !_replicationThrottleAdjusterEnabled || !throttleHelper.throttlingEnabled()
+          || (adjusterState.leaderThrottleByBroker().isEmpty() && adjusterState.followerThrottleByBroker().isEmpty())) {
+        return;
+      }
+      throttleHelper.updateThrottleRates(adjusterState.leaderThrottleByBroker(), adjusterState.followerThrottleByBroker());
+      LOG.info("User task {}: Resumed execution continues from the replication throttles the concurrency adjuster set before the restart "
+               + "(leader: {}, follower: {} bytes/sec).", _uuid, adjusterState.leaderThrottleByBroker(),
+               adjusterState.followerThrottleByBroker());
     }
 
     private void interBrokerMoveReplicas() throws InterruptedException, ExecutionException, TimeoutException {
+      _partitionWriteRateCache.reset();
       Set<Integer> currentDeadBrokersWithReplicas = _loadMonitor.deadBrokersWithReplicas(MAX_METADATA_WAIT_MS);
-      ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(_adminClient, _replicationThrottle,
-          currentDeadBrokersWithReplicas);
-      int numTotalPartitionMovements = _executionTaskManager.numRemainingInterBrokerPartitionMovements();
-      long totalDataToMoveInMB = _executionTaskManager.remainingInterBrokerDataToMoveInMB();
-      long startTime = System.currentTimeMillis();
-      LOG.info("User task {}: Starting {} inter-broker partition movements.", _uuid, numTotalPartitionMovements);
-
-      int partitionsToMove = numTotalPartitionMovements;
-      // Exhaust all the pending partition movements.
-      while ((partitionsToMove > 0 || !inExecutionTasks().isEmpty()) && _stopSignal.get() == NO_STOP_EXECUTION) {
-        // Get tasks to execute.
-        List<ExecutionTask> tasksToExecute = _executionTaskManager.getInterBrokerReplicaMovementTasks();
-        LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
-
-        AlterPartitionReassignmentsResult result = null;
-        if (!tasksToExecute.isEmpty()) {
-          throttleHelper.setThrottles(tasksToExecute.stream().map(ExecutionTask::proposal).collect(Collectors.toList()));
-          // Execute the tasks.
-          _executionTaskManager.markTasksInProgress(tasksToExecute);
-          result = ExecutionUtils.submitReplicaReassignmentTasks(_adminClient, tasksToExecute);
+      ReplicationThrottleHelper throttleHelper;
+      if (_replicationThrottle == null && _replicationThrottleAdjusterEnabled) {
+        throttleHelper = throttleHelperStartingAtHeadroom(currentDeadBrokersWithReplicas);
+      } else {
+        throttleHelper = new ReplicationThrottleHelper(_adminClient, _replicationThrottle, ReplicationThrottleHelper.RETRIES,
+                                                       currentDeadBrokersWithReplicas, _appliedReplicationThrottles);
+      }
+      maybeRestoreAdjustedReplicationThrottles(throttleHelper);
+      _replicationThrottleHelper = throttleHelper;
+      try {
+        interBrokerMoveReplicas(throttleHelper);
+      } finally {
+        if (_detachRequested) {
+          // The throttles the concurrency adjuster set are persisted with the execution while the helper still has them.
+          checkpointExecutionState(true);
         }
-        // Wait indefinitely for partition movements to finish.
-        List<ExecutionTask> completedTasks = waitForInterBrokerReplicaTasksToFinish(result);
-        partitionsToMove = _executionTaskManager.numRemainingInterBrokerPartitionMovements();
-        int numFinishedPartitionMovements = _executionTaskManager.numFinishedInterBrokerPartitionMovements();
-        long finishedDataMovementInMB = _executionTaskManager.finishedInterBrokerDataMovementInMB();
-        updatePartitionMovementMetrics(numFinishedPartitionMovements, finishedDataMovementInMB, System.currentTimeMillis() - startTime);
-        LOG.info("User task {}: {}/{} ({}%) inter-broker partition movements completed. {}/{} ({}%) MB have been moved.",
-                 _uuid,
-                 numFinishedPartitionMovements, numTotalPartitionMovements,
-                 String.format("%.2f", numFinishedPartitionMovements * UNIT_INTERVAL_TO_PERCENTAGE / numTotalPartitionMovements),
-                 finishedDataMovementInMB, totalDataToMoveInMB,
-                 totalDataToMoveInMB == 0 ? 100 : String.format("%.2f", finishedDataMovementInMB * UNIT_INTERVAL_TO_PERCENTAGE
-                                                                        / totalDataToMoveInMB));
-        List<ExecutionTask> inProgressTasks = tasksToExecute.stream()
-            .filter(t -> t.state() == ExecutionTaskState.IN_PROGRESS)
-            .collect(Collectors.toList());
-        inProgressTasks.addAll(inExecutionTasks());
+        // Under the lock of the helper, which the concurrency adjuster holds while it updates throttle rates: once the helper is
+        // unset, no update is in flight, and the adjuster re-checks it before updating -- so it cannot set a throttle again that
+        // the end-of-execution sweep (another helper, see #removeLeftoverReplicationThrottles) removes or has removed.
+        synchronized (throttleHelper) {
+          _replicationThrottleHelper = null;
+        }
+      }
+    }
 
-        throttleHelper.clearThrottles(completedTasks, inProgressTasks);
+    private void interBrokerMoveReplicas(ReplicationThrottleHelper throttleHelper)
+        throws InterruptedException, ExecutionException, TimeoutException {
+      // Expose the throttle helper to support dynamically updating the replication throttle of the ongoing execution.
+      _ongoingExecutionThrottleHelper = throttleHelper;
+      // Tasks that are already in execution at this point have been adopted from an execution interrupted by a restart.
+      List<ExecutionProposal> adoptedProposals = _executionTaskManager.inExecutionTasks(Collections.singleton(INTER_BROKER_REPLICA_ACTION))
+                                                                      .stream().map(ExecutionTask::proposal).collect(Collectors.toList());
+      int numTotalPartitionMovements = _executionTaskManager.numRemainingInterBrokerPartitionMovements() + adoptedProposals.size();
+      long totalDataToMoveInMB = _executionTaskManager.remainingInterBrokerDataToMoveInMB();
+      _replicaMovementStartTimeMs = System.currentTimeMillis();
+      LOG.info("User task {}: Starting {} inter-broker partition movements.", _uuid, numTotalPartitionMovements);
+      logInterBrokerReplicaMovementSkew(numTotalPartitionMovements);
+      // Check the data movement progress as soon as the first partition movements are in progress.
+      _dataMovementProgressCheckScheduler.reset();
+
+      try {
+        if (!adoptedProposals.isEmpty()) {
+          LOG.info("User task {}: Monitoring {} adopted inter-broker partition movements.", _uuid, adoptedProposals.size());
+          throttleHelper.setThrottles(adoptedProposals);
+        }
+        int partitionsToMove = numTotalPartitionMovements;
+        // Exhaust all the pending partition movements. Once the execution is stopped, keep going until the in-progress partition
+        // movements are rolled back, which also removes their throttles.
+        while ((partitionsToMove > 0 && _stopSignal.get() == NO_STOP_EXECUTION) || !inExecutionTasksOfType(INTER_BROKER_REPLICA_ACTION).isEmpty()) {
+          throwIfDetached();
+          // Get tasks to execute.
+          List<ExecutionTask> tasksToExecute = _stopSignal.get() == NO_STOP_EXECUTION
+                                               ? _executionTaskManager.getInterBrokerReplicaMovementTasks(replicationThrottleBudget(),
+                                                                                                          brokersNotToStartMovementsOn(),
+                                                                                                          canStartReplicaMovement(
+                                                                                                              INTER_BROKER_REPLICA_ACTION))
+                                               : Collections.emptyList();
+          LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
+
+          AlterPartitionReassignmentsResult result = null;
+          if (!tasksToExecute.isEmpty()) {
+            maybePinLogDirsOfReplicasToAdd(tasksToExecute);
+            // Hold the lock of the throttle helper until the tasks are marked in progress, so that a concurrent update of the
+            // replication throttle either takes effect before their throttles are set or applies to them as in-progress tasks.
+            synchronized (throttleHelper) {
+              throttleHelper.setThrottles(tasksToExecute.stream().map(ExecutionTask::proposal).collect(Collectors.toList()));
+              // Execute the tasks.
+              _executionTaskManager.markTasksInProgress(tasksToExecute);
+            }
+            // Persist the tasks as in progress before submitting them, so that the persisted state is aware of all tasks
+            // submitted to Kafka.
+            checkpointExecutionState();
+            result = ExecutionUtils.submitReplicaReassignmentTasks(_adminClient, tasksToExecute);
+          }
+          // Wait indefinitely for partition movements to finish.
+          List<ExecutionTask> completedTasks = waitForInterBrokerReplicaTasksToFinish(result);
+          partitionsToMove = _executionTaskManager.numRemainingInterBrokerPartitionMovements();
+          int numFinishedPartitionMovements = _executionTaskManager.numFinishedInterBrokerPartitionMovements();
+          long finishedDataMovementInMB = _executionTaskManager.finishedInterBrokerDataMovementInMB();
+          updatePartitionMovementMetrics(INTER_BROKER_REPLICA_ACTION);
+          LOG.info("User task {}: {}/{} ({}%) inter-broker partition movements completed. {}/{} ({}%) MB have been moved.",
+                   _uuid,
+                   numFinishedPartitionMovements, numTotalPartitionMovements,
+                   String.format("%.2f", numFinishedPartitionMovements * UNIT_INTERVAL_TO_PERCENTAGE / numTotalPartitionMovements),
+                   finishedDataMovementInMB, totalDataToMoveInMB,
+                   totalDataToMoveInMB == 0 ? 100 : String.format("%.2f", finishedDataMovementInMB * UNIT_INTERVAL_TO_PERCENTAGE
+                                                                          / totalDataToMoveInMB));
+          List<ExecutionTask> inProgressTasks = tasksToExecute.stream()
+              .filter(t -> t.state() == ExecutionTaskState.IN_PROGRESS)
+              .collect(Collectors.toList());
+          inProgressTasks.addAll(inExecutionTasksOfType(INTER_BROKER_REPLICA_ACTION));
+
+          throttleHelper.clearThrottles(completedTasks, inProgressTasks);
+        }
+      } finally {
+        _ongoingExecutionThrottleHelper = null;
       }
 
       // Currently, _executionProgressCheckIntervalMs is only runtime adjusted for inter broker move tasks, not
@@ -1652,7 +5039,8 @@ public class Executor {
       // have it been safely used in following leadership move tasks.
       resetExecutionProgressCheckIntervalMs();
 
-      // At this point it is guaranteed that there are no in execution tasks to wait -- i.e. all tasks are completed or dead.
+      // At this point it is guaranteed that there are no in execution inter-broker tasks to wait -- i.e. all of them are completed
+      // or dead.
       if (_stopSignal.get() == NO_STOP_EXECUTION) {
         LOG.info("User task {}: Inter-broker partition movements finished", _uuid);
       } else {
@@ -1675,48 +5063,118 @@ public class Executor {
       }
     }
 
-    private void intraBrokerMoveReplicas() {
-      int numTotalPartitionMovements = _executionTaskManager.numRemainingIntraBrokerPartitionMovements();
-      long totalDataToMoveInMB = _executionTaskManager.remainingIntraBrokerDataToMoveInMB();
-      long startTime = System.currentTimeMillis();
-      LOG.info("User task {}: Starting {} intra-broker partition movements.", _uuid, numTotalPartitionMovements);
-
-      int partitionsToMove = numTotalPartitionMovements;
-      // Exhaust all the pending partition movements.
-      while ((partitionsToMove > 0 || !inExecutionTasks().isEmpty()) && _stopSignal.get() == NO_STOP_EXECUTION) {
-        // Get tasks to execute.
-        List<ExecutionTask> tasksToExecute = _executionTaskManager.getIntraBrokerReplicaMovementTasks();
-        LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
-
-        if (!tasksToExecute.isEmpty()) {
-          // Execute the tasks.
-          _executionTaskManager.markTasksInProgress(tasksToExecute);
-          executeIntraBrokerReplicaMovements(tasksToExecute, _adminClient, _executionTaskManager, _config);
-        }
-        // Wait indefinitely for partition movements to finish.
-        waitForIntraBrokerReplicaTasksToFinish();
-        partitionsToMove = _executionTaskManager.numRemainingIntraBrokerPartitionMovements();
-        int numFinishedPartitionMovements = _executionTaskManager.numFinishedIntraBrokerPartitionMovements();
-        long finishedDataToMoveInMB = _executionTaskManager.finishedIntraBrokerDataToMoveInMB();
-        updatePartitionMovementMetrics(numFinishedPartitionMovements, finishedDataToMoveInMB, System.currentTimeMillis() - startTime);
-        LOG.info("User task {}: {}/{} ({}%) intra-broker partition movements completed. {}/{} ({}%) MB have been moved.",
-                 _uuid,
-                 numFinishedPartitionMovements, numTotalPartitionMovements,
-                 String.format("%.2f", numFinishedPartitionMovements * UNIT_INTERVAL_TO_PERCENTAGE / numTotalPartitionMovements),
-                 finishedDataToMoveInMB, totalDataToMoveInMB,
-                 totalDataToMoveInMB == 0 ? 100 : String.format("%.2f", finishedDataToMoveInMB * UNIT_INTERVAL_TO_PERCENTAGE
-                                                                        / totalDataToMoveInMB));
+    /**
+     * If the replica movements on each logdir are limited, count the movements in progress on each logdir involved in the
+     * remaining movements of the given type, and return a check that admits a movement only if its logdirs are under the limit.
+     *
+     * @param type The type of replica movements to start.
+     * @return Whether a replica movement can start.
+     */
+    private Predicate<ExecutionTask> canStartReplicaMovement(ExecutionTask.TaskType type) {
+      if (_logDirMovementLimit == null) {
+        return task -> true;
       }
+      Set<ExecutionTask> remainingTasks = type == INTER_BROKER_REPLICA_ACTION ? _executionTaskManager.remainingInterBrokerReplicaMovements()
+                                                                              : _executionTaskManager.remainingIntraBrokerReplicaMovements();
+      if (remainingTasks.isEmpty()) {
+        return task -> true;
+      }
+      Cluster cluster = _metadataClient.cluster();
       Set<ExecutionTask> inExecutionTasks = inExecutionTasks();
-      while (!inExecutionTasks.isEmpty()) {
-        LOG.info("User task {}: Waiting for {} tasks moving {} MB to finish", _uuid, inExecutionTasks.size(),
-                 _executionTaskManager.inExecutionIntraBrokerDataMovementInMB());
-        waitForIntraBrokerReplicaTasksToFinish();
-        inExecutionTasks = inExecutionTasks();
+      Set<ExecutionTask> involvedTasks = new HashSet<>(remainingTasks);
+      involvedTasks.addAll(inExecutionTasks);
+      _logDirMovementLimit.refresh(cluster, inExecutionTasks, LogDirMovementLimit.brokersInvolved(involvedTasks, cluster));
+      LOG.debug("User task {}: Partition movements by logdir by broker: {}.", _uuid, _logDirMovementLimit.numMovementsByLogDirByBroker());
+      return _logDirMovementLimit::tryReserve;
+    }
+
+    /**
+     * If the replica movements on each logdir are limited, request the destination brokers of the given inter-broker replica
+     * movements to create the replicas to add in the logdirs picked for them.
+     *
+     * @param tasks Inter-broker replica movement tasks about to start.
+     */
+    private void maybePinLogDirsOfReplicasToAdd(List<ExecutionTask> tasks) {
+      if (_logDirMovementLimit == null) {
+        return;
       }
-      if (inExecutionTasks().isEmpty()) {
+      Map<TopicPartitionReplica, String> pickedLogDirs = _logDirMovementLimit.pickedLogDirs(tasks);
+      Set<TopicPartitionReplica> pinnedReplicas = pinLogdirsOfReplicasToAdd(pickedLogDirs, _adminClient, _config);
+      for (TopicPartitionReplica replica : pickedLogDirs.keySet()) {
+        if (!pinnedReplicas.contains(replica)) {
+          _logDirMovementLimit.forgetPickedLogDir(replica);
+        }
+      }
+    }
+
+    /**
+     * Each phase of the execution monitors only the tasks of its own type: an execution resumed after a restart starts with the
+     * adopted tasks of every type in execution, and the progress check of one type does not tell whether a task of another type
+     * is done.
+     *
+     * @param type The type of the tasks.
+     * @return The tasks of the given type that are {@link ExecutionTaskState#IN_PROGRESS} or {@link ExecutionTaskState#ABORTING}.
+     */
+    private Set<ExecutionTask> inExecutionTasksOfType(ExecutionTask.TaskType type) {
+      return _executionTaskManager.inExecutionTasks(Collections.singleton(type));
+    }
+
+    private void intraBrokerMoveReplicas() {
+      // Tasks that are already in execution at this point have been adopted from an execution interrupted by a restart.
+      int numTotalPartitionMovements = _executionTaskManager.numRemainingIntraBrokerPartitionMovements()
+                                       + _executionTaskManager.inExecutionTasks(Collections.singleton(INTRA_BROKER_REPLICA_ACTION)).size();
+      long totalDataToMoveInMB = _executionTaskManager.remainingIntraBrokerDataToMoveInMB();
+      _replicaMovementStartTimeMs = System.currentTimeMillis();
+      LOG.info("User task {}: Starting {} intra-broker partition movements.", _uuid, numTotalPartitionMovements);
+      // Expose the log dir throttle helper to support dynamically updating the log dir throttle of the ongoing execution.
+      _ongoingExecutionLogDirThrottleHelper = _logDirThrottleHelper;
+      // Check the data movement progress as soon as the first partition movements are in progress.
+      _dataMovementProgressCheckScheduler.reset();
+
+      try {
+        int partitionsToMove = numTotalPartitionMovements;
+        // Exhaust all the pending partition movements.
+        while ((partitionsToMove > 0 || !inExecutionTasksOfType(INTRA_BROKER_REPLICA_ACTION).isEmpty()) && _stopSignal.get() == NO_STOP_EXECUTION) {
+          throwIfDetached();
+          // Get tasks to execute.
+          List<ExecutionTask> tasksToExecute =
+              _executionTaskManager.getIntraBrokerReplicaMovementTasks(canStartReplicaMovement(INTRA_BROKER_REPLICA_ACTION));
+          LOG.info("User task {}: Executor will execute {} task(s)", _uuid, tasksToExecute.size());
+
+          if (!tasksToExecute.isEmpty()) {
+            _logDirThrottleHelper.setThrottles(tasksToExecute);
+            // Execute the tasks -- persist them as in progress before submitting them.
+            _executionTaskManager.markTasksInProgress(tasksToExecute);
+            checkpointExecutionState();
+            executeIntraBrokerReplicaMovements(tasksToExecute, _adminClient, _executionTaskManager, _config);
+          }
+          // Wait indefinitely for partition movements to finish.
+          waitForIntraBrokerReplicaTasksToFinish();
+          partitionsToMove = _executionTaskManager.numRemainingIntraBrokerPartitionMovements();
+          int numFinishedPartitionMovements = _executionTaskManager.numFinishedIntraBrokerPartitionMovements();
+          long finishedDataToMoveInMB = _executionTaskManager.finishedIntraBrokerDataToMoveInMB();
+          updatePartitionMovementMetrics(INTRA_BROKER_REPLICA_ACTION);
+          LOG.info("User task {}: {}/{} ({}%) intra-broker partition movements completed. {}/{} ({}%) MB have been moved.",
+                   _uuid,
+                   numFinishedPartitionMovements, numTotalPartitionMovements,
+                   String.format("%.2f", numFinishedPartitionMovements * UNIT_INTERVAL_TO_PERCENTAGE / numTotalPartitionMovements),
+                   finishedDataToMoveInMB, totalDataToMoveInMB,
+                   totalDataToMoveInMB == 0 ? 100 : String.format("%.2f", finishedDataToMoveInMB * UNIT_INTERVAL_TO_PERCENTAGE
+                                                                          / totalDataToMoveInMB));
+        }
+        Set<ExecutionTask> inExecutionTasks = inExecutionTasksOfType(INTRA_BROKER_REPLICA_ACTION);
+        while (!inExecutionTasks.isEmpty()) {
+          LOG.info("User task {}: Waiting for {} tasks moving {} MB to finish", _uuid, inExecutionTasks.size(),
+                   _executionTaskManager.inExecutionIntraBrokerDataMovementInMB());
+          waitForIntraBrokerReplicaTasksToFinish();
+          inExecutionTasks = inExecutionTasksOfType(INTRA_BROKER_REPLICA_ACTION);
+        }
+      } finally {
+        _ongoingExecutionLogDirThrottleHelper = null;
+      }
+      if (_stopSignal.get() == NO_STOP_EXECUTION) {
         LOG.info("User task {}: Intra-broker partition movements finished.", _uuid);
-      } else if (_stopSignal.get() != NO_STOP_EXECUTION) {
+      } else {
         ExecutionTasksSummary executionTasksSummary = _executionTaskManager.getExecutionTasksSummary(Collections.emptySet());
         Map<ExecutionTaskState, Integer> partitionMovementTasksByState = executionTasksSummary.taskStat().get(INTRA_BROKER_REPLICA_ACTION);
         LOG.info("User task {}: Intra-broker partition movements stopped. For intra-broker partition movements {} tasks cancelled, "
@@ -1736,6 +5194,83 @@ public class Executor {
     }
 
     /**
+     * Get the replication throttle budget of brokers based on the inter-broker replica movements in progress and the current
+     * write rate of partitions, which is used if the replica movement strategy contains
+     * ThrottleAwareReplicaMovementStrategy. Each broker side is budgeted at its current replication throttle (which the admin
+     * endpoint and the concurrency adjuster may change during the execution). While replication throttle adjustment is enabled, each
+     * movement is charged the throttle that the adjuster gives it, and the in-progress movements the throttle the adjuster keeps for
+     * them -- see {@link ConcurrencyAdjuster#admissionInputs(Map, Map, Map)}; otherwise, each movement is charged the write rate of
+     * its partition with {@link ExecutorConfig#REPLICA_MOVEMENT_THROTTLE_WRITE_RATE_MARGIN_CONFIG}.
+     *
+     * @return The replication throttle budget of brokers, or {@code null} if the execution has no replication throttle (and
+     * replication throttle adjustment is disabled) or its replica movement strategy is not throttle-aware.
+     */
+    private ReplicationThrottleBudget replicationThrottleBudget() {
+      if (!_executionTaskManager.isThrottleAware()) {
+        return null;
+      }
+      Cluster cluster = _metadataClient.cluster();
+      ReplicationThrottleHelper throttleHelper = _replicationThrottleHelper;
+      if (_replicationThrottleAdjusterEnabled && throttleHelper != null && throttleHelper.throttlingEnabled()) {
+        // Admit movements against the live throttle of each broker: the adjuster starts it at a fraction of the network headroom, and
+        // raises it only while the movements through it fill it. Charge each movement the need the adjuster will give it, and reserve
+        // the need of the in-progress movements, which the adjuster keeps as a floor.
+        Map<TopicPartition, Double> neededThrottleByPartition = new HashMap<>();
+        Map<Integer, Long> neededLeaderThrottleByBroker = new HashMap<>();
+        Map<Integer, Long> neededFollowerThrottleByBroker = new HashMap<>();
+        _concurrencyAdjuster.admissionInputs(neededThrottleByPartition, neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+        ReplicationThrottleBudget budget = new ReplicationThrottleBudget(Collections.emptyList(), neededThrottleByPartition,
+                                                                         task -> currentLeader(cluster, task),
+                                                                         throttleHelper::leaderThrottleRate,
+                                                                         throttleHelper::followerThrottleRate, 0.0);
+        budget.reserve(neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+        LOG.debug("Admitting inter-broker replica movements against the replication throttles of brokers, with the in-progress "
+                  + "movements needing (leader: {}, follower: {} bytes/sec).", neededLeaderThrottleByBroker, neededFollowerThrottleByBroker);
+        return budget;
+      }
+      // Budget at the live rates of the helper, read at every planning call: the replication throttle of the ongoing execution may
+      // be changed or removed meanwhile (admin?replication_throttle), and the adjuster, if turned off during the execution, leaves
+      // its last rate on each broker. Unsynchronized reads, so planning does not wait for an update that holds the helper's lock.
+      if (throttleHelper == null ? _replicationThrottle == null : !throttleHelper.throttlingEnabled()) {
+        return null;
+      }
+      Function<Integer, Long> leaderThrottleByBrokerId = throttleHelper == null ? brokerId -> _replicationThrottle
+                                                                                : throttleHelper::leaderThrottleRate;
+      Function<Integer, Long> followerThrottleByBrokerId = throttleHelper == null ? brokerId -> _replicationThrottle
+                                                                                  : throttleHelper::followerThrottleRate;
+      return new ReplicationThrottleBudget(_executionTaskManager.inExecutionTasks(Collections.singleton(INTER_BROKER_REPLICA_ACTION)),
+                                           _partitionWriteRateCache.writeRatesInBytesPerSec(), task -> currentLeader(cluster, task),
+                                           leaderThrottleByBrokerId, followerThrottleByBrokerId, _replicaMovementThrottleWriteRateMargin);
+    }
+
+    /**
+     * @param cluster The cluster metadata.
+     * @param task Inter-broker replica movement task.
+     * @return The current leader of the partition of the given task, or {@code null} if unknown.
+     */
+    private Integer currentLeader(Cluster cluster, ExecutionTask task) {
+      Node leader = cluster.leaderFor(task.proposal().topicPartition());
+      return leader != null ? leader.id() : null;
+    }
+
+    /**
+     * Log the number of inter-broker partition movements by broker and the share of the most involved broker, which indicates
+     * whether a single broker may become the bottleneck of the execution.
+     *
+     * @param numTotalPartitionMovements Total number of inter-broker partition movements.
+     */
+    private void logInterBrokerReplicaMovementSkew(int numTotalPartitionMovements) {
+      Map<Integer, Integer> numMovementsByBrokerId = _executionTaskManager.numRemainingInterBrokerReplicaMovementsByBrokerId();
+      if (numMovementsByBrokerId.isEmpty() || numTotalPartitionMovements == 0) {
+        return;
+      }
+      Map.Entry<Integer, Integer> mostInvolvedBroker = numMovementsByBrokerId.entrySet().iterator().next();
+      LOG.info("User task {}: Inter-broker partition movements by broker: {}. The most involved broker {} is involved in {} of {} "
+               + "movements ({}%).", _uuid, numMovementsByBrokerId, mostInvolvedBroker.getKey(), mostInvolvedBroker.getValue(),
+               numTotalPartitionMovements, String.format("%.1f", 100.0 * mostInvolvedBroker.getValue() / numTotalPartitionMovements));
+    }
+
+    /**
      * Executes leadership movement tasks.
      */
     private void moveLeaderships() {
@@ -1743,12 +5278,13 @@ public class Executor {
       LOG.info("User task {}: Starting {} leadership movements.", _uuid, numTotalLeadershipMovements);
       int numFinishedLeadershipMovements = 0;
       while (_executionTaskManager.numRemainingLeadershipMovements() != 0 && _stopSignal.get() == NO_STOP_EXECUTION) {
+        throwIfDetached();
         updateOngoingExecutionState();
         numFinishedLeadershipMovements += moveLeadershipInBatch();
         LOG.info("User task {}: {}/{} ({}%) leadership movements completed.", _uuid, numFinishedLeadershipMovements,
                  numTotalLeadershipMovements, numFinishedLeadershipMovements * 100 / numTotalLeadershipMovements);
       }
-      if (inExecutionTasks().isEmpty()) {
+      if (inExecutionTasksOfType(LEADER_ACTION).isEmpty()) {
         LOG.info("Leadership movements finished.");
       } else if (_stopSignal.get() != NO_STOP_EXECUTION) {
         Map<ExecutionTaskState, Integer> leadershipMovementTasksByState =
@@ -1771,12 +5307,13 @@ public class Executor {
       LOG.debug("Executing {} leadership movements in a batch.", numLeadershipToMove);
       // Execute the leadership movements.
       if (!leadershipMovementTasks.isEmpty() && _stopSignal.get() == NO_STOP_EXECUTION) {
-        // Mark leadership movements in progress.
+        // Mark leadership movements in progress -- persist them as in progress before submitting them.
         _executionTaskManager.markTasksInProgress(leadershipMovementTasks);
+        checkpointExecutionState();
 
         ElectLeadersResult electLeadersResult = ExecutionUtils.submitPreferredLeaderElection(_adminClient, leadershipMovementTasks);
         LOG.trace("Waiting for leadership movement batch to finish.");
-        while (!inExecutionTasks().isEmpty() && _stopSignal.get() == NO_STOP_EXECUTION) {
+        while (!inExecutionTasksOfType(LEADER_ACTION).isEmpty() && _stopSignal.get() == NO_STOP_EXECUTION) {
           waitForLeadershipTasksToFinish(electLeadersResult);
         }
       }
@@ -1791,14 +5328,22 @@ public class Executor {
      */
     private Cluster getClusterForExecutionProgressCheck() {
       try {
-        Thread.sleep(executionProgressCheckIntervalMs());
+        // A shutdown that detaches the execution wakes this up, so it does not wait for a whole interval.
+        synchronized (_progressCheckWaitLock) {
+          if (!_detachRequested) {
+            _progressCheckWaitLock.wait(executionProgressCheckIntervalMs());
+          }
+        }
       } catch (InterruptedException e) {
         // let it go
       }
+      throwIfDetached();
       if (LOG.isDebugEnabled()) {
         LOG.debug("Tasks in execution: {}", inExecutionTasks());
       }
-      return _metadataClient.cluster();
+      Cluster cluster = _metadataClient.cluster();
+      _latestClusterOfExecution = cluster;
+      return cluster;
     }
 
     /**
@@ -1831,7 +5376,7 @@ public class Executor {
         List<ExecutionTask> deadInterBrokerReplicaTasks = new ArrayList<>();
         List<ExecutionTask> stoppedInterBrokerReplicaTasks = new ArrayList<>();
         List<ExecutionTask> slowTasksToReport = new ArrayList<>();
-        final int numInExecutionTasks = inExecutionTasks().size();
+        final int numInExecutionTasks = inExecutionTasksOfType(INTER_BROKER_REPLICA_ACTION).size();
         // numFinishedOrDeletedTasks instead of finishedTasks.size() is used to decide whether to dynamically adjust
         // executionProgressCheckIntervalMs.
         // If the task is completed or the related topic is deleted, numFinishedOrDeletedTasks is increased.
@@ -1839,7 +5384,7 @@ public class Executor {
         // to speed up inter broker replica move with new broker being down.
         int numFinishedOrDeletedTasks = 0;
         boolean shouldReportSlowTasks = _time.milliseconds() - _lastSlowTaskReportingTimeMs > _slowTaskAlertingBackoffTimeMs;
-        for (ExecutionTask task : inExecutionTasks()) {
+        for (ExecutionTask task : inExecutionTasksOfType(INTER_BROKER_REPLICA_ACTION)) {
           TopicPartition tp = task.proposal().topicPartition();
           if (_stopSignal.get() != NO_STOP_EXECUTION) {
             // If the execution is stopped during an ongoing inter-broker replica reassignment, the
@@ -1858,9 +5403,10 @@ public class Executor {
             handleProgressWithCompletion(task, finishedTasks);
           } else {
             if (shouldReportSlowTasks) {
-              task.maybeReportExecutionTooSlow(_time.milliseconds(), slowTasksToReport);
+              task.maybeReportExecutionTooSlow(_time.milliseconds(), _taskExecutionAlertingThresholdMs,
+                                               _interBrokerReplicaMovementRateAlertingThreshold, slowTasksToReport);
             }
-            if (maybeMarkTaskAsDead(cluster, null, task, deadUponSubmission)) {
+            if (maybeMarkTaskAsDead(cluster, null, null, task, deadUponSubmission)) {
               deadTaskIds.add(task.executionId());
               // Add dead inter-broker replica tasks for handling.
               deadInterBrokerReplicaTasks.add(task);
@@ -1878,11 +5424,12 @@ public class Executor {
           setExecutionProgressCheckIntervalMs(_executionProgressCheckIntervalMs + EXECUTION_PROGRESS_CHECK_INTERVAL_ADJUSTING_MS);
         }
 
+        maybeUpdateDataMovementProgress(cluster, INTER_BROKER_REPLICA_ACTION);
         sendSlowExecutionAlert(slowTasksToReport);
         handleDeadInterBrokerReplicaTasks(deadInterBrokerReplicaTasks, stoppedInterBrokerReplicaTasks);
         updateOngoingExecutionState();
 
-        retry = !inExecutionTasks().isEmpty() && finishedTasks.isEmpty();
+        retry = !inExecutionTasksOfType(INTER_BROKER_REPLICA_ACTION).isEmpty() && finishedTasks.isEmpty();
         // If there is no finished tasks, we need to check if anything is blocked.
         if (retry) {
           maybeReexecuteInterBrokerReplicaTasks(deletedUponSubmission, deadUponSubmission);
@@ -1932,7 +5479,7 @@ public class Executor {
 
         List<ExecutionTask> slowTasksToReport = new ArrayList<>();
         boolean shouldReportSlowTasks = _time.milliseconds() - _lastSlowTaskReportingTimeMs > _slowTaskAlertingBackoffTimeMs;
-        for (ExecutionTask task : inExecutionTasks()) {
+        for (ExecutionTask task : inExecutionTasksOfType(LEADER_ACTION)) {
           TopicPartition tp = task.proposal().topicPartition();
           if (_stopSignal.get() != NO_STOP_EXECUTION) {
             // If the execution is stopped, the executor will mark all in progress tasks as dead
@@ -1948,7 +5495,7 @@ public class Executor {
             if (shouldReportSlowTasks) {
               task.maybeReportExecutionTooSlow(_time.milliseconds(), slowTasksToReport);
             }
-            if (maybeMarkTaskAsDead(cluster, null, task, null)) {
+            if (maybeMarkTaskAsDead(cluster, null, null, task, null)) {
               deadTaskIds.add(task.executionId());
               finishedTasks.add(task);
             }
@@ -1957,7 +5504,7 @@ public class Executor {
         sendSlowExecutionAlert(slowTasksToReport);
         updateOngoingExecutionState();
 
-        retry = !inExecutionTasks().isEmpty() && finishedTasks.isEmpty();
+        retry = !inExecutionTasksOfType(LEADER_ACTION).isEmpty() && finishedTasks.isEmpty();
         // If there is no finished tasks, we need to check if anything is blocked.
         if (retry) {
           maybeReexecuteLeadershipTasks(deletedUponSubmission);
@@ -1975,41 +5522,107 @@ public class Executor {
      */
     private void waitForIntraBrokerReplicaTasksToFinish() {
       List<ExecutionTask> finishedTasks = new ArrayList<>();
+      Set<Long> stoppedTaskIds = new HashSet<>();
       Set<Long> deletedTaskIds = new HashSet<>();
       Set<Long> deadTaskIds = new HashSet<>();
       do {
-        // If there is no finished tasks, we need to check if anything is blocked.
-        maybeReexecuteIntraBrokerReplicaTasks();
+        // If there is no finished tasks, we need to check if anything is blocked -- unless the execution is being stopped.
+        if (_stopSignal.get() == NO_STOP_EXECUTION) {
+          maybeReexecuteIntraBrokerReplicaTasks();
+        }
         Cluster cluster = getClusterForExecutionProgressCheck();
+        // A task whose broker does not respond in time keeps its state -- e.g. upon a lost connection, the movement may well be
+        // ongoing -- so it holds on to its concurrency slot and is checked again in the next progress check.
+        Set<ExecutionTask> tasksWithoutLogdirResponse = new HashSet<>();
         Map<ExecutionTask, ReplicaLogDirInfo> logDirInfoByTask = getLogdirInfoForExecutionTask(
             _executionTaskManager.inExecutionTasks(Collections.singleton(INTRA_BROKER_REPLICA_ACTION)),
-            _adminClient, _config);
+            _adminClient, _config, tasksWithoutLogdirResponse);
+        boolean waitForLogdirResponseUponStop = false;
+        if (_stopSignal.get() != NO_STOP_EXECUTION) {
+          waitForLogdirResponseUponStop = _numIntraBrokerProgressChecksUponStop < MAX_PROGRESS_CHECKS_TO_WAIT_FOR_LOGDIR_RESPONSE_UPON_STOP;
+          _numIntraBrokerProgressChecksUponStop++;
+        }
 
+        List<ExecutionTask> stoppedIntraBrokerReplicaTasks = new ArrayList<>();
         List<ExecutionTask> slowTasksToReport = new ArrayList<>();
         boolean shouldReportSlowTasks = _time.milliseconds() - _lastSlowTaskReportingTimeMs > _slowTaskAlertingBackoffTimeMs;
-        for (ExecutionTask task : inExecutionTasks()) {
+        for (ExecutionTask task : inExecutionTasksOfType(INTRA_BROKER_REPLICA_ACTION)) {
           TopicPartition tp = task.proposal().topicPartition();
           if (cluster.partition(tp) == null) {
             handleProgressWithTopicDeletion(task, finishedTasks, deletedTaskIds);
           } else if (ExecutionUtils.isIntraBrokerReplicaActionDone(logDirInfoByTask, task)) {
             handleProgressWithCompletion(task, finishedTasks);
+          } else if (_stopSignal.get() != NO_STOP_EXECUTION) {
+            if (tasksWithoutLogdirResponse.contains(task) && waitForLogdirResponseUponStop) {
+              // Its broker did not respond, so whether the movement is ongoing or completed is unknown, and the rollback needs
+              // the current logdir of the replica: give the broker a few more progress checks to respond.
+              LOG.debug("Task {} waits for its broker to respond before being stopped.", task);
+              continue;
+            }
+            // If the execution is stopped during an ongoing intra-broker replica movement, the executor will not silently
+            // wait for the completion of the current in-progress tasks. Instead, it will mark in progress tasks as dead, and
+            // rollback the ongoing movement of gracefully stopped intra-broker replica movements.
+            LOG.debug("Task {} is marked as dead to stop the execution with a rollback.", task);
+            finishedTasks.add(task);
+            stoppedTaskIds.add(task.executionId());
+            _executionTaskManager.markTaskDead(task);
+            stoppedIntraBrokerReplicaTasks.add(task);
           } else {
             if (shouldReportSlowTasks) {
-              task.maybeReportExecutionTooSlow(_time.milliseconds(), slowTasksToReport);
+              task.maybeReportExecutionTooSlow(_time.milliseconds(), _taskExecutionAlertingThresholdMs,
+                                               _intraBrokerReplicaMovementRateAlertingThreshold, slowTasksToReport);
             }
-            if (maybeMarkTaskAsDead(cluster, logDirInfoByTask, task, null)) {
+            if (maybeMarkTaskAsDead(cluster, logDirInfoByTask, tasksWithoutLogdirResponse, task, null)) {
               deadTaskIds.add(task.executionId());
               finishedTasks.add(task);
             }
           }
         }
+        maybeUpdateDataMovementProgress(cluster, INTRA_BROKER_REPLICA_ACTION);
         sendSlowExecutionAlert(slowTasksToReport);
+        rollbackStoppedIntraBrokerReplicaTasks(stoppedIntraBrokerReplicaTasks, logDirInfoByTask);
         updateOngoingExecutionState();
-      } while (!inExecutionTasks().isEmpty() && finishedTasks.isEmpty());
+      } while (!inExecutionTasksOfType(INTRA_BROKER_REPLICA_ACTION).isEmpty() && finishedTasks.isEmpty());
 
-      LOG.info("User task {}: Finished tasks: {}.{}{}", _uuid, finishedTasks,
+      LOG.info("User task {}: Finished tasks: {}.{}{}{}", _uuid, finishedTasks,
+               stoppedTaskIds.isEmpty() ? "" : String.format(". [Stopped: %s]", stoppedTaskIds),
                deletedTaskIds.isEmpty() ? "" : String.format(". [Deleted: %s]", deletedTaskIds),
                deadTaskIds.isEmpty() ? "" : String.format(". [Dead: %s]", deadTaskIds));
+    }
+
+    /**
+     * Rolls back the ongoing movement of stopped intra-broker replica tasks -- i.e. moves the subject replicas back to
+     * their current logdir, which removes the future replicas on the destination logdirs -- and waits until the
+     * rollback is completed.
+     *
+     * @param stoppedIntraBrokerReplicaTasks Intra-broker replica tasks that are marked as dead due to being stopped by user.
+     * @param logdirInfoByTask Replica logdir information by task.
+     */
+    private void rollbackStoppedIntraBrokerReplicaTasks(List<ExecutionTask> stoppedIntraBrokerReplicaTasks,
+                                                        Map<ExecutionTask, ReplicaLogDirInfo> logdirInfoByTask) {
+      if (stoppedIntraBrokerReplicaTasks.isEmpty()) {
+        return;
+      }
+      Set<ExecutionTask> beingCancelled = cancelIntraBrokerReplicaMovements(stoppedIntraBrokerReplicaTasks, logdirInfoByTask,
+                                                                            _adminClient, _config);
+      LOG.debug("Handling stopped intra-broker replica tasks {} (being cancelled: {})", stoppedIntraBrokerReplicaTasks, beingCancelled);
+      while (!beingCancelled.isEmpty()) {
+        // A rollback is completed once the subject replica has no future replica. Tasks whose logdir information cannot be
+        // retrieved (e.g. due to offline disk) are not waited for, to avoid being blocked on a potentially stuck rollback.
+        Map<ExecutionTask, ReplicaLogDirInfo> currentLogdirInfoByTask = getLogdirInfoForExecutionTask(beingCancelled, _adminClient, _config);
+        beingCancelled.removeIf(task -> !currentLogdirInfoByTask.containsKey(task)
+                                        || currentLogdirInfoByTask.get(task).getFutureReplicaLogDir() == null);
+        if (beingCancelled.isEmpty()) {
+          // All tasks have been rolled back.
+          break;
+        }
+        try {
+          LOG.info("User task {}: Waiting for the rollback of ongoing intra-broker replica movements for {}.", _uuid, beingCancelled);
+          Thread.sleep(executionProgressCheckIntervalMs());
+        } catch (InterruptedException e) {
+          // let it go
+        }
+      }
     }
 
     /**
@@ -2081,12 +5694,39 @@ public class Executor {
       }
     }
 
+    /**
+     * Update the data movement progress of in-progress replica movement tasks if partition movement progress tracking is
+     * enabled and the partition movement progress check interval has elapsed since the last check, then update the data
+     * movement metrics.
+     *
+     * @param cluster The current cluster metadata.
+     * @param type The type of the ongoing replica movement tasks.
+     */
+    private void maybeUpdateDataMovementProgress(Cluster cluster, ExecutionTask.TaskType type) {
+      long nowMs = _time.milliseconds();
+      List<ExecutionTask> inProgressReplicaTasks = inExecutionTasks().stream()
+                                                                     .filter(ExecutorAdminUtils::shouldTrackDataMovementProgress)
+                                                                     .collect(Collectors.toList());
+      _dataMovementProgressCheckScheduler.maybeCheck(nowMs, inProgressReplicaTasks,
+                                                     tasks -> updateDataMovementProgress(tasks, cluster, _adminClient, _config, nowMs));
+      _executionTaskManager.markInProgressDataMovement();
+      updatePartitionMovementMetrics(type);
+    }
+
     private void sendSlowExecutionAlert(List<ExecutionTask> slowTasksToReport) {
       if (!slowTasksToReport.isEmpty()) {
         StringBuilder sb = new StringBuilder();
         sb.append("Slow tasks are detected:\n");
         for (ExecutionTask task: slowTasksToReport) {
-          sb.append(String.format("\tID: %s\tstart_time:%s\tdetail:%s%n", task.executionId(), utcDateFor(task.startTimeMs()), task));
+          String progress = task.hasDataMovementProgress()
+                            ? String.format("\tmoved_data:%d/%d MB", task.movedDataInBytes() / ExecutionTask.BYTES_IN_MB,
+                                            task.totalDataToMoveInBytes() / ExecutionTask.BYTES_IN_MB)
+                            : "";
+          if (task.hasDataMovementRate()) {
+            progress += String.format("\tdata_movement_rate:%.3f MB/s", task.dataMovementRateInMBPerSec());
+          }
+          sb.append(String.format("\tID: %s\tstart_time:%s%s\tdetail:%s%n", task.executionId(), utcDateFor(task.startTimeMs()),
+                                  progress, task));
         }
         _executorNotifier.sendAlert(sb.toString());
         _lastSlowTaskReportingTimeMs = _time.milliseconds();
@@ -2100,11 +5740,15 @@ public class Executor {
      *   <li>{@code LEADER_ACTION}: Target broker/disk hosting the prospective leader is down or leadership transition
      *   took longer than the configured limit.</li>
      *   <li>{@code INTER_BROKER_REPLICA_ACTION}: Destination broker is down.</li>
-     *   <li>{@code INTRA_BROKER_REPLICA_ACTION}: Destination disk is down.</li>
+     *   <li>{@code INTRA_BROKER_REPLICA_ACTION}: The broker is down, or it responds without an online logdir for the replica
+     *   (e.g. its disk is down). A broker that does not respond in time is not evidence of either -- e.g. Cruise Control may
+     *   have lost its connection to the cluster while the movement goes on -- so the task is checked again later.</li>
      * </ul>
      *
      * @param cluster the kafka cluster
      * @param logdirInfoByTask  disk information for ongoing intra-broker replica movement tasks
+     * @param tasksWithoutLogdirResponse ongoing intra-broker replica movement tasks whose broker did not respond in time
+     *                                   with their disk information (ignored for other task types).
      * @param task the task to check
      * @param deadInterBrokerReassignments the set of partitions that were dead upon submission of the corresponding
      *                                     inter-broker replica reassignment task (ignored for other task types).
@@ -2112,6 +5756,7 @@ public class Executor {
      */
     private boolean maybeMarkTaskAsDead(Cluster cluster,
                                         Map<ExecutionTask, ReplicaLogDirInfo> logdirInfoByTask,
+                                        Set<ExecutionTask> tasksWithoutLogdirResponse,
                                         ExecutionTask task,
                                         Set<TopicPartition> deadInterBrokerReassignments) {
       // Only check tasks with IN_PROGRESS or ABORTING state.
@@ -2142,9 +5787,14 @@ public class Executor {
             break;
 
           case INTRA_BROKER_REPLICA_ACTION:
-            if (!logdirInfoByTask.containsKey(task)) {
+            if (cluster.nodeById(task.brokerId()) == null) {
               _executionTaskManager.markTaskDead(task);
-              LOG.warn("User task {}: Killing execution for task {} because the destination disk is down.", _uuid, task);
+              LOG.warn("User task {}: Killing execution for task {} because broker {} is down.", _uuid, task, task.brokerId());
+              return true;
+            } else if (!logdirInfoByTask.containsKey(task) && !tasksWithoutLogdirResponse.contains(task)) {
+              _executionTaskManager.markTaskDead(task);
+              LOG.warn("User task {}: Killing execution for task {} because broker {} does not report an online logdir for "
+                       + "the replica (e.g. its disk is down).", _uuid, task, task.brokerId());
               return true;
             }
             break;
@@ -2192,16 +5842,20 @@ public class Executor {
 
     /**
      * Identifies if there is a need for re-execution, if so, ensures re-execution of intra-broker replica reassignments
-     * -- e.g. in case there is a controller failover.
+     * -- e.g. in case there is a controller failover, or the request to execute a task got no response.
+     *
+     * Only the tasks whose broker reports that the replica is neither in nor moving to the destination logdir are executed
+     * again. A task whose broker does not respond, or does not report a current logdir for the replica, is left to the
+     * progress check.
      */
     private void maybeReexecuteIntraBrokerReplicaTasks() {
-      List<ExecutionTask> intraBrokerReplicaTasksToReexecute =
-          new ArrayList<>(_executionTaskManager.inExecutionTasks(Collections.singleton(INTRA_BROKER_REPLICA_ACTION)));
-      getLogdirInfoForExecutionTask(intraBrokerReplicaTasksToReexecute, _adminClient, _config).forEach((k, v) -> {
+      List<ExecutionTask> intraBrokerReplicaTasksToReexecute = new ArrayList<>();
+      getLogdirInfoForExecutionTask(_executionTaskManager.inExecutionTasks(Collections.singleton(INTRA_BROKER_REPLICA_ACTION)),
+                                    _adminClient, _config).forEach((k, v) -> {
         String targetLogdir = k.proposal().replicasToMoveBetweenDisksByBroker().get(k.brokerId()).logdir();
         // If task is completed or in-progress, do not reexecute the task.
-        if (targetLogdir.equals(v.getCurrentReplicaLogDir()) || targetLogdir.equals(v.getFutureReplicaLogDir())) {
-          intraBrokerReplicaTasksToReexecute.remove(k);
+        if (!targetLogdir.equals(v.getCurrentReplicaLogDir()) && !targetLogdir.equals(v.getFutureReplicaLogDir())) {
+          intraBrokerReplicaTasksToReexecute.add(k);
         }
       });
       if (!intraBrokerReplicaTasksToReexecute.isEmpty()) {
@@ -2226,11 +5880,86 @@ public class Executor {
       }
     }
 
+    /**
+     * Update the partition movement metrics of the ongoing replica movement phase, accounting for the data that has
+     * already been moved by the in-progress partition movements.
+     *
+     * @param type The type of the ongoing replica movement tasks.
+     */
+    private void updatePartitionMovementMetrics(ExecutionTask.TaskType type) {
+      boolean isInterBroker = type == INTER_BROKER_REPLICA_ACTION;
+      int numFinishedPartitionMovements = isInterBroker ? _executionTaskManager.numFinishedInterBrokerPartitionMovements()
+                                                        : _executionTaskManager.numFinishedIntraBrokerPartitionMovements();
+      // Dead and aborted tasks (e.g. in-progress movements rolled back when the execution is stopped) have not moved their data.
+      long completedDataMovementInMB = isInterBroker ? _executionTaskManager.completedInterBrokerDataMovementInMB()
+                                                     : _executionTaskManager.completedIntraBrokerDataMovementInMB();
+      updatePartitionMovementMetrics(numFinishedPartitionMovements,
+                                     completedDataMovementInMB + _executionTaskManager.inProgressMovedDataInMB(type),
+                                     System.currentTimeMillis() - _replicaMovementStartTimeMs);
+    }
+
     private void updatePartitionMovementMetrics(long numTotalPartitionMovements, long totalDataToMoveInMB, long executionTimeMs) {
       if (executionTimeMs != 0) {
         _partitionMovementMbPerSec.set(totalDataToMoveInMB / (double) executionTimeMs * 1000);
         _partitionMovementCountPerSec.set(numTotalPartitionMovements / (double) executionTimeMs * 1000);
       }
+    }
+  }
+
+  /**
+   * An execution queued after the ongoing execution of the same user task.
+   */
+  private static final class QueuedExecution {
+    private final String _type;
+    private final Runnable _start;
+    // The parameters to rebuild the queued execution from after a restart, or null.
+    private final Map<String, String> _parameters;
+    // The execution before it completed (or there was none), so this one is about to start.
+    private volatile boolean _handedOff;
+    // The user task is in execution, so finishing this execution without executing it finishes the user task.
+    private volatile boolean _isUserTaskInExecution;
+    private volatile boolean _cancelled;
+
+    private QueuedExecution(String type, Runnable start, Map<String, String> parameters) {
+      _type = type;
+      _start = start;
+      _parameters = parameters == null ? null : Collections.unmodifiableMap(new TreeMap<>(parameters));
+      _handedOff = false;
+      _isUserTaskInExecution = false;
+      _cancelled = false;
+    }
+
+    private String type() {
+      return _type;
+    }
+
+    private Runnable start() {
+      return _start;
+    }
+
+    private Map<String, String> parameters() {
+      return _parameters;
+    }
+
+    private boolean isHandedOff() {
+      return _handedOff;
+    }
+
+    private void handOff(boolean isUserTaskInExecution) {
+      _isUserTaskInExecution = isUserTaskInExecution;
+      _handedOff = true;
+    }
+
+    private boolean isUserTaskInExecution() {
+      return _isUserTaskInExecution;
+    }
+
+    private boolean isCancelled() {
+      return _cancelled;
+    }
+
+    private void cancel() {
+      _cancelled = true;
     }
   }
 }

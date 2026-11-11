@@ -8,6 +8,8 @@ ClusterModelStats:
       $ref: '#/ClusterModelStatsMetaData'
     statistics:
       $ref: '#/ClusterModelStatsValue'
+    diskStatistics:
+      $ref: '#/DiskBalanceStats'
 
 ClusterModelStatsMetaData:
   type: object
@@ -76,3 +78,135 @@ ClusterModelStatsValueHolder:
       type: number
     topicReplicas:
       type: number
+
+DiskBalanceStats:
+  type: object
+  description: Balance between the disks of each broker, grouped by the metric it is about. Only present if the cluster model has
+    disk information. Disks with no capacity, such as disks being removed, are left out.
+  required:
+    - numAliveDisks
+    - usage
+    - ioRate
+  properties:
+    numAliveDisks:
+      description: Number of alive disks with a positive capacity.
+      type: integer
+      format: int32
+    usage:
+      $ref: '#/DiskUsageStats'
+    ioRate:
+      $ref: '#/DiskIORateStats'
+
+DiskUsageStats:
+  type: object
+  description: Disk usage, i.e. the share of the capacity of each disk that its replicas use. AVG, MAX and MIN are the average,
+    highest and lowest utilization percentage of the disks (MAX and MIN with the broker and logdir of the disk). STD is the standard
+    deviation of the utilization percentage of each disk from the utilization percentage of its broker, and maxSpreadWithinBroker
+    the largest difference between the utilization percentages of the disks of a broker (with the broker, if a broker has at least
+    two disks), both in percentage points.
+  required:
+    - AVG
+    - MAX
+    - MIN
+    - STD
+    - maxSpreadWithinBroker
+    - numUnbalancedDisks
+    - numDisksAboveCapacityLimit
+  properties:
+    AVG:
+      $ref: '#/DiskUtilizationValue'
+    MAX:
+      $ref: '#/DiskUtilizationValue'
+    MIN:
+      $ref: '#/DiskUtilizationValue'
+    STD:
+      $ref: '#/DiskUtilizationValue'
+    maxSpreadWithinBroker:
+      $ref: '#/DiskUtilizationValue'
+    numUnbalancedDisks:
+      description: Number of disks whose utilization is out of the balance range of their broker that IntraBrokerDiskUsageDistributionGoal
+        enforces in a manual rebalance, i.e. the utilization of the broker times 1 +/- (intra.broker.disk.balance.threshold - 1) * 0.9,
+        where intra.broker.disk.balance.threshold defaults to disk.balance.threshold; a broker whose disks average at most
+        disk.low.utilization.threshold has the lenient band of the goal (no lower bound, an upper bound of at least
+        disk.low.utilization.threshold * 0.9).
+      type: integer
+      format: int32
+    numDisksAboveCapacityLimit:
+      description: Number of disks whose utilization is above disk.capacity.threshold.
+      type: integer
+      format: int32
+
+DiskUtilizationValue:
+  type: object
+  required:
+    - utilizationPct
+  properties:
+    utilizationPct:
+      description: Disk utilization in percent of the disk capacity, or a difference between such percentages in percentage points
+        (STD and maxSpreadWithinBroker).
+      type: number
+      format: double
+    broker:
+      description: Broker the value is about, if any.
+      type: integer
+      format: int32
+    logdir:
+      description: Logdir of the disk the value is about, if any.
+      type: string
+
+DiskIORateStats:
+  type: object
+  description: Estimated disk I/O rate, i.e. what IntraBrokerDiskIORateDistributionGoal balances -- the inbound network rate of the
+    replicas of a disk plus intra.broker.disk.io.read.weight times the outbound network rate of its leader replicas, in KB/s. Per-disk
+    I/O is not observable, so these are estimates from network load. AVG, MAX and MIN are the average, highest and lowest rate of
+    the disks (MAX and MIN with the broker and logdir of the disk), and STD the standard deviation of the rate of each disk from the
+    average of its broker (rateKBps). maxRatio is the disk with the highest rate relative to the average of its broker, in percent,
+    and maxSpreadWithinBroker the largest difference between the rates of the disks of a broker, in percentage points of the average
+    of that broker (ratioPct, with the broker). A broker whose disks have no estimated I/O has no ratio.
+  required:
+    - AVG
+    - MAX
+    - MIN
+    - STD
+    - maxRatio
+    - maxSpreadWithinBroker
+    - numUnbalancedDisks
+  properties:
+    AVG:
+      $ref: '#/DiskIORateValue'
+    MAX:
+      $ref: '#/DiskIORateValue'
+    MIN:
+      $ref: '#/DiskIORateValue'
+    STD:
+      $ref: '#/DiskIORateValue'
+    maxRatio:
+      $ref: '#/DiskIORateValue'
+    maxSpreadWithinBroker:
+      $ref: '#/DiskIORateValue'
+    numUnbalancedDisks:
+      description: Number of disks whose estimated I/O rate is out of the balance range of their broker that
+        IntraBrokerDiskIORateDistributionGoal enforces, i.e. the average rate of the disks of the broker times
+        1 +/- (intra.broker.disk.io.balance.threshold - 1) * 0.9.
+      type: integer
+      format: int32
+
+DiskIORateValue:
+  type: object
+  properties:
+    rateKBps:
+      description: Estimated disk I/O rate in KB/s (AVG, MAX, MIN, STD).
+      type: number
+      format: double
+    ratioPct:
+      description: Ratio to the average rate of the disks of the broker, in percent (maxRatio) or percentage points
+        (maxSpreadWithinBroker).
+      type: number
+      format: double
+    broker:
+      description: Broker the value is about, if any.
+      type: integer
+      format: int32
+    logdir:
+      description: Logdir of the disk the value is about, if any.
+      type: string

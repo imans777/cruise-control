@@ -24,17 +24,23 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
+import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.LogDirDescription;
 import org.apache.kafka.clients.admin.ReplicaInfo;
+import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.TopicPartitionReplica;
+import org.apache.kafka.common.errors.DisconnectException;
 import org.apache.kafka.common.errors.KafkaStorageException;
 import org.apache.kafka.common.errors.LogDirNotFoundException;
 import org.apache.kafka.common.errors.ReplicaNotAvailableException;
@@ -42,6 +48,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig.LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG;
+import static com.linkedin.kafka.cruisecontrol.executor.ExecutionTask.BYTES_IN_MB;
 import static org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.ReplicaLogDirInfo;
 
 public final class ExecutorAdminUtils {
@@ -57,11 +64,34 @@ public final class ExecutorAdminUtils {
    * @param tasks The tasks to check.
    * @param adminClient The adminClient to send describeReplicaLogDirs request.
    * @param config The config object that holds all the Cruise Control related configs
-   * @return Replica logdir information by task.
+   * @return Replica logdir information by task. A task is omitted if the current logdir of its subject replica cannot
+   *         be resolved -- i.e. either the request for it failed, or it succeeded without reporting a current logdir,
+   *         which is how an offline logdir is reported.
    */
   static Map<ExecutionTask, ReplicaLogDirInfo> getLogdirInfoForExecutionTask(Collection<ExecutionTask> tasks,
                                                                              Admin adminClient,
                                                                              KafkaCruiseControlConfig config) {
+    return getLogdirInfoForExecutionTask(tasks, adminClient, config, new HashSet<>());
+  }
+
+  /**
+   * Fetch the logdir information for subject replicas in intra-broker replica movement tasks, and identify the tasks whose
+   * broker did not respond in time -- as opposed to the ones whose broker responded without a current logdir for the replica.
+   *
+   * @param tasks The tasks to check.
+   * @param adminClient The adminClient to send describeReplicaLogDirs request.
+   * @param config The config object that holds all the Cruise Control related configs
+   * @param tasksWithoutResponse A set to populate with the tasks omitted from the result because no response arrived for
+   *                             their subject replica in time (see {@link #isNoResponse(Throwable)}), i.e. the state of
+   *                             their movement is unknown.
+   * @return Replica logdir information by task. A task is omitted if the current logdir of its subject replica cannot
+   *         be resolved -- i.e. either the request for it failed, or it succeeded without reporting a current logdir,
+   *         which is how an offline logdir is reported.
+   */
+  static Map<ExecutionTask, ReplicaLogDirInfo> getLogdirInfoForExecutionTask(Collection<ExecutionTask> tasks,
+                                                                             Admin adminClient,
+                                                                             KafkaCruiseControlConfig config,
+                                                                             Set<ExecutionTask> tasksWithoutResponse) {
     Set<TopicPartitionReplica> replicasToCheck = new HashSet<>();
     Map<ExecutionTask, ReplicaLogDirInfo> logdirInfoByTask = new HashMap<>();
     Map<TopicPartitionReplica, ExecutionTask> taskByReplica = new HashMap<>();
@@ -71,19 +101,272 @@ public final class ExecutorAdminUtils {
       taskByReplica.put(tpr, t);
     });
     Map<TopicPartitionReplica, KafkaFuture<ReplicaLogDirInfo>> logDirsByReplicas = adminClient.describeReplicaLogDirs(replicasToCheck).values();
+    long timeoutMs = config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG);
+    // The requests to different brokers are in flight at the same time, so the timeout applies to all of them at once.
+    long deadlineMs = System.currentTimeMillis() + timeoutMs;
+    Set<TopicPartitionReplica> replicasWithoutResponse = new HashSet<>();
+    Throwable noResponseFailure = null;
     for (Map.Entry<TopicPartitionReplica, KafkaFuture<ReplicaLogDirInfo>> entry : logDirsByReplicas.entrySet()) {
       try {
-        ReplicaLogDirInfo info = entry.getValue().get(config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS);
+        ReplicaLogDirInfo info = entry.getValue().get(remainingMs(deadlineMs), TimeUnit.MILLISECONDS);
+        if (info.getCurrentReplicaLogDir() == null) {
+          // A replica whose logdir is offline does not fail this request: the admin client skips a logdir that reports
+          // KafkaStorageException and then completes every requested replica from a map pre-seeded with an empty
+          // ReplicaLogDirInfo, so the future succeeds with no current logdir. Such a replica must be omitted rather
+          // than reported, because callers use the presence of a task in this map to mean "the logdir of its replica
+          // is known": ExecutionUtils#isIntraBrokerReplicaActionDone compares the current logdir against the target,
+          // and Executor#maybeMarkTaskAsDead treats an absent task whose broker responded as one whose disk is down.
+          LOG.warn("The current logdir of replica {} is unknown, which indicates that its logdir is offline.", entry.getKey());
+          continue;
+        }
         logdirInfoByTask.put(taskByReplica.get(entry.getKey()), info);
       } catch (InterruptedException | ExecutionException | TimeoutException e) {
-        LOG.warn("Encounter exception {} when fetching logdir information for replica {}", e.getMessage(), entry.getKey());
+        if (isNoResponse(e)) {
+          replicasWithoutResponse.add(entry.getKey());
+          tasksWithoutResponse.add(taskByReplica.get(entry.getKey()));
+          noResponseFailure = e;
+        } else {
+          LOG.warn("Encounter exception {} when fetching logdir information for replica {}", e.getMessage(), entry.getKey());
+        }
       }
+    }
+    if (!replicasWithoutResponse.isEmpty()) {
+      LOG.warn("No response in {} ms when fetching logdir information for replicas {} ({}).", timeoutMs, replicasWithoutResponse,
+               causeOf(noResponseFailure));
     }
     return logdirInfoByTask;
   }
 
   /**
-   * Execute intra-broker replica movement tasks by sending alterReplicaLogDirs request.
+   * Check whether the given failure of a request to a broker means that no response arrived in time -- e.g. the broker is
+   * unreachable, or Cruise Control lost its connection to the cluster -- rather than a response that reports an error. In
+   * the former case, the request may or may not have been processed by the broker.
+   *
+   * @param failure The failure of a request to a broker.
+   * @return {@code true} if no response arrived in time for the request, {@code false} otherwise.
+   */
+  static boolean isNoResponse(Throwable failure) {
+    Throwable cause = causeOf(failure);
+    return cause instanceof TimeoutException
+           || cause instanceof InterruptedException
+           || cause instanceof org.apache.kafka.common.errors.TimeoutException
+           || cause instanceof DisconnectException;
+  }
+
+  private static Throwable causeOf(Throwable failure) {
+    return failure instanceof ExecutionException && failure.getCause() != null ? failure.getCause() : failure;
+  }
+
+  private static long remainingMs(long deadlineMs) {
+    return Math.max(0L, deadlineMs - System.currentTimeMillis());
+  }
+
+  /**
+   * Update the data movement progress of the in-progress replica movement tasks among the given tasks, using the replica
+   * sizes reported by the brokers involved in these tasks. A single describeLogDirs request is sent to each such broker
+   * (i.e. the destination brokers and the current leader for inter-broker replica movements, and the broker whose replica
+   * is moving across disks for intra-broker replica movements), and the requests to different brokers are sent in parallel.
+   * Tasks whose progress cannot be determined (e.g. a broker fails to respond in time) keep their last known progress.
+   *
+   * @param tasks The tasks whose data movement progress will be updated -- tasks other than in-progress inter-broker or
+   *              intra-broker replica movement tasks are ignored.
+   * @param cluster The current cluster metadata.
+   * @param adminClient The adminClient to send describeLogDirs request.
+   * @param config The config object that holds all the Cruise Control related configs
+   * @param nowMs The current time in milliseconds.
+   */
+  static void updateDataMovementProgress(Collection<ExecutionTask> tasks,
+                                         Cluster cluster,
+                                         Admin adminClient,
+                                         KafkaCruiseControlConfig config,
+                                         long nowMs) {
+    List<ExecutionTask> tasksToUpdate = tasks.stream().filter(ExecutorAdminUtils::shouldTrackDataMovementProgress).collect(Collectors.toList());
+    Set<Integer> brokersToDescribe = new HashSet<>();
+    for (ExecutionTask task : tasksToUpdate) {
+      if (task.type() == ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION) {
+        task.proposal().replicasToAdd().forEach(r -> brokersToDescribe.add(r.brokerId()));
+        Node leader = cluster.leaderFor(task.proposal().topicPartition());
+        if (leader != null) {
+          brokersToDescribe.add(leader.id());
+        }
+      } else {
+        brokersToDescribe.add(task.brokerId());
+      }
+    }
+    if (brokersToDescribe.isEmpty()) {
+      return;
+    }
+
+    Map<Integer, Map<String, LogDirDescription>> logDirsByBrokerId = new HashMap<>();
+    long timeoutMs = config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG);
+    long deadlineMs = System.currentTimeMillis() + timeoutMs;
+    try {
+      Map<Integer, KafkaFuture<Map<String, LogDirDescription>>> futureByBrokerId = adminClient.describeLogDirs(brokersToDescribe).descriptions();
+      for (Map.Entry<Integer, KafkaFuture<Map<String, LogDirDescription>>> entry : futureByBrokerId.entrySet()) {
+        try {
+          // All brokers share the same deadline, so an unresponsive (e.g. offline) broker delays the check by at most the timeout.
+          long remainingTimeMs = Math.max(0L, deadlineMs - System.currentTimeMillis());
+          logDirsByBrokerId.put(entry.getKey(), entry.getValue().get(remainingTimeMs, TimeUnit.MILLISECONDS));
+        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+          LOG.warn("Failed to describe logdirs of broker {} to track the progress of partition movements.", entry.getKey(), e);
+        }
+      }
+    } catch (RuntimeException e) {
+      LOG.warn("Failed to describe logdirs of brokers {} to track the progress of partition movements.", brokersToDescribe, e);
+      return;
+    }
+    updateDataMovementProgress(tasksToUpdate, cluster, logDirsByBrokerId, nowMs);
+  }
+
+  /**
+   * Update the data movement progress of the in-progress replica movement tasks among the given tasks, using the given
+   * logdir descriptions.
+   *
+   * <ul>
+   *   <li>{@code INTER_BROKER_REPLICA_ACTION}: The moved data is the total size of the replicas being created on the
+   *   destination brokers. The total data to move is the size of the leader replica multiplied by the number of replicas
+   *   being created.</li>
+   *   <li>{@code INTRA_BROKER_REPLICA_ACTION}: The moved data is the size of the future replica being created on the
+   *   destination disk. The total data to move is the size of the current replica.</li>
+   * </ul>
+   *
+   * If a destination broker failed to respond, the task keeps its last known progress. If a replica being created may
+   * be on an offline logdir, the task is considered to have made no progress since the last observation. If the size of
+   * the source replica is unavailable (e.g. the partition has no leader), the last known (or estimated) total is used.
+   *
+   * @param tasks The tasks whose data movement progress will be updated -- tasks other than in-progress inter-broker or
+   *              intra-broker replica movement tasks are ignored.
+   * @param cluster The current cluster metadata.
+   * @param logDirsByBrokerId Logdir descriptions by broker id, as returned by a describeLogDirs request. Brokers that
+   *                          failed to respond are expected to be missing.
+   * @param nowMs The current time in milliseconds.
+   */
+  static void updateDataMovementProgress(Collection<ExecutionTask> tasks,
+                                         Cluster cluster,
+                                         Map<Integer, Map<String, LogDirDescription>> logDirsByBrokerId,
+                                         long nowMs) {
+    for (ExecutionTask task : tasks) {
+      if (!shouldTrackDataMovementProgress(task)) {
+        continue;
+      }
+      if (task.type() == ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION) {
+        updateInterBrokerDataMovementProgress(task, cluster, logDirsByBrokerId, nowMs);
+      } else {
+        updateIntraBrokerDataMovementProgress(task, logDirsByBrokerId, nowMs);
+      }
+    }
+  }
+
+  private static void updateInterBrokerDataMovementProgress(ExecutionTask task,
+                                                            Cluster cluster,
+                                                            Map<Integer, Map<String, LogDirDescription>> logDirsByBrokerId,
+                                                            long nowMs) {
+    TopicPartition tp = task.proposal().topicPartition();
+    Set<ReplicaPlacementInfo> replicasToAdd = task.proposal().replicasToAdd();
+    long movedDataInBytes = 0L;
+    boolean isReplicaToAddUnavailable = false;
+    for (ReplicaPlacementInfo replicaToAdd : replicasToAdd) {
+      Map<String, LogDirDescription> logDirs = logDirsByBrokerId.get(replicaToAdd.brokerId());
+      if (logDirs == null) {
+        // The destination broker failed to respond.
+        return;
+      }
+      Map.Entry<String, ReplicaInfo> replica = findReplica(logDirs, tp, false);
+      if (replica != null) {
+        movedDataInBytes += replica.getValue().size();
+      } else if (hasOfflineLogDir(logDirs)) {
+        isReplicaToAddUnavailable = true;
+      }
+      // Otherwise, the replica has not been created on the destination broker yet.
+    }
+    if (isReplicaToAddUnavailable && task.hasDataMovementProgress()) {
+      movedDataInBytes = task.movedDataInBytes();
+    }
+    Node leader = cluster.leaderFor(tp);
+    Map.Entry<String, ReplicaInfo> leaderReplica = leader == null ? null : findReplica(logDirsByBrokerId.get(leader.id()), tp, false);
+    long totalDataToMoveInBytes = leaderReplica != null ? leaderReplica.getValue().size() * replicasToAdd.size()
+                                                        : lastKnownOrEstimatedTotalDataToMoveInBytes(task);
+    task.updateDataMovementProgress(movedDataInBytes, totalDataToMoveInBytes, nowMs);
+  }
+
+  private static void updateIntraBrokerDataMovementProgress(ExecutionTask task,
+                                                            Map<Integer, Map<String, LogDirDescription>> logDirsByBrokerId,
+                                                            long nowMs) {
+    Map<String, LogDirDescription> logDirs = logDirsByBrokerId.get(task.brokerId());
+    if (logDirs == null) {
+      // The broker failed to respond.
+      return;
+    }
+    TopicPartition tp = task.proposal().topicPartition();
+    String destinationLogDir = task.proposal().replicasToMoveBetweenDisksByBroker().get(task.brokerId()).logdir();
+    Map.Entry<String, ReplicaInfo> currentReplica = findReplica(logDirs, tp, false);
+    Map.Entry<String, ReplicaInfo> futureReplica = findReplica(logDirs, tp, true);
+    long movedDataInBytes;
+    long totalDataToMoveInBytes;
+    if (currentReplica != null && currentReplica.getKey().equals(destinationLogDir)) {
+      // The future replica has replaced the current replica since the last check of the task's completion.
+      movedDataInBytes = currentReplica.getValue().size();
+      totalDataToMoveInBytes = movedDataInBytes;
+    } else {
+      if (futureReplica != null) {
+        movedDataInBytes = futureReplica.getValue().size();
+      } else if (hasOfflineLogDir(logDirs) && task.hasDataMovementProgress()) {
+        movedDataInBytes = task.movedDataInBytes();
+      } else {
+        // The future replica has not been created on the destination disk yet.
+        movedDataInBytes = 0L;
+      }
+      totalDataToMoveInBytes = currentReplica != null ? currentReplica.getValue().size() : lastKnownOrEstimatedTotalDataToMoveInBytes(task);
+    }
+    task.updateDataMovementProgress(movedDataInBytes, totalDataToMoveInBytes, nowMs);
+  }
+
+  private static long lastKnownOrEstimatedTotalDataToMoveInBytes(ExecutionTask task) {
+    if (task.hasDataMovementProgress()) {
+      return task.totalDataToMoveInBytes();
+    }
+    long estimatedDataToMoveInMB = task.type() == ExecutionTask.TaskType.INTER_BROKER_REPLICA_ACTION
+                                   ? task.proposal().interBrokerDataToMoveInMB() : task.proposal().intraBrokerDataToMoveInMB();
+    return estimatedDataToMoveInMB * BYTES_IN_MB;
+  }
+
+  /**
+   * @param task The task to check.
+   * @return {@code true} if the data movement progress of the given task is tracked -- i.e. it is an in-progress replica
+   * movement task, {@code false} otherwise.
+   */
+  static boolean shouldTrackDataMovementProgress(ExecutionTask task) {
+    return task.state() == ExecutionTaskState.IN_PROGRESS && task.type() != ExecutionTask.TaskType.LEADER_ACTION;
+  }
+
+  /**
+   * @param logDirs Logdir descriptions of a broker, or {@code null} if unavailable.
+   * @param tp The topic partition whose replica is requested.
+   * @param isFuture {@code true} to get the future replica (i.e. the replica being moved to another disk), {@code false}
+   *                 to get the current replica.
+   * @return The requested replica of the given partition along with the logdir hosting it, or {@code null} if it does
+   * not exist in any online logdir.
+   */
+  private static Map.Entry<String, ReplicaInfo> findReplica(Map<String, LogDirDescription> logDirs, TopicPartition tp, boolean isFuture) {
+    if (logDirs != null) {
+      for (Map.Entry<String, LogDirDescription> logDir : logDirs.entrySet()) {
+        ReplicaInfo replicaInfo = logDir.getValue().error() == null ? logDir.getValue().replicaInfos().get(tp) : null;
+        if (replicaInfo != null && replicaInfo.isFuture() == isFuture) {
+          return Map.entry(logDir.getKey(), replicaInfo);
+        }
+      }
+    }
+    return null;
+  }
+
+  private static boolean hasOfflineLogDir(Map<String, LogDirDescription> logDirs) {
+    return logDirs.values().stream().anyMatch(logDir -> logDir.error() != null);
+  }
+
+  /**
+   * Execute intra-broker replica movement tasks by sending alterReplicaLogDirs request. A task whose request is refused by
+   * the broker is marked as dead. A task whose request gets no response in time stays in progress, as the broker may have
+   * started the movement: the progress check finds out from the broker whether to execute it again.
    *
    * @param tasksToExecute The tasks to execute.
    * @param adminClient The adminClient to send alterReplicaLogDirs request.
@@ -101,16 +384,164 @@ public final class ExecutorAdminUtils {
       replicaAssignment.put(tpr, t.proposal().replicasToMoveBetweenDisksByBroker().get(t.brokerId()).logdir());
       replicaToTask.put(tpr, t);
     });
+    long deadlineMs = System.currentTimeMillis() + config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG);
     for (Map.Entry<TopicPartitionReplica, KafkaFuture<Void>> entry: adminClient.alterReplicaLogDirs(replicaAssignment).values().entrySet()) {
+      ExecutionTask task = replicaToTask.get(entry.getKey());
       try {
-        entry.getValue().get(config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS);
+        entry.getValue().get(remainingMs(deadlineMs), TimeUnit.MILLISECONDS);
       } catch (InterruptedException | ExecutionException | TimeoutException | LogDirNotFoundException | KafkaStorageException
           | ReplicaNotAvailableException e) {
-        LOG.warn("Encounter exception {} when trying to execute task {}, mark task dead.", e.getMessage(), replicaToTask.get(entry.getKey()));
-        executionTaskManager.markTaskAborting(replicaToTask.get(entry.getKey()));
-        executionTaskManager.markTaskDead(replicaToTask.get(entry.getKey()));
+        if (isNoResponse(e)) {
+          LOG.warn("No response in time when trying to execute task {} ({}), keep the task in progress.", task, causeOf(e));
+        } else {
+          LOG.warn("Encounter exception {} when trying to execute task {}, mark task dead.", e.getMessage(), task);
+          executionTaskManager.markTaskAborting(task);
+          executionTaskManager.markTaskDead(task);
+        }
       }
     }
+  }
+
+  /**
+   * Get the offline logdirs of the given brokers, i.e. the logdirs that the brokers report with an error.
+   * Kafka refuses to move any replica between the disks of a broker that has an offline logdir.
+   *
+   * @param brokersToCheck Brokers whose logdirs to check.
+   * @param adminClient The adminClient to send describeLogDirs request.
+   * @param config The config object that holds all the Cruise Control related configs
+   * @return Offline logdirs by broker id, only for brokers that have at least one offline logdir.
+   */
+  static Map<Integer, Set<String>> offlineLogDirsByBroker(Collection<Integer> brokersToCheck,
+                                                          Admin adminClient,
+                                                          KafkaCruiseControlConfig config)
+      throws InterruptedException, ExecutionException, TimeoutException {
+    Map<Integer, Set<String>> offlineLogDirsByBroker = new TreeMap<>();
+    Map<Integer, KafkaFuture<Map<String, LogDirDescription>>> logDirsByBrokerId = adminClient.describeLogDirs(brokersToCheck).descriptions();
+    for (Map.Entry<Integer, KafkaFuture<Map<String, LogDirDescription>>> entry : logDirsByBrokerId.entrySet()) {
+      Map<String, LogDirDescription> logInfos = entry.getValue().get(config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG), TimeUnit.MILLISECONDS);
+      for (Map.Entry<String, LogDirDescription> logInfo : logInfos.entrySet()) {
+        if (logInfo.getValue().error() != null) {
+          offlineLogDirsByBroker.computeIfAbsent(entry.getKey(), b -> new TreeSet<>()).add(logInfo.getKey());
+        }
+      }
+    }
+    return offlineLogDirsByBroker;
+  }
+
+  /**
+   * Request the destination brokers of replicas to add to create them in the given logdirs. This is expected to be called before
+   * submitting the replica reassignments that add these replicas. Since the replicas do not exist yet, the destination brokers
+   * record their logdirs and respond with {@link ReplicaNotAvailableException}. Then, the replicas are created in the recorded
+   * logdirs upon the corresponding replica reassignments.
+   *
+   * This is a best-effort operation: if the logdir of a replica cannot be recorded, the destination broker picks the logdir to
+   * create the replica in. A replica that its destination broker already hosts is skipped: requesting a logdir for an existing
+   * replica would start moving it to that logdir, which no execution task tracks.
+   *
+   * @param logdirByReplica The logdir to create each replica to add in.
+   * @param adminClient The adminClient to send describeReplicaLogDirs and alterReplicaLogDirs requests.
+   * @param config The config object that holds all the Cruise Control related configs
+   * @return The replicas whose logdirs the destination brokers recorded.
+   */
+  static Set<TopicPartitionReplica> pinLogdirsOfReplicasToAdd(Map<TopicPartitionReplica, String> logdirByReplica,
+                                                              Admin adminClient,
+                                                              KafkaCruiseControlConfig config) {
+    Set<TopicPartitionReplica> recordedReplicas = new HashSet<>();
+    if (logdirByReplica.isEmpty()) {
+      return recordedReplicas;
+    }
+    Map<TopicPartitionReplica, String> logdirToRecordByReplica = new HashMap<>(logdirByReplica);
+    long timeoutMs = config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG);
+    for (Map.Entry<TopicPartitionReplica, KafkaFuture<ReplicaLogDirInfo>> entry
+        : adminClient.describeReplicaLogDirs(logdirToRecordByReplica.keySet()).values().entrySet()) {
+      try {
+        ReplicaLogDirInfo info = entry.getValue().get(timeoutMs, TimeUnit.MILLISECONDS);
+        if (info.getCurrentReplicaLogDir() != null) {
+          LOG.warn("Replica {} already exists in logdir {} of its destination broker, hence its logdir is not set to {}.",
+                   entry.getKey(), info.getCurrentReplicaLogDir(), logdirToRecordByReplica.remove(entry.getKey()));
+        }
+      } catch (InterruptedException | ExecutionException | TimeoutException e) {
+        LOG.warn("Failed to check whether replica {} exists on its destination broker, hence its logdir is not set to {}.",
+                 entry.getKey(), logdirToRecordByReplica.remove(entry.getKey()), e);
+      }
+    }
+    if (logdirToRecordByReplica.isEmpty()) {
+      return recordedReplicas;
+    }
+    for (Map.Entry<TopicPartitionReplica, KafkaFuture<Void>> entry
+        : adminClient.alterReplicaLogDirs(logdirToRecordByReplica).values().entrySet()) {
+      try {
+        entry.getValue().get(timeoutMs, TimeUnit.MILLISECONDS);
+        LOG.warn("Replica {} was created on its destination broker before its logdir was set to {}.", entry.getKey(),
+                 logdirToRecordByReplica.get(entry.getKey()));
+      } catch (ExecutionException e) {
+        if (e.getCause() instanceof ReplicaNotAvailableException) {
+          // The replica does not exist yet, hence the destination broker recorded the logdir to create it in.
+          recordedReplicas.add(entry.getKey());
+        } else {
+          LOG.warn("Failed to set the logdir of replica {} to {}, the broker will pick the logdir.", entry.getKey(),
+                   logdirToRecordByReplica.get(entry.getKey()), e.getCause());
+        }
+      } catch (InterruptedException | TimeoutException e) {
+        LOG.warn("Failed to set the logdir of replica {} to {}, the broker will pick the logdir.", entry.getKey(),
+                 logdirToRecordByReplica.get(entry.getKey()), e);
+      }
+    }
+    return recordedReplicas;
+  }
+
+  /**
+   * Cancel (i.e. rollback) the ongoing intra-broker replica movements of the given tasks by sending alterReplicaLogDirs
+   * request to move each subject replica back to its current logdir. Upon receiving such a request, the broker removes
+   * the future replica (i.e. stops the ongoing movement) because the requested logdir differs from the destination of
+   * the ongoing movement, and does not start a new movement because the requested logdir is the current logdir.
+   *
+   * @param tasksToCancel The intra-broker replica movement tasks to cancel.
+   * @param logdirInfoByTask Replica logdir information by task. Tasks whose subject replica has no known current logdir
+   *                         are skipped, as there is no logdir to rollback the movement to.
+   * @param adminClient The adminClient to send alterReplicaLogDirs request.
+   * @param config The config object that holds all the Cruise Control related configs
+   * @return Tasks for which the cancellation request has been accepted by the broker.
+   */
+  static Set<ExecutionTask> cancelIntraBrokerReplicaMovements(Collection<ExecutionTask> tasksToCancel,
+                                                              Map<ExecutionTask, ReplicaLogDirInfo> logdirInfoByTask,
+                                                              Admin adminClient,
+                                                              KafkaCruiseControlConfig config) {
+    Map<TopicPartitionReplica, String> replicaAssignment = new HashMap<>();
+    Map<TopicPartitionReplica, ExecutionTask> replicaToTask = new HashMap<>();
+    for (ExecutionTask task : tasksToCancel) {
+      ReplicaLogDirInfo info = logdirInfoByTask.get(task);
+      if (info == null || info.getCurrentReplicaLogDir() == null) {
+        LOG.warn("Skip cancelling task {} because the current logdir of the replica is unknown -- its movement is not rolled back "
+                 + "if still ongoing.", task);
+        continue;
+      }
+      TopicPartitionReplica tpr = new TopicPartitionReplica(task.proposal().topic(), task.proposal().partitionId(), task.brokerId());
+      replicaAssignment.put(tpr, info.getCurrentReplicaLogDir());
+      replicaToTask.put(tpr, task);
+    }
+
+    Set<ExecutionTask> cancelledTasks = new HashSet<>();
+    if (replicaAssignment.isEmpty()) {
+      return cancelledTasks;
+    }
+    long deadlineMs = System.currentTimeMillis() + config.getLong(LOGDIR_RESPONSE_TIMEOUT_MS_CONFIG);
+    for (Map.Entry<TopicPartitionReplica, KafkaFuture<Void>> entry: adminClient.alterReplicaLogDirs(replicaAssignment).values().entrySet()) {
+      ExecutionTask task = replicaToTask.get(entry.getKey());
+      try {
+        entry.getValue().get(remainingMs(deadlineMs), TimeUnit.MILLISECONDS);
+        cancelledTasks.add(task);
+      } catch (InterruptedException | ExecutionException | TimeoutException | LogDirNotFoundException | KafkaStorageException
+          | ReplicaNotAvailableException e) {
+        if (isNoResponse(e)) {
+          LOG.warn("No response in time when trying to cancel task {} ({}) -- its movement is not rolled back if still ongoing.",
+                   task, causeOf(e));
+        } else {
+          LOG.warn("Encounter exception {} when trying to cancel task {}.", e.getMessage(), task);
+        }
+      }
+    }
+    return cancelledTasks;
   }
 
   /**
