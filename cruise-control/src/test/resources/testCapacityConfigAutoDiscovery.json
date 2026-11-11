@@ -1,0 +1,33 @@
+{
+  "brokerCapacities":[
+    {
+      "brokerId": "-1",
+      "capacity": {
+        "DISK": {"/data/kafka-1": "100000", "/data/kafka-2": "100000"},
+        "CPU": {"num.cores": "4"},
+        "NW_IN": "50000",
+        "NW_OUT": "40000"
+      },
+      "doc": "The default entry: used only for capacity that is neither in the entry of a broker nor discovered."
+    },
+    {
+      "brokerId": "1",
+      "capacity": {
+        "DISK": {"/data/kafka-1": "500000"},
+        "NW_IN": "600000",
+        "NW_OUT": "500000"
+      },
+      "doc": "A partial entry: overrides the network capacity of broker 1 and the size of one of its log dirs."
+    },
+    {
+      "brokerId": "2",
+      "capacity": {
+        "DISK": "800000",
+        "CPU": {"num.cores": "16"},
+        "NW_IN": "300000",
+        "NW_OUT": "300000"
+      },
+      "doc": "A complete entry with a total disk capacity."
+    }
+  ]
+}

@@ -2,6 +2,20 @@
  * Copyright 2017 LinkedIn Corp. Licensed under the BSD 2-Clause License (the "License"). See License in the project root for license information.
  */
 
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.linkedin.kafka.cruisecontrol.monitor;
 
 import com.codahale.metrics.MetricRegistry;
@@ -42,6 +56,7 @@ import org.apache.kafka.clients.admin.ReplicaInfo;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.errors.KafkaStorageException;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.config.TopicConfig;
@@ -87,6 +102,7 @@ public class LoadMonitorTest {
   private static final long CHECK_MS = 10L;
   private static final long MONITOR_STATE_UPDATE_INTERVAL_MS = 100L;
   private static final long START_TIME_MS = 100L;
+  private static final String UNKNOWN_OFFLINE_LOGDIR = "/tmp/kafka-logs-offline";
   private Time _time;
 
   @Test
@@ -308,6 +324,29 @@ public class LoadMonitorTest {
     assertEquals(13, clusterModel.partition(T0P0).leader().load().expectedUtilizationFor(Resource.DISK), 0.0);
   }
 
+  // Test build cluster model for JBOD broker with an offline logdir that the capacity resolver does not report.
+  @Test
+  public void testJbodClusterModelWithOfflineLogDirUnknownToCapacityResolver()
+      throws NotEnoughValidWindowsException, TimeoutException, BrokerCapacityResolutionException {
+    TestContext context = prepareContext(NUM_WINDOWS, true, true);
+    LoadMonitor loadMonitor = context.loadmonitor();
+    KafkaPartitionMetricSampleAggregator aggregator = context.aggregator();
+
+    CruiseControlUnitTestUtils.populateSampleAggregator(3, 4, aggregator, PE_T0P0, 0, WINDOW_MS, METRIC_DEF);
+    CruiseControlUnitTestUtils.populateSampleAggregator(3, 4, aggregator, PE_T0P1, 0, WINDOW_MS, METRIC_DEF);
+    CruiseControlUnitTestUtils.populateSampleAggregator(3, 4, aggregator, PE_T1P0, 0, WINDOW_MS, METRIC_DEF);
+    CruiseControlUnitTestUtils.populateSampleAggregator(3, 4, aggregator, PE_T1P1, 0, WINDOW_MS, METRIC_DEF);
+
+    ClusterModel clusterModel = loadMonitor.clusterModel(DEFAULT_START_TIME_FOR_CLUSTER_MODEL, Long.MAX_VALUE,
+                                                         new ModelCompletenessRequirements(2, 1.0, false),
+                                                         true,
+                                                         true,
+                                                         new OperationProgress());
+
+    assertEquals(4, clusterModel.broker(0).disk("/tmp/kafka-logs").replicas().size());
+    assertNull(clusterModel.broker(0).disk(UNKNOWN_OFFLINE_LOGDIR));
+  }
+
   // Not enough snapshot windows and some partitions are missing from all snapshot windows.
   @Test
   public void testClusterModelWithInvalidPartitionAndInsufficientSnapshotWindows()
@@ -512,6 +551,10 @@ public class LoadMonitorTest {
   }
 
   private TestContext prepareContext(int numWindowToPreserve, boolean isClusterJBOD) {
+    return prepareContext(numWindowToPreserve, isClusterJBOD, false);
+  }
+
+  private TestContext prepareContext(int numWindowToPreserve, boolean isClusterJBOD, boolean hasOfflineLogDirUnknownToCapacityResolver) {
     // Create mock metadata client.
     Metadata metadata = getMetadata(Arrays.asList(T0P0, T0P1, T1P0, T1P1));
     MetadataClient mockMetadataClient = EasyMock.mock(MetadataClient.class);
@@ -533,7 +576,7 @@ public class LoadMonitorTest {
     // Create mock DescribeLogDirsResult
     DescribeLogDirsResult mockDescribeLogDirsResult = EasyMock.mock(DescribeLogDirsResult.class);
     EasyMock.expect(mockDescribeLogDirsResult.descriptions())
-            .andReturn(getDescribeLogDirsResultValues())
+            .andReturn(getDescribeLogDirsResultValues(hasOfflineLogDirUnknownToCapacityResolver))
             .anyTimes();
     EasyMock.replay(mockDescribeLogDirsResult);
 
@@ -605,7 +648,8 @@ public class LoadMonitorTest {
     return Collections.singletonMap(CLUSTER_CONFIG, clusterConfigFuture);
   }
 
-  private Map<Integer, KafkaFuture<Map<String, LogDirDescription>>> getDescribeLogDirsResultValues() {
+  private Map<Integer, KafkaFuture<Map<String, LogDirDescription>>> getDescribeLogDirsResultValues(
+      boolean hasOfflineLogDirUnknownToCapacityResolver) {
 
     Map<Integer, KafkaFuture<Map<String, LogDirDescription>>> futureByBroker = new HashMap<>();
     Map<String, LogDirDescription> logdirInfoBylogdir = new HashMap<>();
@@ -615,6 +659,11 @@ public class LoadMonitorTest {
     replicaInfoByPartition.put(T1P0, new ReplicaInfo(0, 0, false));
     replicaInfoByPartition.put(T1P1, new ReplicaInfo(0, 0, false));
     logdirInfoBylogdir.put("/tmp/kafka-logs", new LogDirDescription(null, replicaInfoByPartition));
+    if (hasOfflineLogDirUnknownToCapacityResolver) {
+      // The capacity config file does not list this logdir, e.g. because the capacity resolver reports only online logdirs.
+      logdirInfoBylogdir.put(UNKNOWN_OFFLINE_LOGDIR, new LogDirDescription(new KafkaStorageException("The logdir is offline."),
+                                                                            Collections.emptyMap()));
+    }
     futureByBroker.put(0, completedFuture(logdirInfoBylogdir));
 
     logdirInfoBylogdir = new HashMap<>();

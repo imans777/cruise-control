@@ -73,6 +73,12 @@
     <Bug pattern="SWL_SLEEP_WITH_LOCK_HELD" />
   </Match>
 
+  <!-- Linux exposes the link speed of network interfaces under the fixed path /sys/class/net. -->
+  <Match>
+    <Class name="com.linkedin.kafka.cruisecontrol.metricsreporter.metric.CapacityDiscoveryUtils" />
+    <Bug pattern="DMI_HARDCODED_ABSOLUTE_FILENAME" />
+  </Match>
+
   <Match>
     <Class name="com.linkedin.kafka.cruisecontrol.model.ClusterModel" />
     <Method name="setBrokerState" />
