@@ -12,7 +12,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -42,7 +44,8 @@ import static com.linkedin.kafka.cruisecontrol.executor.ReplicationThrottleHelpe
  * a single failed restore would leave a rate limit on a broker permanently: the config is a dynamic broker config, so it
  * survives broker restarts, and a later execution would read it as the operator's own value and faithfully put it back.</p>
  *
- * <p>This class is not thread safe.</p>
+ * <p>The throttle rate of an ongoing execution can be updated dynamically (see {@link #updateThrottleRate(long, Collection)}).
+ * This class is thread safe.</p>
  */
 class LogDirThrottleHelper {
   private static final Logger LOG = LoggerFactory.getLogger(LogDirThrottleHelper.class);
@@ -54,11 +57,17 @@ class LogDirThrottleHelper {
   static final int MAX_RETRY_SLEEP_MS = (int) TimeUnit.SECONDS.toMillis(10);
 
   private final Admin _adminClient;
-  private final Long _throttleRate;
   private final int _retries;
-  // Brokers throttled by this helper, mapped to their original per-broker value of the config (null if they had none).
-  // Owned by the caller, so that a throttle this helper fails to restore can be removed later.
+  // Guarded by this. The throttle rate (null if no throttling is applied), which may be updated during the execution.
+  private Long _throttleRate;
+  // Guarded by this. Brokers throttled by this helper, mapped to their original per-broker value of the config (null if they had
+  // none). Owned by the caller, so that a throttle this helper fails to restore can be removed later.
   private final Map<Integer, String> _originalThrottleByBroker;
+  // Written under the lock of this helper, concurrent for the unsynchronized getter. Brokers throttled by this helper, mapped to
+  // the per-broker value of the config this helper last applied.
+  private final Map<Integer, String> _appliedThrottleByBroker;
+  // Guarded by this. Whether the throttles have been restored -- i.e. this helper must not throttle any broker afterwards.
+  private boolean _closed;
 
   /**
    * The brokers that have been throttled but not restored yet, mapped to the original per-broker value of the config of each
@@ -92,12 +101,14 @@ class LogDirThrottleHelper {
     _throttleRate = throttleRate;
     _retries = retries;
     _originalThrottleByBroker = appliedThrottles.originalThrottleByBroker();
+    _appliedThrottleByBroker = new ConcurrentHashMap<>();
+    _closed = false;
   }
 
   /**
    * @return The brokers throttled by this helper, whose throttle has not been restored yet.
    */
-  Set<Integer> throttledBrokers() {
+  synchronized Set<Integer> throttledBrokers() {
     return Collections.unmodifiableSet(new TreeSet<>(_originalThrottleByBroker.keySet()));
   }
 
@@ -108,8 +119,8 @@ class LogDirThrottleHelper {
    * @param intraBrokerReplicaMovementTasks Intra-broker replica movement tasks to be executed.
    * @throws IllegalStateException If the throttle cannot be set.
    */
-  void setThrottles(Collection<ExecutionTask> intraBrokerReplicaMovementTasks) {
-    if (_throttleRate == null) {
+  synchronized void setThrottles(Collection<ExecutionTask> intraBrokerReplicaMovementTasks) {
+    if (_throttleRate == null || _closed) {
       return;
     }
     Set<Integer> brokersToThrottle = new TreeSet<>();
@@ -133,11 +144,12 @@ class LogDirThrottleHelper {
         boolean hasPerBrokerThrottle = isPerBrokerValue(currentThrottle);
         // Track the broker before altering its config so that the throttle is restored even if altering fails midway.
         _originalThrottleByBroker.put(brokerId, hasPerBrokerThrottle ? currentThrottle.value() : null);
+        _appliedThrottleByBroker.put(brokerId, throttleRate);
         if (!hasPerBrokerThrottle || !throttleRate.equals(currentThrottle.value())) {
           opByBroker.put(cf, new AlterConfigOp(new ConfigEntry(LOG_DIR_THROTTLE_CONFIG, throttleRate), AlterConfigOp.OpType.SET));
         }
       }
-      List<ConfigResource> failedToAlter = alterAndVerifyConfigs(_adminClient, opByBroker, _retries);
+      List<ConfigResource> failedToAlter = alterAndVerifyConfigs(_adminClient, opByBroker, _appliedThrottleByBroker, _retries);
       if (!failedToAlter.isEmpty()) {
         throw new IllegalStateException(String.format("Failed to set %s to %d on %s.", LOG_DIR_THROTTLE_CONFIG, _throttleRate, failedToAlter));
       }
@@ -151,13 +163,102 @@ class LogDirThrottleHelper {
   }
 
   /**
-   * Restore the original per-broker value of the config (or remove the per-broker value if there was none) on all brokers
-   * throttled by this helper, using a single batch of requests. If the config of a broker has been changed since this helper set
-   * the throttle, the config of that broker is left as is. This method is best-effort and does not throw. A broker whose
-   * throttle could not be restored is kept in the applied throttles, so that the removal can be retried afterwards.
+   * Update the throttle rate, and apply the new rate to (1) all brokers already throttled by this helper using a single batch
+   * of requests, and (2) the brokers of the given in-progress intra-broker replica movement tasks that have not been throttled
+   * yet -- e.g. if the execution started without a log dir throttle. Brokers of upcoming intra-broker replica movement tasks are
+   * throttled with the new rate as their tasks start.
+   *
+   * @param throttleRate The new throttle (bytes/second) to apply to intra-broker replica movements.
+   * @param inProgressIntraBrokerTasks In-progress intra-broker replica movement tasks.
+   * @return {@code true} if the throttle rate has been updated, {@code false} if the throttles have already been restored.
+   * @throws IllegalStateException If the new throttle cannot be applied.
    */
-  void clearAllThrottles() {
-    removeThrottles(_adminClient, _originalThrottleByBroker, String.valueOf(_throttleRate), _retries);
+  synchronized boolean updateThrottleRate(long throttleRate, Collection<ExecutionTask> inProgressIntraBrokerTasks) {
+    if (_closed) {
+      LOG.info("Skip updating log dir throttle to {} bytes/sec, since the throttles have already been restored.", throttleRate);
+      return false;
+    }
+    _throttleRate = throttleRate;
+    String newThrottleRate = String.valueOf(throttleRate);
+    Set<Integer> throttledBrokers = new TreeSet<>(_originalThrottleByBroker.keySet());
+    if (!throttledBrokers.isEmpty()) {
+      LOG.info("Updating log dir throttle to {} bytes/sec on brokers {}.", throttleRate, throttledBrokers);
+      Map<ConfigResource, AlterConfigOp> opByBroker = new HashMap<>();
+      for (int brokerId : throttledBrokers) {
+        opByBroker.put(brokerResource(brokerId),
+                       new AlterConfigOp(new ConfigEntry(LOG_DIR_THROTTLE_CONFIG, newThrottleRate), AlterConfigOp.OpType.SET));
+      }
+      try {
+        List<ConfigResource> failedToAlter = alterAndVerifyConfigs(_adminClient, opByBroker, _appliedThrottleByBroker, _retries);
+        if (!failedToAlter.isEmpty()) {
+          // Say what the cluster is left with: the rate for the upcoming movements HAS changed, and the brokers named here
+          // still carry the rate they had, so "the update failed" and "nothing changed" are not the same thing.
+          throw new IllegalStateException(String.format("Failed to update %s to %d on %s. Upcoming intra-broker replica "
+                                                        + "movements use %d bytes/sec, while these brokers still carry the rate "
+                                                        + "they had.", LOG_DIR_THROTTLE_CONFIG, throttleRate, failedToAlter,
+                                                        throttleRate));
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(String.format("Interrupted while updating %s on brokers %s.", LOG_DIR_THROTTLE_CONFIG,
+                                                      throttledBrokers), e);
+      }
+    }
+    setThrottles(inProgressIntraBrokerTasks);
+    return true;
+  }
+
+  /**
+   * Not synchronized: the executor state reads it while an update may hold the lock of this helper for as long as it takes to
+   * alter and verify the configs.
+   *
+   * @return The per-broker value of {@value #LOG_DIR_THROTTLE_CONFIG} this helper last applied to each broker it has
+   * throttled and not restored yet.
+   */
+  Map<Integer, String> appliedThrottleByBroker() {
+    return Collections.unmodifiableMap(new TreeMap<>(_appliedThrottleByBroker));
+  }
+
+  /**
+   * Remove the throttle of an ongoing execution: restore the original per-broker value of {@value #LOG_DIR_THROTTLE_CONFIG}
+   * (or remove the per-broker value if there was none) on every broker this helper has throttled, and stop throttling the
+   * upcoming intra-broker replica movements.
+   *
+   * <p>Unlike {@link #clearAllThrottles()} this does NOT close the helper: the throttle of the same execution can be set
+   * again afterwards by another update. This is what an {@code admin} request asking for a {@code null} throttle means.</p>
+   *
+   * @return {@code true} if a throttle was removed, {@code false} if the execution was not throttled, or if the throttles
+   * have already been restored.
+   */
+  synchronized boolean removeThrottleRate() {
+    if (_closed) {
+      LOG.info("Skip removing the log dir throttle, since the throttles have already been restored.");
+      return false;
+    }
+    if (_throttleRate == null) {
+      LOG.info("Skip removing the log dir throttle, since the ongoing execution is not throttled.");
+      return false;
+    }
+    // Clear the rate first, so that the upcoming task batches are not throttled even if the restore below fails for a broker.
+    _throttleRate = null;
+    LOG.info("Removing the log dir throttle of the ongoing execution from brokers {}.", _originalThrottleByBroker.keySet());
+    removeThrottles(_adminClient, _originalThrottleByBroker, _appliedThrottleByBroker, _retries);
+    _appliedThrottleByBroker.keySet().retainAll(_originalThrottleByBroker.keySet());
+    return true;
+  }
+
+  /**
+   * Restore the original per-broker value of the config (or remove the per-broker value if there was none) on all brokers
+   * throttled by this helper, using a single batch of requests. If the config of a broker has been changed since this helper last
+   * applied the throttle to it, the config of that broker is left as is. This method is best-effort and does not throw. A broker
+   * whose throttle could not be restored is kept in the applied throttles, so that the removal can be retried afterwards. This
+   * helper does not throttle any broker afterwards.
+   */
+  synchronized void clearAllThrottles() {
+    _closed = true;
+    removeThrottles(_adminClient, _originalThrottleByBroker, _appliedThrottleByBroker, _retries);
+    // Keep the last applied value of the brokers whose throttle could not be restored, and forget the rest.
+    _appliedThrottleByBroker.keySet().retainAll(_originalThrottleByBroker.keySet());
   }
 
   /**
@@ -171,10 +272,12 @@ class LogDirThrottleHelper {
    *
    * @param adminClient The adminClient to describe and alter broker configs.
    * @param originalThrottleByBroker Brokers to restore, mapped to their original per-broker value (null if they had none).
-   * @param appliedThrottleRate The value that was applied to these brokers, as a string, or null not to check the current value.
+   * @param appliedThrottleByBroker The value that was last applied to each of these brokers, or null not to check the current
+   *                                values.
    * @param retries The number of retries while verifying that the cluster reflects the altered configs.
    */
-  static void removeThrottles(Admin adminClient, Map<Integer, String> originalThrottleByBroker, String appliedThrottleRate, int retries) {
+  static void removeThrottles(Admin adminClient, Map<Integer, String> originalThrottleByBroker,
+                              Map<Integer, String> appliedThrottleByBroker, int retries) {
     if (originalThrottleByBroker.isEmpty()) {
       return;
     }
@@ -193,8 +296,8 @@ class LogDirThrottleHelper {
           LOG.warn("Failed to describe the configs of broker {} to restore its {}. Will retry.", brokerId, LOG_DIR_THROTTLE_CONFIG, e);
           continue;
         }
-        if (appliedThrottleRate != null
-            && (!isPerBrokerValue(currentThrottle) || !appliedThrottleRate.equals(currentThrottle.value()))) {
+        if (appliedThrottleByBroker != null
+            && (!isPerBrokerValue(currentThrottle) || !currentThrottle.value().equals(appliedThrottleByBroker.get(brokerId)))) {
           LOG.info("Skip restoring {} on broker {}, since it has been changed to {} during the execution.", LOG_DIR_THROTTLE_CONFIG,
                    brokerId, currentThrottle);
           done.add(brokerId);
@@ -211,7 +314,7 @@ class LogDirThrottleHelper {
         }
       }
       LOG.info("Restoring {} on brokers {}.", LOG_DIR_THROTTLE_CONFIG, throttledBrokers);
-      List<ConfigResource> failedToRestore = alterAndVerifyConfigs(adminClient, opByBroker, retries);
+      List<ConfigResource> failedToRestore = alterAndVerifyConfigs(adminClient, opByBroker, null, retries);
       for (Map.Entry<ConfigResource, AlterConfigOp> entry : opByBroker.entrySet()) {
         if (!failedToRestore.contains(entry.getKey())) {
           done.add(Integer.parseInt(entry.getKey().name()));
@@ -233,15 +336,18 @@ class LogDirThrottleHelper {
   }
 
   /**
-   * Alter the given broker configs with a batch of requests, and wait until the cluster reflects the altered configs.
+   * Alter the given broker configs with a batch of requests, and wait until the cluster reflects the altered configs. Records the
+   * value applied to each broker whose config is altered successfully.
    *
    * @param adminClient The adminClient to describe and alter broker configs.
    * @param opByBroker The operation to apply to each broker config.
+   * @param appliedThrottleByBroker Record of the value applied to each broker, to populate, or null not to record anything.
    * @param retries The number of retries while verifying that the cluster reflects the altered configs.
    * @return Broker configs that failed to be altered or that the cluster did not reflect within the time limit.
    */
   private static List<ConfigResource> alterAndVerifyConfigs(Admin adminClient,
                                                             Map<ConfigResource, AlterConfigOp> opByBroker,
+                                                            Map<Integer, String> appliedThrottleByBroker,
                                                             int retries) throws InterruptedException {
     List<ConfigResource> failed = new ArrayList<>();
     if (opByBroker.isEmpty()) {
@@ -261,7 +367,11 @@ class LogDirThrottleHelper {
     for (Map.Entry<ConfigResource, KafkaFuture<Void>> entry : alterFutures.entrySet()) {
       try {
         entry.getValue().get(CLIENT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-        pending.put(entry.getKey(), opByBroker.get(entry.getKey()).configEntry().value());
+        String appliedValue = opByBroker.get(entry.getKey()).configEntry().value();
+        if (appliedThrottleByBroker != null) {
+          appliedThrottleByBroker.put(Integer.parseInt(entry.getKey().name()), appliedValue);
+        }
+        pending.put(entry.getKey(), appliedValue);
       } catch (ExecutionException | TimeoutException e) {
         LOG.warn("Failed to alter {} on {}.", LOG_DIR_THROTTLE_CONFIG, entry.getKey(), e);
         failed.add(entry.getKey());
